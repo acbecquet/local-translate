@@ -28,12 +28,12 @@
 - Create: `.gitignore`
 - Create: `README.md`
 
-- [ ] **Step 1: Fetch LICENSE**
+- [x] **Step 1: Fetch LICENSE**
 
 Run: `curl -s https://www.gnu.org/licenses/agpl-3.0.txt -o LICENSE`
 Expected: file starts with "GNU AFFERO GENERAL PUBLIC LICENSE" and "Version 3".
 
-- [ ] **Step 2: Write .gitignore**
+- [x] **Step 2: Write .gitignore**
 
 ```gitignore
 node_modules/
@@ -46,7 +46,7 @@ playwright-report/
 *.local
 ```
 
-- [ ] **Step 3: Write README.md**
+- [x] **Step 3: Write README.md**
 
 ```markdown
 # local_translate
@@ -63,7 +63,7 @@ See docs/superpowers/specs/ for the design and docs/superpowers/plans/ for the r
 License: AGPL-3.0-only.
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add LICENSE .gitignore README.md
@@ -84,7 +84,7 @@ git commit -m "chore: add license, gitignore, readme"
 
 - Produces: `out/main/index.js` as the Electron entry (Tasks 4 and 6 depend on this path); window title `local_translate` (Task 4 asserts it).
 
-- [ ] **Step 1: Write package.json**
+- [x] **Step 1: Write package.json**
 
 ```json
 {
@@ -110,14 +110,14 @@ git commit -m "chore: add license, gitignore, readme"
 }
 ```
 
-- [ ] **Step 2: Install dependencies (latest, recorded in lockfile)**
+- [x] **Step 2: Install dependencies (latest, recorded in lockfile)**
 
 ```bash
 npm install --save-dev electron electron-vite vite typescript @vitejs/plugin-react vitest @playwright/test eslint @eslint/js typescript-eslint eslint-config-prettier prettier electron-builder @types/node @types/react @types/react-dom
 npm install react react-dom
 ```
 
-- [ ] **Step 3: Write electron.vite.config.ts**
+- [x] **Step 3: Write electron.vite.config.ts**
 
 ```ts
 import { defineConfig } from 'electron-vite'
@@ -132,7 +132,7 @@ export default defineConfig({
 })
 ```
 
-- [ ] **Step 4: Write tsconfigs**
+- [x] **Step 4: Write tsconfigs**
 
 `tsconfig.json`:
 
@@ -187,7 +187,7 @@ export default defineConfig({
 }
 ```
 
-- [ ] **Step 5: Write src/main/index.ts**
+- [x] **Step 5: Write src/main/index.ts**
 
 ```ts
 import { app, BrowserWindow } from 'electron'
@@ -223,7 +223,7 @@ if (!gotLock) {
 }
 ```
 
-- [ ] **Step 6: Write src/preload/index.ts**
+- [x] **Step 6: Write src/preload/index.ts**
 
 ```ts
 import { contextBridge } from 'electron'
@@ -235,7 +235,7 @@ contextBridge.exposeInMainWorld('localTranslate', {
 })
 ```
 
-- [ ] **Step 7: Write renderer entry**
+- [x] **Step 7: Write renderer entry**
 
 `src/renderer/index.html`:
 
@@ -281,17 +281,17 @@ export function App(): React.JSX.Element {
 }
 ```
 
-- [ ] **Step 8: Verify build**
+- [x] **Step 8: Verify build**
 
 Run: `npm run build`
 Expected: exits 0; `out/main/index.js`, `out/preload/index.js`, `out/renderer/index.html` all exist.
 
-- [ ] **Step 9: Verify typecheck**
+- [x] **Step 9: Verify typecheck**
 
 Run: `npm run typecheck`
 Expected: exits 0.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add package.json package-lock.json electron.vite.config.ts tsconfig*.json src/
@@ -312,7 +312,7 @@ git commit -m "feat: electron-vite react-ts app skeleton"
 
 - Produces: `APP_NAME = 'local_translate'`, `CONTEXT_MENU_LABEL = 'Translate with local translate'` (Phase 6 context-menu module consumes these exact constants).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `tests/core/app-info.test.ts`:
 
@@ -331,7 +331,7 @@ describe('app-info', () => {
 })
 ```
 
-- [ ] **Step 2: Write vitest.config.ts**
+- [x] **Step 2: Write vitest.config.ts**
 
 ```ts
 import { defineConfig } from 'vitest/config'
@@ -344,12 +344,12 @@ export default defineConfig({
 })
 ```
 
-- [ ] **Step 3: Run test to verify it fails**
+- [x] **Step 3: Run test to verify it fails**
 
 Run: `npm test`
 Expected: FAIL, cannot resolve `../../src/core/app-info`.
 
-- [ ] **Step 4: Write minimal implementation**
+- [x] **Step 4: Write minimal implementation**
 
 `src/core/app-info.ts`:
 
@@ -358,12 +358,12 @@ export const APP_NAME = 'local_translate'
 export const CONTEXT_MENU_LABEL = 'Translate with local translate'
 ```
 
-- [ ] **Step 5: Run test to verify it passes**
+- [x] **Step 5: Run test to verify it passes**
 
 Run: `npm test`
 Expected: 2 passed.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/core/ tests/core/ vitest.config.ts
@@ -379,7 +379,7 @@ git commit -m "test: vitest wiring with app-info constants"
 - Create: `playwright.config.ts`
 - Test: `tests/e2e/app.spec.ts`
 
-- [ ] **Step 1: Write playwright.config.ts**
+- [x] **Step 1: Write playwright.config.ts**
 
 ```ts
 import { defineConfig } from '@playwright/test'
@@ -391,7 +391,7 @@ export default defineConfig({
 })
 ```
 
-- [ ] **Step 2: Write the smoke test**
+- [x] **Step 2: Write the smoke test**
 
 `tests/e2e/app.spec.ts`:
 
@@ -407,13 +407,13 @@ test('app launches and shows the scaffold window', async () => {
 })
 ```
 
-- [ ] **Step 3: Run it against a fresh build**
+- [x] **Step 3: Run it against a fresh build**
 
 Run: `npm run build && npm run test:e2e`
 Expected: 1 passed.
 Note: Electron E2E uses the local electron binary; no `npx playwright install` browser downloads are needed or wanted.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add playwright.config.ts tests/e2e/
@@ -428,7 +428,7 @@ git commit -m "test: playwright electron smoke test"
 
 - Create: `eslint.config.js`, `.prettierrc.json`, `.prettierignore`
 
-- [ ] **Step 1: Write eslint.config.js (flat config)**
+- [x] **Step 1: Write eslint.config.js (flat config)**
 
 ```js
 import js from '@eslint/js'
@@ -456,7 +456,7 @@ export default tseslint.config(
 )
 ```
 
-- [ ] **Step 2: Write .prettierrc.json and .prettierignore**
+- [x] **Step 2: Write .prettierrc.json and .prettierignore**
 
 `.prettierrc.json`:
 
@@ -479,16 +479,16 @@ playwright-report/
 test-results/
 ```
 
-- [ ] **Step 3: Format the tree once**
+- [x] **Step 3: Format the tree once**
 
 Run: `npm run format:fix`
 
-- [ ] **Step 4: Verify the full gate**
+- [x] **Step 4: Verify the full gate**
 
 Run: `npm run check`
 Expected: typecheck, lint, format, and unit tests all pass (exit 0).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add eslint.config.js .prettierrc.json .prettierignore .
@@ -503,7 +503,7 @@ git commit -m "chore: eslint flat config, prettier, check gate"
 
 - Create: `electron-builder.yml`
 
-- [ ] **Step 1: Write electron-builder.yml**
+- [x] **Step 1: Write electron-builder.yml**
 
 ```yaml
 appId: com.becquet.localtranslate
@@ -521,17 +521,17 @@ nsis:
   artifactName: local_translate-setup-${version}.exe
 ```
 
-- [ ] **Step 2: Build the installer**
+- [x] **Step 2: Build the installer**
 
 Run: `npm run dist`
 Expected: exits 0; `dist_installer/local_translate-setup-0.1.0.exe` exists.
 
-- [ ] **Step 3: Smoke the packed app**
+- [x] **Step 3: Smoke the packed app**
 
 Run the installer manually OR verify `dist_installer/win-unpacked/local_translate.exe` launches and shows the scaffold window (headless check: launch, screenshot via Playwright against the unpacked exe is acceptable).
 Expected: window appears with "local_translate" heading.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add electron-builder.yml
@@ -546,7 +546,7 @@ git commit -m "build: nsis installer via electron-builder"
 
 - Create: `.github/workflows/ci.yml`
 
-- [ ] **Step 1: Write the workflow**
+- [x] **Step 1: Write the workflow**
 
 ```yaml
 name: ci
@@ -586,7 +586,7 @@ jobs:
           path: dist_installer/*.exe
 ```
 
-- [ ] **Step 2: Commit and push**
+- [x] **Step 2: Commit and push**
 
 ```bash
 git add .github/
@@ -594,7 +594,7 @@ git commit -m "ci: check and build on push, installer on dispatch"
 git push
 ```
 
-- [ ] **Step 3: Verify CI green**
+- [x] **Step 3: Verify CI green**
 
 Run: `gh run watch --exit-status` (or `gh run list --limit 1` until completed).
 Expected: check-build job succeeds.
