@@ -21,5 +21,24 @@ export default tseslint.config(
       ]
     }
   },
+  {
+    // Standalone CommonJS test fixtures spawned as their own `node <file>`
+    // process (never imported/bundled), so they run outside the app's
+    // ESM/TS module graph and need Node's CJS globals declared explicitly.
+    files: ['tests/**/fixtures/**/*.cjs'],
+    languageOptions: {
+      sourceType: 'commonjs',
+      globals: {
+        process: 'readonly',
+        require: 'readonly',
+        module: 'readonly',
+        setTimeout: 'readonly',
+        console: 'readonly'
+      }
+    },
+    rules: {
+      '@typescript-eslint/no-require-imports': 'off'
+    }
+  },
   prettier
 )
