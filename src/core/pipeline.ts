@@ -155,6 +155,9 @@ function fitSegments(
 
   let done = 0
   const total = segments.length
+  if (total === 0) {
+    opts.onProgress?.(0, 0, 'fit')
+  }
   for (const seg of segments) {
     const translation = translationById.get(seg.id) ?? seg.text
     const result = fit(translation, seg.box, seg.font)
@@ -179,13 +182,21 @@ function fitSegments(
  * own registered extension (which may be compound, e.g. `.fake.json`) -
  * matched against the file path the same way adapterFor() does, rather than
  * via path.extname(), which would only strip `.json` and mangle the name
- * for compound extensions. Falls back to path.extname() on the (normally
+ * for compound extensions. When more than one registered extension matches
+ * the file (e.g. a hypothetical adapter registering both `.json` and
+ * `.fake.json`), the longest match wins, since a shorter suffix match is
+ * always a strict subset of a longer one and picking it would truncate the
+ * name mid-extension. Falls back to path.extname() on the (normally
  * unreachable) case where the file doesn't actually match any of the
  * adapter's extensions.
  */
 function defaultOutPath(file: string, adapter: FormatAdapter): string {
   const lower = file.toLowerCase()
-  const ext = adapter.extensions.find((e) => lower.endsWith(e.toLowerCase())) ?? path.extname(file)
+  const matches = adapter.extensions.filter((e) => lower.endsWith(e.toLowerCase()))
+  const ext =
+    matches.length > 0
+      ? matches.reduce((longest, e) => (e.length > longest.length ? e : longest))
+      : path.extname(file)
   const base = file.slice(0, file.length - ext.length)
   return `${base}_translated${ext}`
 }

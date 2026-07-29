@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { runPipeline } from '../../src/core/pipeline'
@@ -21,9 +21,16 @@ function seg(overrides: Partial<TextSegment> & { id: string; text: string }): Te
   }
 }
 
+const tmpDirs: string[] = []
+afterEach(() => {
+  for (const dir of tmpDirs) rmSync(dir, { recursive: true, force: true })
+  tmpDirs.length = 0
+})
+
 /** Writes a fake.json fixture with the given segments and returns its path. */
 function writeFixture(segments: TextSegment[]): { dir: string; file: string } {
   const dir = mkdtempSync(path.join(tmpdir(), 'lt-pipeline-'))
+  tmpDirs.push(dir)
   const file = path.join(dir, 'doc.fake.json')
   writeFileSync(file, JSON.stringify({ segments }))
   return { dir, file }
@@ -321,6 +328,52 @@ describe('runPipeline', () => {
 
     expect(phasesSeen).toEqual(new Set(['extract', 'translate', 'fit', 'apply']))
     expect(finalFitCall).toEqual([2, 2])
+  })
+
+  it('handles an empty document: zero segments, applied output is empty, all four phases still report via onProgress', async () => {
+    const { file } = writeFixture([])
+
+    const translateBatch = vi.fn()
+    const backend: TranslationBackend = {
+      listModels: vi.fn().mockResolvedValue([]),
+      pullModel: vi.fn().mockResolvedValue(undefined),
+      translateBatch
+    }
+
+    const phaseCalls: { phase: string; done: number; total: number }[] = []
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend,
+      onProgress: (done, total, phase) => {
+        phaseCalls.push({ phase, done, total })
+      }
+    })
+
+    expect(report.total).toBe(0)
+    expect(report.translated).toBe(0)
+    expect(report.keptOriginal).toEqual([])
+    expect(report.overflowed).toEqual([])
+    expect(translateBatch).not.toHaveBeenCalled()
+
+    const phasesSeen = new Set(phaseCalls.map((c) => c.phase))
+    expect(phasesSeen).toEqual(new Set(['extract', 'translate', 'fit', 'apply']))
+    // Every phase reports done === total === 0, except apply which is a
+    // single atomic step reported as done once it completes (1 of 1).
+    for (const call of phaseCalls) {
+      if (call.phase === 'apply') {
+        expect(call).toMatchObject({ done: 1, total: 1 })
+      } else {
+        expect(call).toMatchObject({ done: 0, total: 0 })
+      }
+    }
+
+    const applied = readApplied(report.outPath)
+    expect(applied.segments).toEqual([])
   })
 
   it('produces a stable RunReport shape with a non-negative duration', async () => {
