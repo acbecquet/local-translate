@@ -71,6 +71,20 @@ export async function ensureOllama(opts: {
 }): Promise<OllamaConnection> {
   const probeUrl = opts.probeUrl ?? DEFAULT_PROBE_URL
 
+  await mkdir(opts.appDataDir, { recursive: true })
+
+  // 4. Crash-orphan cleanup: a pid file left over from a previous run that
+  // never got to call stop() (app crash / force-quit). This runs
+  // unconditionally, before the probe below, and regardless of which
+  // branch we end up taking - a stale spawned child from a previous run
+  // must be reaped even when *this* run ends up adopting a different,
+  // already-running server (e.g. the user started their own Ollama on the
+  // default port after our last spawned instance was crash-orphaned on
+  // the spawn port). Doing this only inside the "we're about to spawn"
+  // branch would leak that orphan indefinitely whenever an external
+  // server happens to answer the probe.
+  await cleanupStalePidFile(opts.appDataDir)
+
   // 1. A server (the user's own, or one from a previous run of this app) is
   // already listening there - use it as-is and never touch its lifecycle.
   if (await probeVersion(probeUrl)) {
@@ -82,15 +96,7 @@ export async function ensureOllama(opts: {
     throw new OllamaNotFoundError(OLLAMA_STANDALONE_URL)
   }
 
-  await mkdir(opts.appDataDir, { recursive: true })
-
-  // 4. Crash-orphan cleanup: a pid file left over from a previous run that
-  // never got to call stop() (app crash / force-quit). Do this before
-  // spawning a new child so it can't collide with the one we're about to
-  // start.
-  await cleanupStalePidFile(opts.appDataDir)
-
-  const modelsDir = await resolveModelsDir(opts.appDataDir, homedir())
+  const modelsDir = await resolveModelsDir(opts.appDataDir, resolveHomeDir())
   const port = opts.port ?? DEFAULT_SPAWN_PORT
   const baseUrl = `http://127.0.0.1:${port}`
   const { command, args } = resolveSpawnCommand(exePath)
@@ -180,6 +186,21 @@ async function resolveModelsDir(appDataDir: string, home: string): Promise<strin
   const existing = path.join(home, '.ollama', 'models')
   if (await pathExists(existing)) return existing
   return path.join(appDataDir, 'models')
+}
+
+/**
+ * Test-only seam: when OLLAMA_FAKE_HOME_DIR is set, ensureOllama() resolves
+ * the OLLAMA_MODELS store against it instead of the real os.homedir().
+ * Without this, every integration-style test that spawns through
+ * ensureOllama() resolves against *this machine's* real home directory -
+ * the fake exe never reads or writes there, so it's not unsafe, but it
+ * makes resolveModelsDir()'s branch choice (real ~/.ollama/models vs
+ * <appDataDir>/models) depend on whatever happens to exist on the dev/CI
+ * box, rather than being deterministic. Read lazily, mirroring
+ * OLLAMA_FAKE_SERVE_SCRIPT above.
+ */
+function resolveHomeDir(): string {
+  return process.env.OLLAMA_FAKE_HOME_DIR || homedir()
 }
 
 async function pathExists(p: string): Promise<boolean> {
@@ -286,6 +307,14 @@ async function cleanupStalePidFile(appDataDir: string): Promise<void> {
   if (isProcessAlive(contents.pid)) {
     const currentImage = await imageNameForPid(contents.pid)
     const expectedImage = path.basename(contents.exe || '')
+    // Known limitation: Windows reuses pids. If the recorded pid has since
+    // exited and been reassigned to an unrelated process that happens to
+    // share the same image name (e.g. another node.exe, or a second
+    // ollama.exe the user launched independently), this match is a false
+    // positive and we'd terminate a process we don't actually own. There's
+    // no cheap, race-free way to rule this out without also recording a
+    // process start-time/handle at spawn time, which the pid-file format
+    // doesn't do; accepted as a rare-edge-case tradeoff for the simpler format.
     if (
       currentImage &&
       expectedImage &&
@@ -344,11 +373,24 @@ async function forceKillPid(pid: number): Promise<void> {
 
 /**
  * Graceful-then-forceful termination (contract point 3): `kill()` the pid,
- * and if it's still alive once `graceMs` elapses, fall back to
- * `taskkill /pid <pid> /T /F` to reap the whole process tree (important for
- * real ollama.exe, which can spawn a separate runner subprocess that a plain
- * kill of the parent wouldn't touch). All primitives are injectable so the
- * grace-window/fallback branch itself can be unit-tested deterministically
+ * wait up to `graceMs` for it to die, then *unconditionally* run
+ * `taskkill /pid <pid> /T /F` to reap the whole process tree - important
+ * for real ollama.exe, which can spawn a separate runner subprocess that a
+ * plain kill of the parent never touches, and whose child processes keep
+ * that pid recorded as their parent even after the parent itself has
+ * exited (Windows does not re-parent orphans), so `/T` still finds them.
+ *
+ * The taskkill call is unconditional - not gated behind a "still alive?"
+ * check - deliberately: on Windows, `process.kill()` on a well-behaved
+ * child terminates it near-instantly, so gating taskkill on the top-level
+ * pid's liveness left the tree-kill effectively unreachable in practice
+ * (the exact case it exists to cover, a lingering subprocess under an
+ * already-dead parent, is precisely the case an isAlive(pid) check can't
+ * see). taskkill against a pid with no matching tree is a fast, harmless
+ * no-op - forceKillPid swallows its "not found" error - so there's no cost
+ * to always running it once the grace window has passed.
+ *
+ * All primitives are injectable so this can be unit-tested deterministically
  * (see _internals.terminatePid in lifecycle.test.ts) without waiting on a
  * real OS process or the real 5s default.
  */
@@ -375,24 +417,24 @@ async function terminatePid(
   const forceKill = deps.forceKill ?? forceKillPid
   const wait = deps.delay ?? delay
 
-  if (!isAlive(pid)) return
-
-  kill(pid)
-
-  const deadline = Date.now() + graceMs
-  while (Date.now() < deadline) {
-    if (!isAlive(pid)) return
-    await wait(Math.min(50, Math.max(0, deadline - Date.now())))
-  }
-
   if (isAlive(pid)) {
-    await forceKill(pid)
+    kill(pid)
+
+    const deadline = Date.now() + graceMs
+    while (Date.now() < deadline && isAlive(pid)) {
+      await wait(Math.min(50, Math.max(0, deadline - Date.now())))
+    }
   }
+
+  // Unconditional: see the doc comment above for why this must not be
+  // gated behind isAlive(pid).
+  await forceKill(pid)
 }
 
 export const _internals = {
   resolveModelsDir,
   resolveSpawnCommand,
+  resolveHomeDir,
   terminatePid,
   isProcessAlive,
   imageNameForPid

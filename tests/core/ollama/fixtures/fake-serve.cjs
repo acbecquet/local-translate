@@ -46,6 +46,16 @@ const server = http.createServer((req, res) => {
   res.end()
 })
 
+server.on('error', (err) => {
+  // Explicit, rather than relying on the default "unhandled 'error' event
+  // throws" behavior: makes the EADDRINUSE (port already occupied) exit
+  // path deterministic and gives lifecycle.test.ts's EADDRINUSE test a
+  // fast, clean non-zero exit to detect instead of an uncaught-exception
+  // stack trace.
+  process.stderr.write(`fake-ollama: server error: ${err && err.message ? err.message : err}\n`)
+  process.exit(1)
+})
+
 server.listen(port, host, () => {
   // Not parsed by lifecycle.ts (which polls /api/version instead) - just
   // useful when a test spawns this fixture directly and wants to log-watch.

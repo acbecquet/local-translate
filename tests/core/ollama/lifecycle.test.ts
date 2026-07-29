@@ -74,20 +74,33 @@ const envKeys = [
   'PATH',
   'Path',
   'OLLAMA_FAKE_SERVE_SCRIPT',
+  'OLLAMA_FAKE_HOME_DIR',
   'OLLAMA_STOP_GRACE_MS'
 ] as const
 let savedEnv: Record<string, string | undefined>
+let fakeHomeDir: string
 
-beforeEach(() => {
+// Applies to every test in this file, not just ones that obviously spawn:
+// ensureOllama() now runs crash-orphan cleanup (which calls resolveHomeDir()
+// indirectly via resolveModelsDir on the spawn path) unconditionally, so any
+// test calling ensureOllama() could end up resolving against this machine's
+// real ~/.ollama/models if OLLAMA_FAKE_HOME_DIR weren't always set. Giving
+// every test its own fresh, empty fake home directory up front means
+// resolveModelsDir() deterministically falls back to <appDataDir>/models
+// unless a test explicitly populates <fakeHomeDir>/.ollama/models itself.
+beforeEach(async () => {
   savedEnv = {}
   for (const k of envKeys) savedEnv[k] = process.env[k]
+  fakeHomeDir = await mkdtemp(path.join(tmpdir(), 'lt-fake-home-'))
+  process.env.OLLAMA_FAKE_HOME_DIR = fakeHomeDir
 })
 
-afterEach(() => {
+afterEach(async () => {
   for (const k of envKeys) {
     if (savedEnv[k] === undefined) delete process.env[k]
     else process.env[k] = savedEnv[k]
   }
+  await rm(fakeHomeDir, { recursive: true, force: true })
 })
 
 // --- 1. already-running server: probe succeeds, never spawn, stop() is a no-op ---
@@ -224,6 +237,40 @@ describe('ensureOllama: spawns the fake exe when nothing answers probeUrl', () =
       args: ['serve']
     })
   })
+
+  it('resolveHomeDir uses OLLAMA_FAKE_HOME_DIR when set (always true in this suite via beforeEach)', () => {
+    // The global beforeEach in this file always sets OLLAMA_FAKE_HOME_DIR, so
+    // this asserts the seam itself in isolation rather than relying on that
+    // as an implicit assumption elsewhere.
+    expect(_internals.resolveHomeDir()).toBe(fakeHomeDir)
+
+    delete process.env.OLLAMA_FAKE_HOME_DIR
+    expect(_internals.resolveHomeDir()).not.toBe(fakeHomeDir)
+  })
+
+  it('ensureOllama actually resolves OLLAMA_MODELS against OLLAMA_FAKE_HOME_DIR, not the real machine home', async () => {
+    // End-to-end version of the resolveHomeDir/resolveModelsDir unit tests
+    // above: proves the seam is actually wired into ensureOllama's real
+    // spawn path (via the fixture's /__test/env endpoint), not just that the
+    // pure functions behave correctly in isolation.
+    const existing = path.join(fakeHomeDir, '.ollama', 'models')
+    await mkdir(existing, { recursive: true })
+
+    const port = await freePort()
+    const conn = await ensureOllama({
+      appDataDir,
+      exePath: 'unused-under-seam',
+      probeUrl: `http://127.0.0.1:${deadPort}`,
+      port
+    })
+    try {
+      const envRes = await fetch(`${conn.baseUrl}/__test/env`)
+      const seenEnv = await envRes.json()
+      expect(seenEnv.OLLAMA_MODELS).toBe(existing)
+    } finally {
+      await conn.stop()
+    }
+  })
 })
 
 describe('ensureOllama: the chosen spawn port is already occupied by something else (EADDRINUSE)', () => {
@@ -257,6 +304,62 @@ describe('ensureOllama: the chosen spawn port is already occupied by something e
     expect(existsSync(path.join(appDataDir, 'ollama.pid'))).toBe(false)
 
     await rm(appDataDir, { recursive: true, force: true })
+  })
+})
+
+// Important-1 regression: crash-orphan cleanup must run even when this call
+// ends up adopting a *different*, already-running server rather than
+// spawning its own - otherwise a spawned child crash-orphaned on a previous
+// run would never get reaped once the user (or a later launch) started a
+// real Ollama that answers probeUrl first.
+describe('ensureOllama: orphan cleanup runs even when a different server answers probeUrl', () => {
+  it('terminates a stale spawned orphan and still returns the probed connection', async () => {
+    const appDataDir = await mkdtemp(path.join(tmpdir(), 'lt-ollama-'))
+    process.env.OLLAMA_FAKE_SERVE_SCRIPT = FIXTURE
+
+    // The orphan: a fake-serve process left running from a previous crashed
+    // run, recorded in the pid file exactly as writePidFile() would have.
+    const orphanPort = await freePort()
+    const orphan = spawnRawFixture(orphanPort)
+    try {
+      await waitUntil(() => pingVersion(`http://127.0.0.1:${orphanPort}`))
+      if (!orphan.pid) throw new Error('orphan did not get a pid')
+      await writeFile(
+        path.join(appDataDir, 'ollama.pid'),
+        JSON.stringify({ pid: orphan.pid, exe: process.execPath })
+      )
+
+      // The "different, already-running server" - e.g. the user's own real
+      // Ollama, started independently on the default probe port.
+      const probeServer = http.createServer((req, res) => {
+        if (req.url === '/api/version') {
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ version: 'real-user-ollama' }))
+          return
+        }
+        res.writeHead(404)
+        res.end()
+      })
+      await new Promise<void>((resolve) => probeServer.listen(0, '127.0.0.1', resolve))
+      const addr = probeServer.address()
+      if (addr === null || typeof addr === 'string') throw new Error('bad address')
+      const probeUrl = `http://127.0.0.1:${addr.port}`
+
+      try {
+        const conn = await ensureOllama({ appDataDir, probeUrl })
+
+        expect(conn.spawned).toBe(false)
+        expect(conn.baseUrl).toBe(probeUrl)
+        // The orphan was cleaned up as part of this call, not left running.
+        expect(isAlive(orphan.pid)).toBe(false)
+        expect(existsSync(path.join(appDataDir, 'ollama.pid'))).toBe(false)
+      } finally {
+        await new Promise<void>((resolve) => probeServer.close(() => resolve()))
+      }
+    } finally {
+      if (orphan.pid && isAlive(orphan.pid)) orphan.kill()
+      await rm(appDataDir, { recursive: true, force: true })
+    }
   })
 })
 
@@ -491,7 +594,12 @@ describe('findOllamaExe', () => {
 // --- _internals.terminatePid: deterministic unit test of the grace-window/taskkill fallback ---
 
 describe('_internals.terminatePid', () => {
-  it('does not force-kill when the process dies within the grace window', async () => {
+  // Important-2 regression: the taskkill tree-kill must run unconditionally
+  // after the grace window, not only when the top-level pid is still alive
+  // at that point - see the doc comment on terminatePid() for why gating it
+  // on isAlive(pid) made the tree-kill effectively unreachable on Windows.
+
+  it('kills, then still runs the tree-kill even though the process died immediately', async () => {
     let alive = true
     const calls: string[] = []
     await _internals.terminatePid(4242, 50, {
@@ -500,15 +608,17 @@ describe('_internals.terminatePid', () => {
         calls.push('kill')
         alive = false // simulate the process reacting to kill() promptly
       },
-      forceKill: async () => {
-        calls.push('forceKill')
+      forceKill: async (pid: number) => {
+        calls.push(`forceKill:${pid}`)
       },
       delay: (ms: number) => new Promise((r) => setTimeout(r, ms))
     })
-    expect(calls).toEqual(['kill'])
+    // forceKill still runs - it's what actually reaps any subprocess tree,
+    // which an isAlive(pid) check on the top-level pid alone can't see.
+    expect(calls).toEqual(['kill', 'forceKill:4242'])
   })
 
-  it('force-kills via taskkill once the grace window elapses', async () => {
+  it('kills, waits out the grace window, then runs the tree-kill when the pid stays alive throughout', async () => {
     const calls: string[] = []
     await _internals.terminatePid(4242, 20, {
       isAlive: () => true, // never reacts to kill() on its own
@@ -521,16 +631,18 @@ describe('_internals.terminatePid', () => {
     expect(calls).toEqual(['kill', 'forceKill:4242'])
   })
 
-  it('is a no-op when the pid is already dead', async () => {
+  it('skips kill() but still runs the tree-kill (as a safe no-op) when the pid was already dead at entry', async () => {
     const calls: string[] = []
     await _internals.terminatePid(4242, 50, {
       isAlive: () => false,
       kill: () => calls.push('kill'),
-      forceKill: async () => {
-        calls.push('forceKill')
+      forceKill: async (pid: number) => {
+        calls.push(`forceKill:${pid}`)
       },
       delay: (ms: number) => new Promise((r) => setTimeout(r, ms))
     })
-    expect(calls).toEqual([])
+    // No point calling kill() on a pid that's already gone, but the
+    // tree-kill still runs in case a subprocess it spawned is lingering.
+    expect(calls).toEqual(['forceKill:4242'])
   })
 })
