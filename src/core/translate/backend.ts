@@ -24,6 +24,18 @@ export interface BatchRequest {
 
 export interface BatchResponse {
   translations: { id: string; translation: string }[]
+  /**
+   * Segments that ended up absent from `translations` after the full
+   * validation ladder (whole-group call, whole-group retry, per-segment
+   * fallback ran and still couldn't resolve them), and why - one of
+   * 'parse' | 'id-mismatch' | 'empty' | 'echo' | 'error' (kept as `string`
+   * here rather than importing ValidationFailure, since backend.ts stays
+   * dependency-free of batching.ts). Optional and present only when
+   * non-empty. The pipeline keeps each such segment's original text and
+   * can use this instead of guessing why - e.g. for its RunReport's
+   * keptOriginal reasons.
+   */
+  failures?: { id: string; reason: string }[]
 }
 
 export interface TranslationBackend {

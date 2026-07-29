@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { Ollama } from 'ollama'
 import { z } from 'zod'
@@ -89,7 +89,15 @@ export class OllamaBackend implements TranslationBackend {
   async pullModel(name: string, onProgress?: (pct: number) => void): Promise<void> {
     const stream = await this.client.pull({ model: name, stream: true })
     for await (const part of stream) {
-      if (onProgress && typeof part.total === 'number' && part.total > 0) {
+      // Both fields must be present numbers before computing a percentage -
+      // a progress event with only one of them (or a zero/undefined total)
+      // would otherwise divide into NaN and hand the caller garbage.
+      if (
+        onProgress &&
+        typeof part.completed === 'number' &&
+        typeof part.total === 'number' &&
+        part.total > 0
+      ) {
         onProgress((part.completed / part.total) * 100)
       }
     }
@@ -100,9 +108,15 @@ export class OllamaBackend implements TranslationBackend {
 
     const caps = await this.getModelCaps(req.model)
     const okById = new Map<string, TranslatedEntry>()
+    // Reason a segment failed at the most recent attempt that touched it -
+    // overwritten as the ladder progresses, and deleted the moment a
+    // segment resolves. Whatever's left for an id once the ladder is done
+    // is what gets surfaced in BatchResponse.failures.
+    const reasonById = new Map<string, ValidationFailure | 'error'>()
 
     const attempt1 = await this.attemptGroup(req, caps)
     for (const o of attempt1.ok) okById.set(o.id, o)
+    for (const f of attempt1.failed) reasonById.set(f.id, f.reason)
 
     let unresolvedIds = req.segments.map((s) => s.id).filter((id) => !okById.has(id))
 
@@ -110,7 +124,13 @@ export class OllamaBackend implements TranslationBackend {
       await delay(this.retryDelayMs)
       const attempt2 = await this.attemptGroup(req, caps)
       for (const o of attempt2.ok) {
-        if (!okById.has(o.id)) okById.set(o.id, o)
+        if (!okById.has(o.id)) {
+          okById.set(o.id, o)
+          reasonById.delete(o.id)
+        }
+      }
+      for (const f of attempt2.failed) {
+        if (!okById.has(f.id)) reasonById.set(f.id, f.reason)
       }
       unresolvedIds = req.segments.map((s) => s.id).filter((id) => !okById.has(id))
     }
@@ -123,9 +143,18 @@ export class OllamaBackend implements TranslationBackend {
         const singleReq: BatchRequest = { ...req, segments: [seg] }
         const attempt = await this.attemptGroup(singleReq, caps)
         const solved = attempt.ok.find((o) => o.id === id)
-        if (solved) okById.set(id, solved)
-        // else: still unresolved after per-segment fallback - deliberately
-        // absent from the response; the pipeline keeps the original text.
+        if (solved) {
+          okById.set(id, solved)
+          reasonById.delete(id)
+        } else {
+          // else: still unresolved after per-segment fallback -
+          // deliberately absent from the response; the pipeline keeps the
+          // original text. Record why, falling back to 'error' in the
+          // (normally unreachable) case attemptGroup didn't report a
+          // reason for this specific id.
+          const failure = attempt.failed.find((f) => f.id === id)
+          reasonById.set(id, failure?.reason ?? 'error')
+        }
       }
     }
 
@@ -133,7 +162,11 @@ export class OllamaBackend implements TranslationBackend {
       .map((s) => okById.get(s.id))
       .filter((t): t is TranslatedEntry => t !== undefined)
 
-    return { translations }
+    const failures = req.segments
+      .filter((s) => !okById.has(s.id))
+      .map((s) => ({ id: s.id, reason: reasonById.get(s.id) ?? 'error' }))
+
+    return failures.length > 0 ? { translations, failures } : { translations }
   }
 
   /** One ollama.chat call for `req`, parsed and validated. Never throws - unparseable/schema-invalid responses become an all-'parse' failure list. */
@@ -242,6 +275,23 @@ export class OllamaBackend implements TranslationBackend {
     return this.capsMemo
   }
 
+  /**
+   * Caps persistence is best-effort. The model was already successfully
+   * probed by the time this runs - all this does is remember the result so
+   * a *future* call/instance doesn't have to re-probe. A transient I/O
+   * failure here (AV lock, disk full, permissions) must never propagate:
+   * if it did, it would reject the shared capsWriteChain, and every later
+   * persistModelCaps() call chains its `.then()` onto that already-
+   * rejected promise and re-rejects forever - permanently poisoning caps
+   * persistence for the rest of this instance's lifetime, and (worse)
+   * bubbling out of resolveModelCaps()/getModelCaps()/translateBatch(),
+   * bypassing the whole graceful-degradation ladder over something that
+   * isn't even a translation failure. So every step below is caught
+   * internally: the chained callback always resolves, never rejects, and
+   * a failure still updates the in-memory memo (so this process won't
+   * bother re-probing the same model again this run) even though the
+   * on-disk file didn't get the update.
+   */
   private async persistModelCaps(model: string, caps: ModelCaps): Promise<void> {
     this.capsWriteChain = this.capsWriteChain.then(async () => {
       let all: Record<string, ModelCaps>
@@ -251,10 +301,36 @@ export class OllamaBackend implements TranslationBackend {
         all = {}
       }
       all[model] = caps
-      await mkdir(path.dirname(this.capsPath), { recursive: true })
-      await writeFile(this.capsPath, JSON.stringify(all, null, 2), 'utf8')
-      this.capsMemo = all
+
+      try {
+        await this.writeCapsFileAtomic(all)
+        this.capsMemo = all
+      } catch (err) {
+        this.capsMemo = { ...(this.capsMemo ?? {}), [model]: caps }
+        this.notePersistFailure(model, err)
+      }
     })
     await this.capsWriteChain
+  }
+
+  /** Writes model-caps.json via write-to-temp-then-rename, so a crash or failure mid-write can never leave a truncated/corrupt JSON file at capsPath - readers only ever see the old complete file or the new complete file, never a partial one. */
+  private async writeCapsFileAtomic(all: Record<string, ModelCaps>): Promise<void> {
+    await mkdir(path.dirname(this.capsPath), { recursive: true })
+    const tmpPath = `${this.capsPath}.${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`
+    try {
+      await writeFile(tmpPath, JSON.stringify(all, null, 2), 'utf8')
+      await rename(tmpPath, this.capsPath)
+    } catch (err) {
+      await unlink(tmpPath).catch(() => {})
+      throw err
+    }
+  }
+
+  /** Best-effort visibility only - never thrown, and deliberately not spammed since persistModelCaps doesn't retry the write itself (one failure -> one note). */
+  private notePersistFailure(model: string, err: unknown): void {
+    console.warn(
+      `OllamaBackend: failed to persist caps for model "${model}" to ${this.capsPath} ` +
+        `(kept in memory for this process only): ${err instanceof Error ? err.message : String(err)}`
+    )
   }
 }

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import type { BatchRequest } from '../../../src/core/translate/backend'
@@ -24,6 +24,29 @@ vi.mock('ollama', () => ({
     return { chat: mocks.chat, list: mocks.list, pull: mocks.pull }
   })
 }))
+
+// Partial-mocks node:fs/promises so a single caps-file write can be made to
+// fail on demand (writeFileFailOnce), to exercise persistModelCaps' best-
+// effort error handling without touching real disk-failure conditions.
+// Everything else (mkdtemp/mkdir/readFile/rm/readdir, and writeFile itself
+// whenever the flag is off) delegates straight through to the real
+// implementation, so every other test's own file I/O - `seedCaps`,
+// `beforeEach`/`afterEach` - is unaffected.
+const fsFailure = vi.hoisted(() => ({ writeFileFailOnce: false }))
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>()
+  const mockedWriteFile = vi.fn(
+    async (filePath: string, data: string, encoding: BufferEncoding) => {
+      if (fsFailure.writeFileFailOnce) {
+        fsFailure.writeFileFailOnce = false
+        throw new Error('EBUSY: simulated transient write failure')
+      }
+      await actual.writeFile(filePath, data, encoding)
+    }
+  )
+  return { ...actual, writeFile: mockedWriteFile }
+})
 
 const { OllamaBackend } = await import('../../../src/core/translate/ollama/ollama-backend')
 
@@ -61,6 +84,7 @@ beforeEach(async () => {
   mocks.chat.mockReset()
   mocks.list.mockReset()
   mocks.pull.mockReset()
+  fsFailure.writeFileFailOnce = false
   appDataDir = await mkdtemp(path.join(tmpdir(), 'lt-caps-'))
 })
 
@@ -133,6 +157,7 @@ describe('OllamaBackend.translateBatch', () => {
     const res = await backend.translateBatch(req())
 
     expect(res.translations).toEqual([{ id: 's1', translation: 'Bonjour' }])
+    expect(res.failures).toBeUndefined() // nothing to report when everything resolved
     expect(mocks.chat).toHaveBeenCalledTimes(1)
     expect(mocks.chat.mock.calls[0][0]).toMatchObject({ model: 'test-model', think: false })
   })
@@ -179,6 +204,9 @@ describe('OllamaBackend.translateBatch', () => {
     // the pipeline is expected to keep s2's original text.
     expect(res.translations).toEqual([{ id: 's1', translation: 'Bonjour' }])
     expect(mocks.chat).toHaveBeenCalledTimes(4)
+    // s2's failure is surfaced with its reason (from the per-segment
+    // fallback, which is what actually determined it stayed unresolved).
+    expect(res.failures).toEqual([{ id: 's2', reason: 'parse' }])
   })
 
   it('a segment that fails validation (not JSON parsing) also goes through retry then per-segment fallback', async () => {
@@ -207,6 +235,35 @@ describe('OllamaBackend.translateBatch', () => {
 
     expect(res.translations).toEqual([{ id: 's1', translation: 'Bonjour' }])
     expect(mocks.chat).toHaveBeenCalledTimes(3)
+  })
+
+  it('failures reports the reason from the most recent attempt, not a stale earlier one', async () => {
+    await seedCaps(appDataDir, 'test-model', { structuredWithThinkOff: true })
+    const request = req({ segments: [{ id: 's1', text: 'Hello' }] })
+
+    // Attempt 1: echo (fails as 'echo').
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse(JSON.stringify({ translations: [{ id: 's1', translation: 'Hello' }] }))
+    )
+    // Attempt 2 (whole-group retry): still echo.
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse(JSON.stringify({ translations: [{ id: 's1', translation: 'Hello' }] }))
+    )
+    // Per-segment fallback: this time it's an empty translation - a
+    // different failure reason than the two prior attempts.
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse(JSON.stringify({ translations: [{ id: 's1', translation: '   ' }] }))
+    )
+
+    const backend = new OllamaBackend({
+      baseUrl: 'http://127.0.0.1:1',
+      appDataDir,
+      retryDelayMs: 0
+    })
+    const res = await backend.translateBatch(request)
+
+    expect(res.translations).toEqual([])
+    expect(res.failures).toEqual([{ id: 's1', reason: 'empty' }]) // not 'echo'
   })
 
   it('keeps an already-succeeded segment from attempt 1 even if the whole-group retry response omits it', async () => {
@@ -400,6 +457,57 @@ describe('OllamaBackend capability probe', () => {
     const written = JSON.parse(await readFile(path.join(appDataDir, 'model-caps.json'), 'utf8'))
     expect(written['model-a']).toEqual({ structuredWithThinkOff: true })
     expect(written['model-b']).toEqual({ structuredWithThinkOff: true })
+
+    // The atomic write-then-rename never leaves its temp file behind.
+    const entries = await readdir(appDataDir)
+    expect(entries.filter((f) => f.endsWith('.tmp'))).toEqual([])
+  })
+})
+
+// --- caps persistence is best-effort (Important fix) -----------------------
+
+describe('OllamaBackend caps persistence: best-effort, never breaks translateBatch', () => {
+  it('a transient model-caps.json write failure does not fail translateBatch, remembers the caps in-memory, and does not poison later writes', async () => {
+    fsFailure.writeFileFailOnce = true
+
+    // Probe + group call for test-model; the caps file write will fail.
+    mocks.chat.mockResolvedValueOnce(chatResponse(JSON.stringify({ ok: true })))
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse(JSON.stringify({ translations: [{ id: 's1', translation: 'Bonjour' }] }))
+    )
+
+    const backend = new OllamaBackend({
+      baseUrl: 'http://127.0.0.1:1',
+      appDataDir,
+      retryDelayMs: 0
+    })
+    const res1 = await backend.translateBatch(req())
+    expect(res1.translations).toEqual([{ id: 's1', translation: 'Bonjour' }])
+
+    // Calling translateBatch again for the SAME model must not re-probe:
+    // the failed on-disk write shouldn't have discarded the in-memory memo.
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse(JSON.stringify({ translations: [{ id: 's1', translation: 'Bonjour again' }] }))
+    )
+    const res2 = await backend.translateBatch(req())
+    expect(res2.translations).toEqual([{ id: 's1', translation: 'Bonjour again' }])
+
+    const probeCallsSoFar = mocks.chat.mock.calls.filter(([arg]) =>
+      arg.messages.some((m: { content: string }) => m.content.includes('Capability probe'))
+    )
+    expect(probeCallsSoFar).toHaveLength(1) // still just the one probe from before
+
+    // A later persist for a *different* model proves the shared write
+    // chain recovered rather than staying permanently rejected.
+    mocks.chat.mockResolvedValueOnce(chatResponse(JSON.stringify({ ok: true })))
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse(JSON.stringify({ translations: [{ id: 's1', translation: 'Hola' }] }))
+    )
+    const res3 = await backend.translateBatch(req({ model: 'other-model' }))
+    expect(res3.translations).toEqual([{ id: 's1', translation: 'Hola' }])
+
+    const written = JSON.parse(await readFile(path.join(appDataDir, 'model-caps.json'), 'utf8'))
+    expect(written['other-model']).toEqual({ structuredWithThinkOff: true })
   })
 })
 
@@ -456,5 +564,23 @@ describe('OllamaBackend.pullModel', () => {
     ])
     const backend = new OllamaBackend({ baseUrl: 'http://127.0.0.1:1', appDataDir })
     await expect(backend.pullModel('llama3.1')).resolves.toBeUndefined()
+  })
+
+  it('skips onProgress for events missing completed/total instead of reporting NaN', async () => {
+    mocks.pull.mockResolvedValueOnce([
+      { status: 'pulling manifest' }, // neither field present
+      { status: 'downloading', digest: 'x', total: 100 }, // completed missing
+      { status: 'downloading', digest: 'x', completed: 10 }, // total missing
+      { status: 'downloading', digest: 'x', completed: 0, total: 0 }, // total not > 0
+      { status: 'downloading', digest: 'x', completed: 50, total: 100 }, // well-formed
+      { status: 'success', digest: 'x', completed: 100, total: 100 } // well-formed
+    ])
+
+    const backend = new OllamaBackend({ baseUrl: 'http://127.0.0.1:1', appDataDir })
+    const pcts: number[] = []
+    await backend.pullModel('llama3.1', (pct) => pcts.push(pct))
+
+    expect(pcts).toEqual([50, 100]) // only the two well-formed events, never NaN
+    expect(pcts.every((p) => Number.isFinite(p))).toBe(true)
   })
 })

@@ -127,6 +127,13 @@ export function validateBatch(
   return { ok, failed }
 }
 
+// Note: the brief's ladder describes this check as strict inequality
+// ("translation !== source text"). Comparing trimmed+lowercased text
+// instead is a deliberate strengthening, not a loosening - it also catches
+// an echo that only differs by leading/trailing whitespace or letter case
+// (e.g. a model that "translates" "Hello" to "hello" or "Hello "), which
+// strict `!==` would let through as a false negative. It never rejects a
+// translation that strict equality would have accepted, so it fails safe.
 function isEcho(
   sourceText: string,
   translation: string,
