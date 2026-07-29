@@ -23,6 +23,7 @@
 ### Task 1: Repo hygiene (LICENSE, .gitignore, README)
 
 **Files:**
+
 - Create: `LICENSE` (full AGPL-3.0 text from https://www.gnu.org/licenses/agpl-3.0.txt)
 - Create: `.gitignore`
 - Create: `README.md`
@@ -74,11 +75,13 @@ git commit -m "chore: add license, gitignore, readme"
 ### Task 2: Electron + Vite + TypeScript app skeleton
 
 **Files:**
+
 - Create: `package.json`, `electron.vite.config.ts`, `tsconfig.json`, `tsconfig.node.json`, `tsconfig.web.json`
 - Create: `src/main/index.ts`, `src/preload/index.ts`
 - Create: `src/renderer/index.html`, `src/renderer/src/main.tsx`, `src/renderer/src/App.tsx`
 
 **Interfaces:**
+
 - Produces: `out/main/index.js` as the Electron entry (Tasks 4 and 6 depend on this path); window title `local_translate` (Task 4 asserts it).
 
 - [ ] **Step 1: Write package.json**
@@ -132,6 +135,7 @@ export default defineConfig({
 - [ ] **Step 4: Write tsconfigs**
 
 `tsconfig.json`:
+
 ```json
 {
   "files": [],
@@ -140,6 +144,7 @@ export default defineConfig({
 ```
 
 `tsconfig.node.json`:
+
 ```json
 {
   "compilerOptions": {
@@ -152,11 +157,19 @@ export default defineConfig({
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["src/main/**/*", "src/preload/**/*", "src/core/**/*", "tests/**/*", "electron.vite.config.ts", "playwright.config.ts"]
+  "include": [
+    "src/main/**/*",
+    "src/preload/**/*",
+    "src/core/**/*",
+    "tests/**/*",
+    "electron.vite.config.ts",
+    "playwright.config.ts"
+  ]
 }
 ```
 
 `tsconfig.web.json`:
+
 ```json
 {
   "compilerOptions": {
@@ -225,6 +238,7 @@ contextBridge.exposeInMainWorld('localTranslate', {
 - [ ] **Step 7: Write renderer entry**
 
 `src/renderer/index.html`:
+
 ```html
 <!doctype html>
 <html lang="en">
@@ -241,6 +255,7 @@ contextBridge.exposeInMainWorld('localTranslate', {
 ```
 
 `src/renderer/src/main.tsx`:
+
 ```tsx
 import React from 'react'
 import { createRoot } from 'react-dom/client'
@@ -254,6 +269,7 @@ createRoot(document.getElementById('root')!).render(
 ```
 
 `src/renderer/src/App.tsx`:
+
 ```tsx
 export function App(): React.JSX.Element {
   return (
@@ -287,16 +303,19 @@ git commit -m "feat: electron-vite react-ts app skeleton"
 ### Task 3: Unit testing (vitest) with first real core module
 
 **Files:**
+
 - Create: `src/core/app-info.ts`
 - Test: `tests/core/app-info.test.ts`
 - Create: `vitest.config.ts`
 
 **Interfaces:**
+
 - Produces: `APP_NAME = 'local_translate'`, `CONTEXT_MENU_LABEL = 'Translate with local translate'` (Phase 6 context-menu module consumes these exact constants).
 
 - [ ] **Step 1: Write the failing test**
 
 `tests/core/app-info.test.ts`:
+
 ```ts
 import { describe, expect, it } from 'vitest'
 import { APP_NAME, CONTEXT_MENU_LABEL } from '../../src/core/app-info'
@@ -333,6 +352,7 @@ Expected: FAIL, cannot resolve `../../src/core/app-info`.
 - [ ] **Step 4: Write minimal implementation**
 
 `src/core/app-info.ts`:
+
 ```ts
 export const APP_NAME = 'local_translate'
 export const CONTEXT_MENU_LABEL = 'Translate with local translate'
@@ -355,6 +375,7 @@ git commit -m "test: vitest wiring with app-info constants"
 ### Task 4: E2E smoke test (Playwright drives the built app)
 
 **Files:**
+
 - Create: `playwright.config.ts`
 - Test: `tests/e2e/app.spec.ts`
 
@@ -373,6 +394,7 @@ export default defineConfig({
 - [ ] **Step 2: Write the smoke test**
 
 `tests/e2e/app.spec.ts`:
+
 ```ts
 import { expect, test, _electron as electron } from '@playwright/test'
 
@@ -403,6 +425,7 @@ git commit -m "test: playwright electron smoke test"
 ### Task 5: Lint + format + check script
 
 **Files:**
+
 - Create: `eslint.config.js`, `.prettierrc.json`, `.prettierignore`
 
 - [ ] **Step 1: Write eslint.config.js (flat config)**
@@ -421,7 +444,11 @@ export default tseslint.config(
     rules: {
       'no-restricted-imports': [
         'error',
-        { paths: [{ name: 'electron', message: 'src/core must stay Electron-free (headless engine).' }] }
+        {
+          paths: [
+            { name: 'electron', message: 'src/core must stay Electron-free (headless engine).' }
+          ]
+        }
       ]
     }
   },
@@ -432,6 +459,7 @@ export default tseslint.config(
 - [ ] **Step 2: Write .prettierrc.json and .prettierignore**
 
 `.prettierrc.json`:
+
 ```json
 {
   "semi": false,
@@ -442,6 +470,7 @@ export default tseslint.config(
 ```
 
 `.prettierignore`:
+
 ```
 out/
 dist_installer/
@@ -471,6 +500,7 @@ git commit -m "chore: eslint flat config, prettier, check gate"
 ### Task 6: NSIS installer via electron-builder
 
 **Files:**
+
 - Create: `electron-builder.yml`
 
 - [ ] **Step 1: Write electron-builder.yml**
@@ -513,6 +543,7 @@ git commit -m "build: nsis installer via electron-builder"
 ### Task 7: CI (GitHub Actions)
 
 **Files:**
+
 - Create: `.github/workflows/ci.yml`
 
 - [ ] **Step 1: Write the workflow**

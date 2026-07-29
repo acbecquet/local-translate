@@ -6,3 +6,4 @@ dist_installer/
 test-results/
 playwright-report/
 *.local
+.remember/

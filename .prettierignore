@@ -1,0 +1,6 @@
+out/
+dist_installer/
+package-lock.json
+playwright-report/
+test-results/
+.remember/

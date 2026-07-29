@@ -31,15 +31,15 @@ Its weaknesses drive this redesign: cloud dependency, one API call per text box,
 
 ## Decisions (settled 2026-07-29)
 
-| Decision | Choice |
-|---|---|
-| App shell | Electron + TypeScript, one language end to end |
-| LLM runtime | Managed Ollama behind a backend abstraction; embedded engine possible later |
-| Release gate | PPTX, XLSX, PDF, PNG, JPG all translating with zero text loss |
-| Image text | Full in-place translation via local vision models |
-| License | AGPL-3.0 |
-| Context menu label | "Translate with local translate" |
-| Platform | Windows first (Charlie's machine); nothing chosen precludes cross-platform later |
+| Decision           | Choice                                                                           |
+| ------------------ | -------------------------------------------------------------------------------- |
+| App shell          | Electron + TypeScript, one language end to end                                   |
+| LLM runtime        | Managed Ollama behind a backend abstraction; embedded engine possible later      |
+| Release gate       | PPTX, XLSX, PDF, PNG, JPG all translating with zero text loss                    |
+| Image text         | Full in-place translation via local vision models                                |
+| License            | AGPL-3.0                                                                         |
+| Context menu label | "Translate with local translate"                                                 |
+| Platform           | Windows first (Charlie's machine); nothing chosen precludes cross-platform later |
 
 ## Target hardware profile
 
@@ -84,12 +84,12 @@ Every format reduces to positioned text segments.
 
 ```ts
 interface TextSegment {
-  id: string;              // stable address, e.g. "slide3/shape7/para2"
-  text: string;            // source text, line breaks preserved
-  box: { w: number; h: number };   // fit constraint (pt or px)
-  font: FontSpec;          // family, size, bold, italic, color
-  context: string;         // "slide title", "table cell", "image region"
-  kind: 'shape' | 'table-cell' | 'sheet-cell' | 'pdf-block' | 'image-region' | 'notes';
+  id: string // stable address, e.g. "slide3/shape7/para2"
+  text: string // source text, line breaks preserved
+  box: { w: number; h: number } // fit constraint (pt or px)
+  font: FontSpec // family, size, bold, italic, color
+  context: string // "slide title", "table cell", "image region"
+  kind: 'shape' | 'table-cell' | 'sheet-cell' | 'pdf-block' | 'image-region' | 'notes'
 }
 ```
 
@@ -113,10 +113,10 @@ One shared module used by every adapter and the image overlay renderer.
 
 ```ts
 interface TranslationBackend {
-  listModels(): Promise<ModelInfo[]>;
-  pullModel(name: string, onProgress): Promise<void>;
-  translateBatch(req: BatchRequest): Promise<BatchResponse>;  // JSON-schema constrained
-  readImageText(image: Buffer, langPair): Promise<ImageRegion[]>;
+  listModels(): Promise<ModelInfo[]>
+  pullModel(name: string, onProgress): Promise<void>
+  translateBatch(req: BatchRequest): Promise<BatchResponse> // JSON-schema constrained
+  readImageText(image: Buffer, langPair): Promise<ImageRegion[]>
 }
 ```
 
@@ -141,14 +141,14 @@ interface TranslationBackend {
 
 ## Format adapters
 
-| Format | Engine | Notes |
-|---|---|---|
-| PPTX | In-house OOXML layer: JSZip + XML walk of `a:r`/`a:t` runs, `a:rPr sz` for size | No python-pptx equivalent exists in JS (verified 2026-07); wrappers are pre-1.0 and do this internally anyway. Covers text boxes, placeholders (with layout/master inheritance for box geometry and default sizes), tables, grouped shapes, SmartArt, speaker notes. |
-| XLSX | `@protobi/exceljs` (live community fork; upstream ExcelJS stalled ~3 years) | Box = column width x row height. CJK font-size logic ported from becquet. Known fork gaps (pivot tables, exotic conditional formats) accepted and documented. |
-| PDF | `mupdf` npm 1.28+ (official Artifex WASM port, AGPL) | Structured text with rects, redaction annotations, text insertion. All three becquet lessons implemented. Image-preservation behavior of JS redactions is under-documented upstream, so a spike test gates this adapter's phase. |
-| PNG/JPG | Vision model -> FitEngine -> skia-canvas overlay -> sharp for I/O and compositing | Vision model returns text regions with bounding boxes. jimp ruled out (bitmap fonts, no CJK). |
-| Embedded images in PPTX | Same image sub-pipeline; media part is extracted, translated, re-embedded | Required for the benchmark deck. |
-| DOCX | Post-release: same in-house OOXML approach walking `w:r`/`w:t` | Not in the release gate. |
+| Format                  | Engine                                                                            | Notes                                                                                                                                                                                                                                                                |
+| ----------------------- | --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| PPTX                    | In-house OOXML layer: JSZip + XML walk of `a:r`/`a:t` runs, `a:rPr sz` for size   | No python-pptx equivalent exists in JS (verified 2026-07); wrappers are pre-1.0 and do this internally anyway. Covers text boxes, placeholders (with layout/master inheritance for box geometry and default sizes), tables, grouped shapes, SmartArt, speaker notes. |
+| XLSX                    | `@protobi/exceljs` (live community fork; upstream ExcelJS stalled ~3 years)       | Box = column width x row height. CJK font-size logic ported from becquet. Known fork gaps (pivot tables, exotic conditional formats) accepted and documented.                                                                                                        |
+| PDF                     | `mupdf` npm 1.28+ (official Artifex WASM port, AGPL)                              | Structured text with rects, redaction annotations, text insertion. All three becquet lessons implemented. Image-preservation behavior of JS redactions is under-documented upstream, so a spike test gates this adapter's phase.                                     |
+| PNG/JPG                 | Vision model -> FitEngine -> skia-canvas overlay -> sharp for I/O and compositing | Vision model returns text regions with bounding boxes. jimp ruled out (bitmap fonts, no CJK).                                                                                                                                                                        |
+| Embedded images in PPTX | Same image sub-pipeline; media part is extracted, translated, re-embedded         | Required for the benchmark deck.                                                                                                                                                                                                                                     |
+| DOCX                    | Post-release: same in-house OOXML approach walking `w:r`/`w:t`                    | Not in the release gate.                                                                                                                                                                                                                                             |
 
 ## Benchmark harness
 
@@ -174,14 +174,14 @@ The "constantly evolving service" mechanism.
 
 ## Error handling principles
 
-| Failure | Behavior |
-|---|---|
-| Backend/model call fails | Retry once, then per-segment fallback, then keep original text; log with segment id |
-| Structured output invalid | Same ladder; never trust unparsed text into a document |
-| Font missing for measurement | Fall back to bundled Noto fonts; log substitution |
-| Fit impossible even at 0.5 pt | Insert at 0.5 pt anyway, flag segment in the run report |
-| Ollama spawn fails | Surface actionable error with log path; app remains usable for benchmark browsing |
-| Any unexpected adapter error | Original file is never modified in place; output is always written to a new file |
+| Failure                       | Behavior                                                                            |
+| ----------------------------- | ----------------------------------------------------------------------------------- |
+| Backend/model call fails      | Retry once, then per-segment fallback, then keep original text; log with segment id |
+| Structured output invalid     | Same ladder; never trust unparsed text into a document                              |
+| Font missing for measurement  | Fall back to bundled Noto fonts; log substitution                                   |
+| Fit impossible even at 0.5 pt | Insert at 0.5 pt anyway, flag segment in the run report                             |
+| Ollama spawn fails            | Surface actionable error with log path; app remains usable for benchmark browsing   |
+| Any unexpected adapter error  | Original file is never modified in place; output is always written to a new file    |
 
 ## Testing
 

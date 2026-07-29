@@ -1,0 +1,13 @@
+appId: com.becquet.localtranslate
+productName: local_translate
+directories:
+  output: dist_installer
+files:
+  - out/**
+  - package.json
+win:
+  target: nsis
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  artifactName: local_translate-setup-${version}.exe

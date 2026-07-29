@@ -97,6 +97,7 @@ Boundary rule: `src/core` never imports Electron or renderer code, so the whole 
 **Goal:** A committed, building, testable Electron+TS skeleton wired to the GitHub repo.
 
 **Tasks:**
+
 1. `npm create` Electron+Vite+TS scaffold; pin versions; `LICENSE` (AGPL-3.0), `.gitignore`, `README.md` stub with the problem statement.
 2. vitest + first trivial test green; Playwright smoke test launches the empty window.
 3. lint (eslint + prettier) + `npm run check` script (typecheck + lint + test).
@@ -115,6 +116,7 @@ Boundary rule: `src/core` never imports Electron or renderer code, so the whole 
 **Goal:** Headless pipeline proven end to end against a fake adapter: segments in, validated fitted translations out, via a live managed Ollama.
 
 **Tasks:**
+
 1. `segments.ts` types + `adapter.ts` interface + in-memory FakeAdapter for tests.
 2. `fonts.ts`: bundle Noto Sans + Noto Sans CJK, registration with skia-canvas, family-fallback resolution, substitution logging.
 3. `fit-engine.ts` (TDD against metrics fixtures): wrap at box width, measure block, descend 1 pt steps above 6 pt / 0.5 pt below, floor 0.5 pt; returns `{ fontSize, lines[] }`; property test: result always fits, larger size never fits.
@@ -125,6 +127,7 @@ Boundary rule: `src/core` never imports Electron or renderer code, so the whole 
 7. `pipeline.ts`: orchestration with progress events; CLI entry (`npm run translate -- <file> <src> <tgt>`) using FakeAdapter.
 
 **Interfaces produced (later phases rely on these exact shapes):**
+
 ```ts
 FormatAdapter { extensions: string[]; extract(path): Promise<TextSegment[]>; apply(path, out, translated: TranslatedSegment[]): Promise<void> }
 FitEngine.fit(text, box, font): { fontSize: number; lines: string[] }
@@ -143,6 +146,7 @@ Pipeline.run(file, langPair, opts, onProgress): Promise<RunReport>
 **Goal:** Real decks translate end to end with zero text loss; first usable UI.
 
 **Tasks:**
+
 1. `ooxml.ts` (TDD on hand-built minimal decks): open zip, DOM-parse slide XML, enumerate `a:t` runs grouped by paragraph/shape, write back losslessly (byte-identical when nothing edited).
 2. `geometry.ts`: shape box from `spPr`; placeholder box + default font size inheritance layout -> master; table cell boxes from grid geometry; grouped shape recursion with child transform.
 3. `pptx-adapter.ts`: extract (text boxes, placeholders, tables, grouped shapes, SmartArt text, speaker notes) -> apply with FitEngine sizes; run-format preservation (first-run formatting carries, becquet style); skip-list for non-translatable runs (numbers, whitespace).
@@ -160,6 +164,7 @@ Pipeline.run(file, langPair, opts, onProgress): Promise<RunReport>
 **Goal:** PNG/JPG files and images embedded in pptx get in-place translated text.
 
 **Tasks:**
+
 1. Spike (gates the phase): bbox accuracy of qwen3-vl and gemma4 vision on 10 labeled fixture images; decide prompt strategy (normalized coords, region re-verification crop pass) and accuracy threshold.
 2. `regions.ts`: readImageText via backend vision call; bbox sanity validation (bounds, overlap, min size); confidence gating - low-confidence regions are reported, not painted.
 3. `overlay.ts`: background sampling for fill color, FitEngine sizing, skia-canvas text draw, sharp composite; original image never discarded (output is a copy).
@@ -177,6 +182,7 @@ Pipeline.run(file, langPair, opts, onProgress): Promise<RunReport>
 **Goal:** The model question answered with evidence; champion crowned.
 
 **Tasks:**
+
 1. `corpus.ts` + fixture manifest: benchmark deck + synthetic hard cases (long German compounds, dense CJK tables, tiny boxes, image text).
 2. `harness.ts`: corpus x roster matrix runner reusing Pipeline; resumable; per-run isolation of model + settings.
 3. `metrics.ts`: completeness %, fidelity (overflow count, min font size, fallback-ladder hits), speed (segments/min, tokens/s).
@@ -196,6 +202,7 @@ Pipeline.run(file, langPair, opts, onProgress): Promise<RunReport>
 **Goal:** Release-gate formats complete.
 
 **Tasks:**
+
 1. `xlsx-adapter.ts` on @protobi/exceljs (TDD): cell text + rich-text runs, box from column width x row height (with merged-cell union), becquet CJK font logic ported, number/date/formula cells skipped; round-trip suite incl. styles.
 2. PDF spike (gates PDF work): mupdf npm redaction behavior over images/line art on fixture PDFs; verify structured-text rects + insertion positioning (upstream issue #157); go/no-go on mupdf vs escalation options.
 3. `pdf-adapter.ts`: structured text blocks -> tight rects from visible spans -> segments; redact with image/line-art preservation; measure via FitEngine (fontkit metrics for PDF font advances where canvas metrics diverge); single insertion per block; CJK font embedding fallback chain.
@@ -212,6 +219,7 @@ Pipeline.run(file, langPair, opts, onProgress): Promise<RunReport>
 **Goal:** The "right-click any file" product experience, installable.
 
 **Tasks:**
+
 1. Full settings UI backed by user-editable JSON config: model per task (text/vision/judge), language pairs, fit rules, glossary file path.
 2. Model manager UI: list/pull/remove, per-model capability flags, champion indicator.
 3. `context-menu.ts` + installer integration: Explorer verb "Translate with local translate" for .pptx/.xlsx/.pdf/.png/.jpg; invoking it opens the app straight into a translation run for that file.
@@ -230,6 +238,7 @@ Pipeline.run(file, langPair, opts, onProgress): Promise<RunReport>
 **Goal:** The service that outlives any single model.
 
 **Tasks:**
+
 1. Challenger flow UI: enter any Ollama model name -> pull -> benchmark vs champion on stored corpus -> promote/reject with one click; result appended to results history.
 2. Model watchlist doc + lightweight check: surface new notable Ollama library releases in the model manager (manual refresh, no telemetry).
 3. Docs: README (install, privacy stance, how it works), CONTRIBUTING, benchmark methodology page with launch-cohort results.
