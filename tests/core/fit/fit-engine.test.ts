@@ -51,6 +51,38 @@ describe('fit-engine', () => {
     expect(r.overflowed).toBe(true)
   })
 
+  // Regression: a word-wrap bug let a token that STARTS a line skip the
+  // force-break check entirely (the `line === ''` branch short-circuited
+  // before ever measuring the token), so an oversized leading token was
+  // accepted as a single unbroken line. The engine then had to shrink the
+  // font drastically just to make that one giant line's width fit, instead
+  // of wrapping it into several lines at a reasonable size. Self-consistency
+  // checks alone (like the invariant test below) don't catch this: an
+  // unbroken line that "fits" only because the font shrank to a near-floor
+  // size still measures as fitting. These tests assert wrapping actually
+  // happened, not just that whatever size was picked is self-consistent.
+  it('force-breaks an oversized token even when it starts the line', () => {
+    const r = fit('A'.repeat(400), { wPt: 60, hPt: 2000 }, font)
+    expect(r.lines.length).toBeGreaterThan(1)
+    expect(r.overflowed).toBe(false)
+  })
+
+  it('shrinks a leading oversized word about as much as the same word mid-text', () => {
+    const box = { wPt: 60, hPt: 30 }
+    const longWord = 'Antidisestablishmentarianism'
+    const leading = fit(longWord, box, font)
+    const nonLeading = fit(`X ${longWord}`, box, font)
+
+    // Wrapping must actually happen in both cases.
+    expect(leading.lines.length).toBeGreaterThan(1)
+    expect(nonLeading.lines.length).toBeGreaterThan(1)
+
+    // A token that starts a line must not be forced to shrink dramatically
+    // more than the identical token appearing mid-paragraph, where
+    // force-breaking already worked before this fix.
+    expect(Math.abs(leading.fontSizePt - nonLeading.fontSizePt)).toBeLessThanOrEqual(1)
+  })
+
   // Fit invariant over a grid: whatever fits must actually measure inside the box,
   // and one descent step larger must NOT fit (else we shrank too far).
   it('fit invariant + minimality across a fixture grid', () => {

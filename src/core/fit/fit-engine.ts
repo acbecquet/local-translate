@@ -1,6 +1,5 @@
-import { Canvas } from 'skia-canvas'
 import type { Box, FontSpec } from '../segments'
-import { resolveFamily } from './fonts'
+import { measureCtx, resolveFamily } from './fonts'
 
 export interface FitResult {
   fontSizePt: number
@@ -10,8 +9,7 @@ export interface FitResult {
 
 const FLOOR_PT = 0.5
 const LINE_HEIGHT_FACTOR = 1.2
-const canvas = new Canvas(8, 8) // throwaway measurement surface, never rendered
-const ctx = canvas.getContext('2d')
+const ctx = measureCtx()
 
 function setFont(sizePt: number, font: FontSpec): void {
   const { family } = resolveFamily(font.family)
@@ -25,15 +23,15 @@ function width(s: string): number {
   return ctx.measureText(s).width
 }
 
-// CJK Symbols/Punctuation + Unified Ideographs (U+3000-U+9FFF), CJK Compatibility
-// Ideographs (U+F900-U+FAFF), Hiragana + Katakana (U+3040-U+30FF), Fullwidth/Halfwidth
-// forms (U+FF00-U+FFEF). Written with \u escapes (never literal characters): besides
-// tripping eslint's no-irregular-whitespace rule (U+3000 is an ideographic space), a
-// literal U+F900 pasted into a character class is prone to silent NFC normalization to
-// its canonical decomposition U+8C48, which would widen this range to also swallow
-// Hangul syllables, surrogate code points, and the Private Use Area - scripts it was
-// never meant to match.
-const CJK_BREAK_CHAR = /[\u3000-\u9fff\uf900-\ufaff\u3040-\u30ff\uff00-\uffef]/
+// CJK Symbols/Punctuation + Unified Ideographs (U+3000-U+9FFF, which already covers
+// Hiragana/Katakana at U+3040-U+30FF), CJK Compatibility Ideographs (U+F900-U+FAFF),
+// and Fullwidth/Halfwidth forms (U+FF00-U+FFEF). Written with \u escapes (never
+// literal characters): besides tripping eslint's no-irregular-whitespace rule
+// (U+3000 is an ideographic space), a literal U+F900 pasted into a character class
+// is prone to silent NFC normalization to its canonical decomposition U+8C48, which
+// would widen this range to also swallow Hangul syllables, surrogate code points,
+// and the Private Use Area - scripts it was never meant to match.
+const CJK_BREAK_CHAR = /[\u3000-\u9fff\uf900-\ufaff\uff00-\uffef]/
 
 /** Break opportunities: after spaces, and after every CJK char. */
 function tokens(text: string): string[] {
@@ -74,44 +72,57 @@ function breakToken(tok: string, maxW: number): string[] {
   return pieces
 }
 
-function wrapParagraph(par: string, maxW: number): { lines: string[]; fits: boolean } {
+function wrapParagraph(par: string, maxW: number): string[] {
   const lines: string[] = []
   let line = ''
-  let fits = true
 
-  const pushLine = (l: string): void => {
-    if (width(l) > maxW) fits = false
-    lines.push(l)
-  }
-
-  for (const tok of tokens(par)) {
-    if (tok === ' ') {
-      // Trailing space never forces a break by itself; keep accumulating,
-      // final trim happens when the line is flushed.
-      line += line === '' ? '' : tok
-      continue
-    }
-
-    const cand = (line + tok).trimEnd()
-    if (line === '' || width(cand) <= maxW) {
-      line = line + tok
-      continue
-    }
-
-    // tok doesn't fit appended to the current line: flush current line, start fresh.
-    if (line.trimEnd()) pushLine(line.trimEnd())
-
-    // Does the token fit on its own line? If not, force character breaks.
+  // Start a fresh line with `tok`. Used both for the first token of a
+  // paragraph and for a token that didn't fit appended to the previous
+  // line - the same force-break check applies either way, so a token can
+  // never dodge it just by being first.
+  const startLine = (tok: string): void => {
     if (width(tok) > maxW) {
       const pieces = breakToken(tok, maxW)
-      for (let i = 0; i < pieces.length - 1; i++) pushLine(pieces[i])
+      for (let i = 0; i < pieces.length - 1; i++) lines.push(pieces[i])
       line = pieces[pieces.length - 1] ?? ''
     } else {
       line = tok
     }
   }
-  if (line.trimEnd()) pushLine(line.trimEnd())
-  return { lines: lines.length ? lines : [''], fits }
+
+  for (const tok of tokens(par)) {
+    if (tok === ' ') {
+      // Leading/trailing spaces never force a break by themselves.
+      if (line !== '') line += tok
+      continue
+    }
+
+    if (line === '') {
+      startLine(tok)
+      continue
+    }
+
+    const cand = (line + tok).trimEnd()
+    if (width(cand) <= maxW) {
+      line = line + tok
+      continue
+    }
+
+    // tok doesn't fit appended to the current line: flush it, then let
+    // startLine decide how tok begins the next one (forced breaks included).
+    lines.push(line.trimEnd())
+    line = ''
+    startLine(tok)
+  }
+  if (line.trimEnd()) lines.push(line.trimEnd())
+  return lines.length ? lines : ['']
+}
+
+/** Single source of truth for "does this laid-out text fit the box". */
+function fitsBox(lines: string[], sizePt: number, box: Box): boolean {
+  const maxLineW = Math.max(...lines.map((l) => width(l)))
+  const totalH = lines.length * sizePt * LINE_HEIGHT_FACTOR
+  return maxLineW <= box.wPt && totalH <= box.hPt
 }
 
 function layout(
@@ -121,15 +132,8 @@ function layout(
   font: FontSpec
 ): { lines: string[]; fits: boolean } {
   setFont(sizePt, font)
-  let fits = true
-  const lines = text.split('\n').flatMap((par) => {
-    const w = wrapParagraph(par, box.wPt)
-    fits = fits && w.fits
-    return w.lines
-  })
-  const maxLineW = Math.max(...lines.map((l) => width(l)))
-  const totalH = lines.length * sizePt * LINE_HEIGHT_FACTOR
-  return { lines, fits: fits && maxLineW <= box.wPt && totalH <= box.hPt }
+  const lines = text.split('\n').flatMap((par) => wrapParagraph(par, box.wPt))
+  return { lines, fits: fitsBox(lines, sizePt, box) }
 }
 
 function stepDown(sizePt: number): number {
@@ -140,14 +144,13 @@ function stepUp(sizePt: number): number {
 }
 
 export function fit(text: string, box: Box, font: FontSpec): FitResult {
-  let size = font.sizePt
-  while (size >= FLOOR_PT) {
-    const r = layout(text, size, box, font)
-    if (r.fits) return { fontSizePt: size, lines: r.lines, overflowed: false }
+  let size = Math.max(font.sizePt, FLOOR_PT)
+  let result = layout(text, size, box, font)
+  while (!result.fits && size > FLOOR_PT) {
     size = stepDown(size)
+    result = layout(text, size, box, font)
   }
-  const r = layout(text, FLOOR_PT, box, font)
-  return { fontSizePt: FLOOR_PT, lines: r.lines, overflowed: !r.fits }
+  return { fontSizePt: size, lines: result.lines, overflowed: !result.fits }
 }
 
 export const _internals = {
@@ -155,8 +158,7 @@ export const _internals = {
     layout(text, sizePt, box, font),
   measuredFits: (lines: string[], sizePt: number, box: Box, font: FontSpec) => {
     setFont(sizePt, font)
-    const maxW = Math.max(...lines.map((l) => width(l)))
-    return maxW <= box.wPt && lines.length * sizePt * LINE_HEIGHT_FACTOR <= box.hPt
+    return fitsBox(lines, sizePt, box)
   },
   stepUp
 }
