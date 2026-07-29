@@ -12,13 +12,7 @@ export interface Box {
 }
 
 export type SegmentKind =
-  | 'shape'
-  | 'table-cell'
-  | 'sheet-cell'
-  | 'pdf-block'
-  | 'image-region'
-  | 'notes'
-  | 'fake'
+  'shape' | 'table-cell' | 'sheet-cell' | 'pdf-block' | 'image-region' | 'notes' | 'fake'
 
 export interface TextSegment {
   id: string
