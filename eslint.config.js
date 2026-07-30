@@ -22,6 +22,17 @@ export default tseslint.config(
     }
   },
   {
+    // Node ESM utility scripts run directly via `node scripts/<file>.mjs`;
+    // they need Node's globals declared since they sit outside the TS graph.
+    files: ['scripts/**/*.mjs'],
+    languageOptions: {
+      globals: {
+        process: 'readonly',
+        console: 'readonly'
+      }
+    }
+  },
+  {
     // Standalone CommonJS test fixtures spawned as their own `node <file>`
     // process (never imported/bundled), so they run outside the app's
     // ESM/TS module graph and need Node's CJS globals declared explicitly.
