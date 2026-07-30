@@ -11,16 +11,34 @@ const FLOOR_PT = 0.5
 const LINE_HEIGHT_FACTOR = 1.2
 const ctx = measureCtx()
 
+// measureText() is a pure function of (current font state, string content),
+// so its result is safe to memoize per font. The cache is thrown away
+// wholesale on every setFont() call (i.e. once per candidate size the fit
+// loop tries) rather than tracked per-font-string, since within a single
+// layout() pass every measurement shares the one current font anyway - a
+// fresh empty Map per setFont() is both simplest and self-invalidating.
+// This matters a lot for pathological inputs (e.g. one 5000-character
+// token that must be force-broken): wrapParagraph/breakToken and fitsBox
+// both end up measuring many identical substrings (repeated characters, or
+// the same prefix length probed from different starting offsets), and
+// without this cache each of those re-measures the real canvas.
+let widthCache = new Map<string, number>()
+
 function setFont(sizePt: number, font: FontSpec): void {
   const { family } = resolveFamily(font.family)
   const weight = font.bold ? 'bold ' : ''
   const style = font.italic ? 'italic ' : ''
   // 1px == 1pt convention (see plan Global Constraints)
   ctx.font = `${style}${weight}${sizePt}px "${family}"`
+  widthCache = new Map()
 }
 
 function width(s: string): number {
-  return ctx.measureText(s).width
+  const cached = widthCache.get(s)
+  if (cached !== undefined) return cached
+  const w = ctx.measureText(s).width
+  widthCache.set(s, w)
+  return w
 }
 
 // CJK Symbols/Punctuation + Unified Ideographs (U+3000-U+9FFF, which already covers
@@ -54,21 +72,54 @@ function tokens(text: string): string[] {
   return out
 }
 
+/**
+ * Longest prefix of chars[start..] (as a character count) that fits within
+ * maxW, found by exponential ("galloping") search for a bounding range
+ * followed by binary search within it - never measures the full remaining
+ * tail up front, which would be wasteful precisely when the answer is
+ * small (e.g. a single glyph already wider than maxW, forcing one
+ * character per piece: an up-front full-range binary search would probe
+ * huge candidate substrings on every piece just to discover the answer is
+ * 1). A single character is always accepted even if it alone exceeds maxW
+ * (progress guarantee - matches breakToken's pre-existing behavior of
+ * letting an oversized lone character become its own piece rather than
+ * looping forever).
+ */
+function fitLength(chars: string[], start: number, maxW: number): number {
+  const remaining = chars.length - start
+  if (remaining === 1 || width(chars[start]) > maxW) return 1
+
+  let fitLen = 1
+  let probeLen = 2
+  while (probeLen <= remaining && width(chars.slice(start, start + probeLen).join('')) <= maxW) {
+    fitLen = probeLen
+    probeLen *= 2
+  }
+
+  // Largest true value in [fitLen, hi]: fitLen is confirmed to fit; hi may
+  // or may not (either it's a confirmed non-fit from the loop above, or the
+  // loop stopped because it hit the end of the token and hi was never
+  // measured - either way the search below still needs to check it).
+  let lo = fitLen
+  let hi = Math.min(probeLen, remaining)
+  while (lo < hi) {
+    const mid = lo + Math.ceil((hi - lo) / 2)
+    if (width(chars.slice(start, start + mid).join('')) <= maxW) lo = mid
+    else hi = mid - 1
+  }
+  return lo
+}
+
 /** Break a single token into pieces that each individually fit within maxW. */
 function breakToken(tok: string, maxW: number): string[] {
   const chars = [...tok]
   const pieces: string[] = []
-  let piece = ''
-  for (const ch of chars) {
-    const cand = piece + ch
-    if (piece !== '' && width(cand) > maxW) {
-      pieces.push(piece)
-      piece = ch
-    } else {
-      piece = cand
-    }
+  let start = 0
+  while (start < chars.length) {
+    const len = fitLength(chars, start, maxW)
+    pieces.push(chars.slice(start, start + len).join(''))
+    start += len
   }
-  if (piece) pieces.push(piece)
   return pieces
 }
 
