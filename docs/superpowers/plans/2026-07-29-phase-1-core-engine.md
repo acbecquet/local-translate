@@ -81,7 +81,7 @@ export interface FormatAdapter {
 export function adapterFor(filePath: string, adapters: FormatAdapter[]): FormatAdapter | null
 ```
 
-- [ ] **Step 1: Install phase deps**
+- [x] **Step 1: Install phase deps**
 
 ```bash
 npm install skia-canvas ollama zod
@@ -93,7 +93,7 @@ Verify skia-canvas native binary loads on this machine: `node -e "const {Canvas}
 Expected: `skia-ok number`.
 If the binary fails to load, install `@napi-rs/canvas` instead and note the swap in fonts.ts (Task 2 isolates the choice).
 
-- [ ] **Step 2: Write failing FakeAdapter test**
+- [x] **Step 2: Write failing FakeAdapter test**
 
 `tests/core/fake-adapter.test.ts`:
 
@@ -143,9 +143,9 @@ describe('FakeAdapter', () => {
 })
 ```
 
-- [ ] **Step 3: Run to verify failure** - `npx vitest run tests/core/fake-adapter.test.ts` fails on missing modules.
+- [x] **Step 3: Run to verify failure** - `npx vitest run tests/core/fake-adapter.test.ts` fails on missing modules.
 
-- [ ] **Step 4: Implement**
+- [x] **Step 4: Implement**
 
 `src/core/segments.ts`: exactly the interfaces above.
 
@@ -190,7 +190,7 @@ export class FakeAdapter implements FormatAdapter {
 }
 ```
 
-- [ ] **Step 5: Verify pass, commit** - `npx vitest run tests/core/fake-adapter.test.ts` green, then:
+- [x] **Step 5: Verify pass, commit** - `npx vitest run tests/core/fake-adapter.test.ts` green, then:
 
 ```bash
 git add src/core/ tests/core/ package.json package-lock.json
@@ -224,7 +224,7 @@ export interface FitResult {
 export function fit(text: string, box: Box, font: FontSpec): FitResult
 ```
 
-- [ ] **Step 1: Fetch Noto fonts into `fonts/`**
+- [x] **Step 1: Fetch Noto fonts into `fonts/`**
 
 ```bash
 curl -sL -o fonts/NotoSans-Regular.ttf  https://github.com/notofonts/latin-greek-cyrillic/raw/main/fonts/NotoSans/googlefonts/ttf/NotoSans-Regular.ttf
@@ -236,7 +236,7 @@ If a URL 404s (repo layout moves), locate the current release asset on github.co
 Add `fonts/README.md` noting the SIL OFL 1.1 license of the bundled fonts.
 Expected: three files present, each > 100 KB; the SC font is several MB.
 
-- [ ] **Step 2: Write failing fonts test**
+- [x] **Step 2: Write failing fonts test**
 
 `tests/core/fit/fonts.test.ts`:
 
@@ -260,7 +260,7 @@ describe('fonts', () => {
 })
 ```
 
-- [ ] **Step 3: Implement fonts.ts**
+- [x] **Step 3: Implement fonts.ts**
 
 ```ts
 import { FontLibrary } from 'skia-canvas'
@@ -295,7 +295,7 @@ export function resolveFamily(requested: string): { family: string; substituted:
 
 (Adjust `FontLibrary` calls if @napi-rs/canvas was swapped in Task 1; keep this file the only place that knows which canvas lib is used - export a `measureCtx()` helper for fit-engine.)
 
-- [ ] **Step 4: Write failing fit-engine test (the regression fixture matrix)**
+- [x] **Step 4: Write failing fit-engine test (the regression fixture matrix)**
 
 `tests/core/fit/fit-engine.test.ts`:
 
@@ -383,7 +383,7 @@ describe('fit-engine', () => {
 
 `measuredFits`, `stepUp`, `layoutAt` are exported test helpers from fit-engine (`export const _internals` object) so the invariant checks use the engine's own measurement, not a reimplementation.
 
-- [ ] **Step 5: Implement fit-engine.ts**
+- [x] **Step 5: Implement fit-engine.ts**
 
 ```ts
 import { Canvas } from 'skia-canvas'
@@ -504,7 +504,7 @@ export const _internals = {
 
 (The plan shows the intended algorithm; the implementer refines the force-break branch as tests demand, keeping the invariant test green.)
 
-- [ ] **Step 6: Verify, commit**
+- [x] **Step 6: Verify, commit**
 
 ```bash
 npx vitest run tests/core/fit
@@ -564,7 +564,7 @@ export const OLLAMA_STANDALONE_URL: string // windows amd64 zip, latest release
 - Orphan cleanup: write a pid file pointing at a spawned fake, call `ensureOllama`, assert the old pid is gone.
 - `downloadFile`: local http server serving a known buffer; assert bytes, progress calls, and sha mismatch -> rejects and deletes partial file.
 
-- [ ] Steps: failing tests -> implement -> `npx vitest run tests/core/ollama` green -> commit `feat: managed ollama lifecycle and downloader`.
+- [x] Steps: failing tests -> implement -> `npx vitest run tests/core/ollama` green -> commit `feat: managed ollama lifecycle and downloader`.
 
 ---
 
@@ -636,7 +636,7 @@ Document context: {groupContext}
 User: {json array of {id, text}}
 ```
 
-- [ ] Steps: failing tests -> implement -> `npx vitest run tests/core/translate` green -> commit `feat: batch translation protocol with ollama backend`.
+- [x] Steps: failing tests -> implement -> `npx vitest run tests/core/translate` green -> commit `feat: batch translation protocol with ollama backend`.
 
 ---
 
@@ -689,13 +689,13 @@ Wires FakeAdapter (only adapter so far), `ensureOllama`, `OllamaBackend`, prints
 
 ### Task 6: Live E2E gate (integrator, real Ollama + gemma4:e4b)
 
-- [ ] **Step 1: Build the 50-segment fixture** `fixtures/gate-50.fake.json`: 25 EN business segments (varied lengths, a table-cell-sized 3-word one, a 60-word paragraph, numbers-only, an acronym-heavy one) and 25 ZH equivalents, boxes sized to force some shrinking.
-- [ ] **Step 2: Stop any running Ollama** (`taskkill` the tray/serve processes - they were incidentally started earlier; verify port 11434 is dead).
-- [ ] **Step 3: Run** `npm run translate -- fixtures/gate-50.fake.json English "Chinese (Simplified)" --model gemma4:e4b` -> expect: lifecycle spawns serve on 11435, report shows total=50, translated=50 (or every miss listed in keptOriginal with reasons), no overflowed=floor cases.
-- [ ] **Step 4: Reverse direction** ZH->EN on the same fixture.
-- [ ] **Step 5: Orphan check** - kill the CLI mid-run (second invocation), rerun, assert no duplicate ollama processes after completion (`tasklist | findstr ollama`).
-- [ ] **Step 6: Full gates** - `npm run check` green; commit fixture + any fixes; push; CI green.
-- [ ] **Step 7: Tick this plan's checkboxes, update .remember, report** with the real RunReport numbers.
+- [x] **Step 1: Build the 50-segment fixture** `fixtures/gate-50.fake.json`: 25 EN business segments (varied lengths, a table-cell-sized 3-word one, a 60-word paragraph, numbers-only, an acronym-heavy one) and 25 ZH equivalents, boxes sized to force some shrinking.
+- [x] **Step 2: Stop any running Ollama** (`taskkill` the tray/serve processes - they were incidentally started earlier; verify port 11434 is dead).
+- [x] **Step 3: Run** `npm run translate -- fixtures/gate-50.fake.json English "Chinese (Simplified)" --model gemma4:e4b` -> expect: lifecycle spawns serve on 11435, report shows total=50, translated=50 (or every miss listed in keptOriginal with reasons), no overflowed=floor cases.
+- [x] **Step 4: Reverse direction** ZH->EN on the same fixture.
+- [x] **Step 5: Orphan check** - kill the CLI mid-run (second invocation), rerun, assert no duplicate ollama processes after completion (`tasklist | findstr ollama`).
+- [x] **Step 6: Full gates** - `npm run check` green; commit fixture + any fixes; push; CI green.
+- [x] **Step 7: Tick this plan's checkboxes, update .remember, report** with the real RunReport numbers.
 
 ## Self-review
 
@@ -703,3 +703,11 @@ Wires FakeAdapter (only adapter so far), `ensureOllama`, `OllamaBackend`, prints
 - No placeholders: every module has real code or an exact behavior contract + test strategy; the two "implementer refines" notes are bounded by concrete invariant tests that define done.
 - Type consistency: `FitResult.fontSizePt`/`overflowed` names match between Tasks 2 and 5; `BatchRequest`/`BatchResponse` match between Tasks 4 and 5; `OllamaConnection.baseUrl` consumed by backend constructor.
 - Deviation recorded: OLLAMA_MODELS reuses an existing user store (contra spec's blanket app-data rule) - deliberate, documented above.
+
+## Execution notes (2026-07-29)
+
+- Task 2 Step 1 correction: the brief's original notofonts URLs 404'd (served HTML error pages disguised as .ttf, caught by magic-byte checks).
+  Final working sources are recorded in [fonts/README.md](../../../fonts/README.md) (notofonts/NotoSans instance_ttf for Latin, notofonts/noto-cjk for SC).
+- Task 5 ruling: --model is optional with DEFAULT_MODEL gemma4:e4b.
+- Post-gate final-review fix wave (04ca077, 3142e93): fit floor clamp for fractional sizes, probe transport errors no longer persisted as caps, binary-search line breaking (pathological fit test 4320ms -> ~50ms, fixes CI timeout on slow runners), groupKey added to TextSegment, adapterFor longest-match, duplicate-id guard in runPipeline, exit 0 for all-skipped-untranslatable runs, numbers-only segment in gate fixture.
+- LOCAL_TRANSLATE_DATA_DIR env override removed in favor of LOCALAPPDATA (nothing depended on it).
