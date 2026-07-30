@@ -48,6 +48,8 @@ export interface TextboxShapeSpec {
   bold?: boolean
   fontFamily?: string
   name?: string
+  /** Explicit `a:bodyPr` insets (EMU); any side omitted falls back to the OOXML default. */
+  insetsEmu?: { l?: number; r?: number; t?: number; b?: number }
 }
 
 export interface PlaceholderShapeSpec {
@@ -59,10 +61,20 @@ export interface PlaceholderShapeSpec {
   name?: string
 }
 
+export interface TableCellSpec {
+  text: string
+  /** Set only on a merge's master (top-left) cell. */
+  gridSpan?: number
+  rowSpan?: number
+  /** Set only on a merge's continuation (placeholder) cells. */
+  hMerge?: boolean
+  vMerge?: boolean
+}
+
 export interface TableShapeSpec {
   kind: 'table'
-  /** rows[r][c] = cell text. */
-  rows: string[][]
+  /** rows[r][c] = cell text, or a TableCellSpec for merged cells. */
+  rows: (string | TableCellSpec)[][]
   colWidthsEmu: number[]
   rowHeightsEmu: number[]
   box: EmuBox
@@ -112,6 +124,17 @@ function xmlDecl(): string {
 
 function xfrmXml(box: EmuBox): string {
   return `<a:xfrm><a:off x="${box.xEmu}" y="${box.yEmu}"/><a:ext cx="${box.wEmu}" cy="${box.hEmu}"/></a:xfrm>`
+}
+
+function bodyPrXml(insetsEmu?: { l?: number; r?: number; t?: number; b?: number }): string {
+  if (!insetsEmu) return '<a:bodyPr/>'
+  const attrs = [
+    insetsEmu.l !== undefined ? `lIns="${insetsEmu.l}"` : null,
+    insetsEmu.r !== undefined ? `rIns="${insetsEmu.r}"` : null,
+    insetsEmu.t !== undefined ? `tIns="${insetsEmu.t}"` : null,
+    insetsEmu.b !== undefined ? `bIns="${insetsEmu.b}"` : null
+  ].filter((a): a is string => a !== null)
+  return attrs.length ? `<a:bodyPr ${attrs.join(' ')}/>` : '<a:bodyPr/>'
 }
 
 function relationshipsXml(rels: { id: string; type: string; target: string }[]): string {
@@ -178,7 +201,7 @@ function buildShapeXml(
         `<p:sp><p:nvSpPr><p:cNvPr id="${id}" name="${escAttr(name)}"/>` +
         '<p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr/></p:nvSpPr>' +
         `<p:spPr>${xfrmXml(shape.box)}<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>` +
-        '<p:txBody><a:bodyPr/><a:lstStyle/>' +
+        `<p:txBody>${bodyPrXml(shape.insetsEmu)}<a:lstStyle/>` +
         paragraphsXml(shape.text, {
           fontPt: shape.fontPt,
           bold: shape.bold,
@@ -204,12 +227,23 @@ function buildShapeXml(
       const rowsXml = shape.rows
         .map((row, ri) => {
           const cells = row
-            .map(
-              (cell) =>
-                '<a:tc><a:txBody><a:bodyPr/><a:lstStyle/>' +
-                `<a:p><a:r><a:t>${escText(cell)}</a:t></a:r></a:p>` +
+            .map((cell) => {
+              const spec: TableCellSpec = typeof cell === 'string' ? { text: cell } : cell
+              const attrs = [
+                spec.gridSpan !== undefined ? `gridSpan="${spec.gridSpan}"` : null,
+                spec.rowSpan !== undefined ? `rowSpan="${spec.rowSpan}"` : null,
+                spec.hMerge ? 'hMerge="1"' : null,
+                spec.vMerge ? 'vMerge="1"' : null
+              ]
+                .filter((a): a is string => a !== null)
+                .join(' ')
+              const tcAttrs = attrs ? ` ${attrs}` : ''
+              return (
+                `<a:tc${tcAttrs}><a:txBody><a:bodyPr/><a:lstStyle/>` +
+                `<a:p><a:r><a:t>${escText(spec.text)}</a:t></a:r></a:p>` +
                 '</a:txBody><a:tcPr/></a:tc>'
-            )
+              )
+            })
             .join('')
           return `<a:tr h="${shape.rowHeightsEmu[ri]}">${cells}</a:tr>`
         })
