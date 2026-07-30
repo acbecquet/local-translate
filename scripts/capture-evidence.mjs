@@ -19,9 +19,13 @@ if (!/^[a-z0-9-]+$/.test(phase)) {
 // Per-phase evidence definition: the original document(s) and the live
 // translation runs to perform on them. Extend per phase as adapters land
 // (phase-2 adds a real .pptx original once the benchmark deck is in).
+// Charlie's machine rule: dev/evidence runs stay SMALL (small fixture, small
+// model) so a capture never saturates RAM/GPU. The full 50-segment fixture +
+// larger models are benchmark-phase territory, run deliberately, not here.
 const PHASES = {
   'phase-1': {
-    original: 'fixtures/gate-50.fake.json',
+    original: 'fixtures/gate-5.fake.json',
+    model: 'llama3.2:3b',
     runs: [
       { name: 'translated-en-zh.fake.json', source: 'English', target: 'Chinese (Simplified)' },
       { name: 'translated-zh-en.fake.json', source: 'Chinese (Simplified)', target: 'English' }
@@ -45,7 +49,7 @@ copyFileSync(path.join(root, def.original), path.join(outDir, originalName))
 const rows = []
 for (const run of def.runs) {
   const outFile = path.join('EVIDENCE', phase, run.name)
-  const cmd = `npx tsx src/core/cli.ts ${def.original} "${run.source}" "${run.target}" --out ${outFile}`
+  const cmd = `npx tsx src/core/cli.ts ${def.original} "${run.source}" "${run.target}" --model ${def.model} --out ${outFile}`
   process.stdout.write(`[evidence] ${cmd}\n`)
   execSync(`${cmd} 2>&1`, { cwd: root, stdio: ['ignore', 'inherit', 'inherit'], timeout: 900_000 })
   rows.push({ name: run.name, source: run.source, target: run.target })

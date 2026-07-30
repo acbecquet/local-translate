@@ -1,5 +1,5 @@
 import { execFile, spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { createWriteStream, existsSync } from 'node:fs'
 import { access, mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
@@ -111,11 +111,26 @@ export async function ensureOllama(opts: {
     // Real ollama.exe doesn't act on that, so it isn't load-bearing for
     // production cleanup - the pid-file orphan check above is - but it
     // costs nothing and keeps the child from being truly detached.
-    // stdout/stderr are ignored: we don't parse ollama's console output.
-    stdio: ['pipe', 'ignore', 'ignore']
+    // stdout/stderr are captured to a log file: ollama reports GPU
+    // discovery (ROCm/Vulkan vs CPU fallback) only on its console, and
+    // that evidence is essential when diagnosing why inference ran on CPU.
+    stdio: ['pipe', 'pipe', 'pipe']
   }
 
   const child = await spawnChecked(command, args, spawnOptions)
+  // Best-effort serve log; never let logging break the lifecycle.
+  try {
+    const logStream = createWriteStream(path.join(opts.appDataDir, 'ollama-serve.log'), {
+      flags: 'a'
+    })
+    logStream.write(
+      `\n===== ollama serve spawned ${new Date().toISOString()} pid=${child.pid} =====\n`
+    )
+    child.stdout?.pipe(logStream)
+    child.stderr?.pipe(logStream)
+  } catch {
+    // logging is diagnostics only
+  }
   if (child.pid == null) {
     throw new Error(`ollama serve spawned without a pid (${command})`)
   }
