@@ -198,7 +198,13 @@ export function fit(text: string, box: Box, font: FontSpec): FitResult {
   let size = Math.max(font.sizePt, FLOOR_PT)
   let result = layout(text, size, box, font)
   while (!result.fits && size > FLOOR_PT) {
-    size = stepDown(size)
+    // Clamped, not just stepped: for a fractional starting size, stepDown's
+    // -0.5 descent (below 6pt) can jump straight past FLOOR_PT (e.g.
+    // 0.8 -> 0.3) rather than landing on it exactly. Clamping every step to
+    // FLOOR_PT guarantees fontSizePt never goes below the floor, and since
+    // the loop condition above already stops as soon as size === FLOOR_PT,
+    // clamping here can't cause it to spin forever at the floor.
+    size = Math.max(stepDown(size), FLOOR_PT)
     result = layout(text, size, box, font)
   }
   return { fontSizePt: size, lines: result.lines, overflowed: !result.fits }

@@ -376,6 +376,34 @@ describe('runPipeline', () => {
     expect(applied.segments).toEqual([])
   })
 
+  it('rejects with a clear error naming the duplicate id when the adapter extracts one, before any translation work and without touching the input file', async () => {
+    const s1 = seg({ id: 'dup', text: 'Hello', context: 'doc' })
+    const s2 = seg({ id: 'dup', text: 'World', context: 'doc' })
+    const { file } = writeFixture([s1, s2])
+    const originalContents = readFileSync(file, 'utf8')
+
+    const translateBatch = vi.fn()
+    const backend: TranslationBackend = {
+      listModels: vi.fn().mockResolvedValue([]),
+      pullModel: vi.fn().mockResolvedValue(undefined),
+      translateBatch
+    }
+
+    await expect(
+      runPipeline({
+        file,
+        sourceLang: 'English',
+        targetLang: 'French',
+        model: 'test-model',
+        adapter,
+        backend
+      })
+    ).rejects.toThrow(/dup/)
+
+    expect(translateBatch).not.toHaveBeenCalled()
+    expect(readFileSync(file, 'utf8')).toBe(originalContents)
+  })
+
   it('produces a stable RunReport shape with a non-negative duration', async () => {
     const s1 = seg({ id: 's1', text: 'Hello', context: 'doc' })
     const { file } = writeFixture([s1])

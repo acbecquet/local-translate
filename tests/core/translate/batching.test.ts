@@ -103,6 +103,25 @@ describe('groupSegments', () => {
     const c = seg({ id: 's3', text: 'z'.repeat(1000), context: 'slide1' })
     expect(groupSegments([a, b, c])).toEqual([[a, b], [c]])
   })
+
+  it('groups by groupKey (exact match) instead of context when an adapter sets it, even across different context strings', () => {
+    const title = seg({ id: 's1', text: 'Hello', context: 'slide title', groupKey: 'slide-3' })
+    const body = seg({ id: 's2', text: 'World', context: 'body paragraph', groupKey: 'slide-3' })
+    expect(groupSegments([title, body])).toEqual([[title, body]])
+  })
+
+  it('still breaks into a new group when groupKey changes, even if context stays the same', () => {
+    const a = seg({ id: 's1', text: 'Hello', context: 'slide title', groupKey: 'slide-3' })
+    const b = seg({ id: 's2', text: 'World', context: 'slide title', groupKey: 'slide-4' })
+    expect(groupSegments([a, b])).toEqual([[a], [b]])
+  })
+
+  it('falls back to grouping by context, unchanged, when groupKey is absent', () => {
+    const a = seg({ id: 's1', text: 'Hello', context: 'slide1' })
+    const b = seg({ id: 's2', text: 'World', context: 'slide1' })
+    const c = seg({ id: 's3', text: 'Again', context: 'slide2' })
+    expect(groupSegments([a, b, c])).toEqual([[a, b], [c]])
+  })
 })
 
 describe('validateBatch', () => {

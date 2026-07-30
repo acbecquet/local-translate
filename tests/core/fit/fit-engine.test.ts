@@ -51,6 +51,27 @@ describe('fit-engine', () => {
     expect(r.overflowed).toBe(true)
   })
 
+  // Regression: stepDown's -0.5 descent (used below 6pt) can jump straight
+  // past FLOOR_PT for a fractional starting size instead of landing on it
+  // exactly (e.g. 12.3pt's descent reaches 0.8 -> 0.3, which is below the
+  // 0.5pt floor). fontSizePt must never go below FLOOR_PT regardless of the
+  // starting size's fractional part, and the tiny box here (guaranteeing
+  // the text never fits at any size) forces the shrink loop all the way
+  // down to the floor for each one.
+  it.each([12.3, 11.25, 0.55])(
+    'never shrinks fontSizePt below the 0.5pt floor for a fractional start size of %spt',
+    (startSizePt) => {
+      const r = fit(
+        'x'.repeat(500),
+        { wPt: 4, hPt: 4 },
+        { family: 'Noto Sans', sizePt: startSizePt }
+      )
+      expect(r.fontSizePt).toBeGreaterThanOrEqual(0.5)
+      expect(r.fontSizePt).toBe(0.5)
+      expect(r.overflowed).toBe(true)
+    }
+  )
+
   // Regression: a word-wrap bug let a token that STARTS a line skip the
   // force-break check entirely (the `line === ''` branch short-circuited
   // before ever measuring the token), so an oversized leading token was

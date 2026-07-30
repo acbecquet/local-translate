@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import os, { tmpdir } from 'node:os'
 import path from 'node:path'
 import { _internals, runCli, type CliDeps } from '../../src/core/cli'
 import type { TextSegment } from '../../src/core/segments'
@@ -105,6 +105,29 @@ describe('_internals.parseArgs', () => {
   })
 })
 
+describe('_internals.resolveAppDataDir', () => {
+  const savedLocalAppData = process.env.LOCALAPPDATA
+
+  afterEach(() => {
+    if (savedLocalAppData === undefined) delete process.env.LOCALAPPDATA
+    else process.env.LOCALAPPDATA = savedLocalAppData
+  })
+
+  it('prefers %LOCALAPPDATA% when set, aligning with findOllamaExe', () => {
+    process.env.LOCALAPPDATA = path.join('C:', 'Users', 'someone', 'AppData', 'Local')
+    expect(_internals.resolveAppDataDir()).toBe(
+      path.join(process.env.LOCALAPPDATA, 'local_translate')
+    )
+  })
+
+  it('falls back to homedir()/AppData/Local when LOCALAPPDATA is unset', () => {
+    delete process.env.LOCALAPPDATA
+    expect(_internals.resolveAppDataDir()).toBe(
+      path.join(os.homedir(), 'AppData', 'Local', 'local_translate')
+    )
+  })
+})
+
 describe('runCli: exit codes and dependency injection', () => {
   it('returns 1 and never touches Ollama on a usage error (missing positionals)', async () => {
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -185,6 +208,23 @@ describe('runCli: exit codes and dependency injection', () => {
     // Progress lines went to stderr.
     const printed = errSpy.mock.calls.map((c) => String(c[0])).join('\n')
     expect(printed).toContain('[extract]')
+  })
+
+  it('returns 0 for an all-numeric document where every segment is legitimately skipped-untranslatable', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const file = writeFixture([seg({ id: 's1', text: '12345' }), seg({ id: 's2', text: '99.9%' })])
+    const stop = vi.fn().mockResolvedValue(undefined)
+    const ensureOllama = vi.fn().mockResolvedValue(fakeConnection(stop))
+    const translateBatch = vi.fn()
+    const createBackend = vi.fn().mockReturnValue(fakeBackend({ translateBatch }))
+
+    const code = await runCli([file, 'English', 'French'], { ensureOllama, createBackend })
+
+    expect(code).toBe(0)
+    // Never sent to the model - groupSegments drops untranslatable segments
+    // before the backend is ever called.
+    expect(translateBatch).not.toHaveBeenCalled()
   })
 
   it('returns 0, prints the report table to stdout, progress to stderr, and calls stop exactly once on success', async () => {

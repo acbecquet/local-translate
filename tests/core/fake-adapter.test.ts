@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { FakeAdapter } from '../../src/core/adapters/fake/fake-adapter'
-import { adapterFor } from '../../src/core/adapters/adapter'
+import { adapterFor, type FormatAdapter } from '../../src/core/adapters/adapter'
 import type { TranslatedSegment } from '../../src/core/segments'
 
 const seg = {
@@ -39,5 +39,29 @@ describe('FakeAdapter', () => {
     const a = new FakeAdapter()
     expect(adapterFor('x/doc.fake.json', [a])).toBe(a)
     expect(adapterFor('x/doc.pptx', [a])).toBeNull()
+  })
+})
+
+describe('adapterFor: longest-match extension resolution', () => {
+  function stubAdapter(name: string, extensions: string[]): FormatAdapter {
+    return {
+      name,
+      extensions,
+      extract: async () => [],
+      apply: async () => {}
+    }
+  }
+
+  it('picks the adapter whose matching extension is longest, regardless of registration order', () => {
+    const generic = stubAdapter('generic-json', ['.json'])
+    const specific = stubAdapter('fake-json', ['.fake.json'])
+
+    // '.fake.json' is a strict subset match of '.json' too, but the more
+    // specific, longer extension must win either way it's registered.
+    expect(adapterFor('x/doc.fake.json', [generic, specific])).toBe(specific)
+    expect(adapterFor('x/doc.fake.json', [specific, generic])).toBe(specific)
+
+    // A file that only matches the generic extension still resolves to it.
+    expect(adapterFor('x/doc.json', [generic, specific])).toBe(generic)
   })
 })

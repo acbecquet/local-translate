@@ -40,8 +40,14 @@ export interface PipelineOpts {
 /** Fallback reason recorded when a segment is absent from a BatchResponse without a matching `failures` entry - should be unreachable given the backend contract, but the report must still account for every segment rather than silently losing one. */
 const UNEXPLAINED_ABSENCE_REASON = 'no-translation'
 
-/** Reason recorded for segments groupSegments drops as untranslatable (numeric/symbol/whitespace-only) - they're expected passthroughs, not failures, but still counted in the report so every extracted segment is accounted for. */
-const UNTRANSLATABLE_REASON = 'skipped-untranslatable'
+/**
+ * Reason recorded for segments groupSegments drops as untranslatable
+ * (numeric/symbol/whitespace-only) - they're expected passthroughs, not
+ * failures, but still counted in the report so every extracted segment is
+ * accounted for. Exported so callers (cli.ts's exit-code logic) can
+ * recognize this specific, expected reason without duplicating the string.
+ */
+export const UNTRANSLATABLE_REASON = 'skipped-untranslatable'
 
 export async function runPipeline(opts: PipelineOpts): Promise<RunReport> {
   const start = Date.now()
@@ -50,6 +56,7 @@ export async function runPipeline(opts: PipelineOpts): Promise<RunReport> {
   registerBundledFonts()
 
   const segments = await opts.adapter.extract(opts.file)
+  assertUniqueIds(segments)
   const total = segments.length
   opts.onProgress?.(total, total, 'extract')
 
@@ -72,6 +79,27 @@ export async function runPipeline(opts: PipelineOpts): Promise<RunReport> {
     keptOriginal,
     overflowed,
     durationMs: Date.now() - start
+  }
+}
+
+/**
+ * Guards the id-uniqueness contract FormatAdapter.extract() documents
+ * (adapter.ts): every id downstream (translation lookups, fit results, the
+ * applied output) is keyed by segment id, so a duplicate would make it
+ * impossible to tell which occurrence a later result belongs to. Checked
+ * immediately after extract(), before any translation work starts, so a
+ * misbehaving adapter fails fast with a clear error and the input file is
+ * never touched.
+ */
+function assertUniqueIds(segments: TextSegment[]): void {
+  const seen = new Set<string>()
+  for (const seg of segments) {
+    if (seen.has(seg.id)) {
+      throw new Error(
+        `Duplicate segment id "${seg.id}" returned by adapter.extract() - every extracted segment id must be unique.`
+      )
+    }
+    seen.add(seg.id)
   }
 }
 

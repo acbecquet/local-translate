@@ -209,6 +209,27 @@ describe('OllamaBackend.translateBatch', () => {
     expect(res.failures).toEqual([{ id: 's2', reason: 'parse' }])
   })
 
+  it('a transport-level failure (the chat call itself throwing) is reported as reason "error", not "parse"', async () => {
+    await seedCaps(appDataDir, 'test-model', { structuredWithThinkOff: true })
+    const request = req({ segments: [{ id: 's1', text: 'Hello' }] })
+
+    // Every attempt (initial, whole-group retry, per-segment fallback) hits
+    // a transport-level failure - the model never actually responds.
+    mocks.chat.mockRejectedValueOnce(new Error('ECONNRESET'))
+    mocks.chat.mockRejectedValueOnce(new Error('ECONNRESET'))
+    mocks.chat.mockRejectedValueOnce(new Error('ECONNRESET'))
+
+    const backend = new OllamaBackend({
+      baseUrl: 'http://127.0.0.1:1',
+      appDataDir,
+      retryDelayMs: 0
+    })
+    const res = await backend.translateBatch(request)
+
+    expect(res.translations).toEqual([])
+    expect(res.failures).toEqual([{ id: 's1', reason: 'error' }])
+  })
+
   it('a segment that fails validation (not JSON parsing) also goes through retry then per-segment fallback', async () => {
     await seedCaps(appDataDir, 'test-model', { structuredWithThinkOff: true })
     const request = req({ segments: [{ id: 's1', text: 'Hello' }] })
@@ -461,6 +482,79 @@ describe('OllamaBackend capability probe', () => {
     // The atomic write-then-rename never leaves its temp file behind.
     const entries = await readdir(appDataDir)
     expect(entries.filter((f) => f.endsWith('.tmp'))).toEqual([])
+  })
+
+  it('a transport-level probe failure persists nothing, proceeds optimistically with think:false for that call, and re-probes on the next translateBatch call', async () => {
+    // Probe call: transport-level failure (server down, connection reset,
+    // model still loading, ...) - the model never actually responded.
+    mocks.chat.mockRejectedValueOnce(new Error('ECONNREFUSED'))
+    // The group call still proceeds for this request, optimistically,
+    // with think:false (same as a model that genuinely passed the probe).
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse(JSON.stringify({ translations: [{ id: 's1', translation: 'Bonjour' }] }))
+    )
+
+    const backend = new OllamaBackend({
+      baseUrl: 'http://127.0.0.1:1',
+      appDataDir,
+      retryDelayMs: 0
+    })
+    const res = await backend.translateBatch(req())
+
+    expect(res.translations).toEqual([{ id: 's1', translation: 'Bonjour' }])
+    expect(mocks.chat.mock.calls[1][0]).toMatchObject({ think: false })
+
+    // Nothing was written - a transport failure is not a capability verdict.
+    await expect(readFile(path.join(appDataDir, 'model-caps.json'), 'utf8')).rejects.toThrow()
+
+    // A second translateBatch call for the same model re-probes from
+    // scratch rather than trusting a memoized negative from the failure.
+    mocks.chat.mockResolvedValueOnce(chatResponse(JSON.stringify({ ok: true })))
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse(JSON.stringify({ translations: [{ id: 's1', translation: 'Bonjour again' }] }))
+    )
+    const res2 = await backend.translateBatch(req())
+    expect(res2.translations).toEqual([{ id: 's1', translation: 'Bonjour again' }])
+
+    const probeCalls = mocks.chat.mock.calls.filter(([arg]) =>
+      arg.messages.some((m: { content: string }) => m.content.includes('Capability probe'))
+    )
+    expect(probeCalls).toHaveLength(2) // the failed attempt, then the successful re-probe
+
+    const written = JSON.parse(await readFile(path.join(appDataDir, 'model-caps.json'), 'utf8'))
+    expect(written['test-model']).toEqual({ structuredWithThinkOff: true })
+  })
+
+  it('discards a malformed model-caps.json entry (wrong-typed field) instead of trusting it, and re-probes', async () => {
+    await mkdir(appDataDir, { recursive: true })
+    await writeFile(
+      path.join(appDataDir, 'model-caps.json'),
+      // structuredWithThinkOff must be a boolean - this corrupt/hand-edited
+      // entry has it as a string, which must be discarded, not trusted.
+      JSON.stringify({ 'test-model': { structuredWithThinkOff: 'yes' } }),
+      'utf8'
+    )
+
+    mocks.chat.mockResolvedValueOnce(chatResponse(JSON.stringify({ ok: true }))) // probe
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse(JSON.stringify({ translations: [{ id: 's1', translation: 'Bonjour' }] }))
+    )
+
+    const backend = new OllamaBackend({
+      baseUrl: 'http://127.0.0.1:1',
+      appDataDir,
+      retryDelayMs: 0
+    })
+    const res = await backend.translateBatch(req())
+
+    expect(res.translations).toEqual([{ id: 's1', translation: 'Bonjour' }])
+    const probeCalls = mocks.chat.mock.calls.filter(([arg]) =>
+      arg.messages.some((m: { content: string }) => m.content.includes('Capability probe'))
+    )
+    expect(probeCalls).toHaveLength(1) // malformed entry treated as absent -> re-probed
+
+    const written = JSON.parse(await readFile(path.join(appDataDir, 'model-caps.json'), 'utf8'))
+    expect(written['test-model']).toEqual({ structuredWithThinkOff: true }) // corrected on disk now
   })
 })
 

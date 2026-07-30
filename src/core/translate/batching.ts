@@ -16,12 +16,18 @@ export function hasTranslatableContent(text: string): boolean {
   return /\p{L}/u.test(text)
 }
 
+/** The key groupSegments actually groups by: `groupKey` when the adapter set one, otherwise `context` (unchanged pre-existing behavior). */
+function groupingKeyOf(seg: TextSegment): string {
+  return seg.groupKey ?? seg.context
+}
+
 /**
  * Groups segments for batched translation calls, in source order: segments
- * are accumulated under their `context` string, breaking to a new group
- * whenever the context changes or the running character total would
- * exceed `maxChars` (default 2000). A single segment longer than maxChars
- * on its own still gets its own one-segment group rather than being split
+ * are accumulated under their grouping key (see groupingKeyOf - `groupKey`
+ * when the adapter set one, otherwise `context`), breaking to a new group
+ * whenever that key changes or the running character total would exceed
+ * `maxChars` (default 2000). A single segment longer than maxChars on its
+ * own still gets its own one-segment group rather than being split
  * mid-text (segment text is never partially sent - that would break the
  * id<->text correspondence the backend and validateBatch rely on).
  *
@@ -38,14 +44,15 @@ export function groupSegments(
 ): TextSegment[][] {
   const groups: TextSegment[][] = []
   let current: TextSegment[] = []
-  let currentContext: string | null = null
+  let currentKey: string | null = null
   let currentChars = 0
 
   for (const seg of segments) {
     if (!hasTranslatableContent(seg.text)) continue
 
-    const sameContext = current.length > 0 && currentContext === seg.context
-    const fitsBudget = sameContext && currentChars + seg.text.length <= maxChars
+    const key = groupingKeyOf(seg)
+    const sameGroup = current.length > 0 && currentKey === key
+    const fitsBudget = sameGroup && currentChars + seg.text.length <= maxChars
 
     if (current.length > 0 && !fitsBudget) {
       groups.push(current)
@@ -54,7 +61,7 @@ export function groupSegments(
     }
 
     current.push(seg)
-    currentContext = seg.context
+    currentKey = key
     currentChars += seg.text.length
   }
 

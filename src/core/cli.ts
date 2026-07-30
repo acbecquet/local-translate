@@ -4,10 +4,14 @@
 // into runPipeline, then prints the RunReport as a plain readable table.
 //
 // Exit codes:
-//   0 - ran, and at least one segment was translated (or the doc had none).
+//   0 - ran, and at least one segment was translated, the doc had none, or
+//       every kept-original segment was legitimately untranslatable
+//       (numeric/symbol/whitespace-only content - never sent to the model
+//       in the first place, so it never having a `translation` isn't a
+//       failure of anything).
 //   1 - ran, but every segment fell back to its original text (total > 0
-//       and translated === 0) - or a usage/setup error before the pipeline
-//       could even start.
+//       and translated === 0) for a reason OTHER than skipped-untranslatable
+//       - or a usage/setup error before the pipeline could even start.
 //   2 - Ollama could not be found or started (OllamaNotFoundError).
 //
 // `runCli()` does the actual work and always resolves to an exit code - it
@@ -21,7 +25,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { adapterFor, type FormatAdapter } from './adapters/adapter'
 import { FakeAdapter } from './adapters/fake/fake-adapter'
-import { runPipeline, type RunReport } from './pipeline'
+import { runPipeline, UNTRANSLATABLE_REASON, type RunReport } from './pipeline'
 import {
   ensureOllama as realEnsureOllama,
   OllamaNotFoundError,
@@ -39,17 +43,18 @@ const DEFAULT_MODEL = 'gemma4:e4b'
 
 /**
  * Where the CLI keeps its Ollama pid file, model-caps cache, and (for a
- * managed install) downloaded models: `$LOCAL_TRANSLATE_DATA_DIR` when set
- * (tests and power users), otherwise `%LOCALAPPDATA%`-equivalent under the
- * user's home directory. This resolver is deliberately CLI-only, not part
- * of the core pipeline - runPipeline receives everything it needs via opts
- * and has no notion of "app data directory" of its own.
+ * managed install) downloaded models: `%LOCALAPPDATA%\local_translate`
+ * when LOCALAPPDATA is set, otherwise `<homedir>/AppData/Local/local_translate`
+ * - the same LOCALAPPDATA-first, homedir-fallback resolution
+ * findOllamaExe() (lifecycle.ts) uses to locate the exe, so both agree on
+ * where "local app data" lives on a given machine. This resolver is
+ * deliberately CLI-only, not part of the core pipeline - runPipeline
+ * receives everything it needs via opts and has no notion of "app data
+ * directory" of its own.
  */
 function resolveAppDataDir(): string {
-  return (
-    process.env.LOCAL_TRANSLATE_DATA_DIR ??
-    path.join(os.homedir(), 'AppData', 'Local', 'local_translate')
-  )
+  const localAppData = process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local')
+  return path.join(localAppData, 'local_translate')
 }
 
 interface CliArgs {
@@ -135,6 +140,21 @@ function printError(err: unknown): void {
 }
 
 /**
+ * A run has genuinely failed (exit 1) only when nothing was translated AND
+ * at least one kept-original segment was kept for a reason other than
+ * being legitimately untranslatable in the first place. A document that's
+ * entirely numbers/symbols/whitespace - e.g. a spec sheet of dimensions -
+ * has translated === 0 with total > 0, but every one of those segments was
+ * correctly never sent to the model (see UNTRANSLATABLE_REASON in
+ * pipeline.ts), so that run succeeded at doing exactly what it should
+ * have and must not be reported as a failure.
+ */
+function isFailedRun(report: RunReport): boolean {
+  if (report.translated > 0 || report.total === 0) return false
+  return report.keptOriginal.some((k) => k.reason !== UNTRANSLATABLE_REASON)
+}
+
+/**
  * The two collaborators runCli needs but doesn't own the lifecycle of -
  * injectable so tests can exercise every exit path (not-found, zero
  * translations, success, stop-on-throw) without spawning or probing a real
@@ -206,7 +226,7 @@ export async function runCli(argv: string[], deps: CliDeps = defaultDeps): Promi
 
     printReport(report)
 
-    return report.total > 0 && report.translated === 0 ? 1 : 0
+    return isFailedRun(report) ? 1 : 0
   } catch (err) {
     printError(err)
     return 1
@@ -216,7 +236,7 @@ export async function runCli(argv: string[], deps: CliDeps = defaultDeps): Promi
   }
 }
 
-export const _internals = { parseArgs, DEFAULT_MODEL, USAGE }
+export const _internals = { parseArgs, DEFAULT_MODEL, USAGE, resolveAppDataDir }
 
 function isMainModule(): boolean {
   const entry = process.argv[1]

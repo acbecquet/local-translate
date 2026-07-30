@@ -1,7 +1,8 @@
 import { Canvas, FontLibrary, type CanvasRenderingContext2D } from 'skia-canvas'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const FONTS_DIR = path.resolve(__dirname, '../../../fonts')
+const FONTS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../fonts')
 let registered = false
 const knownFamilies = new Set<string>()
 

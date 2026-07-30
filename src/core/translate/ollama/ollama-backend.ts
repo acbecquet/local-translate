@@ -25,6 +25,19 @@ const BATCH_SCHEMA = z.object({
 const PROBE_SCHEMA = z.object({ ok: z.boolean() })
 
 /**
+ * What resolveModelCaps() falls back to for exactly one caller when
+ * probeModelCaps() couldn't reach a verdict at all (a transport-level
+ * failure - see probeModelCaps' doc comment). Optimistic (think:false +
+ * the schema format) rather than the old pessimistic "assume it can't"
+ * default: a wrong optimistic guess just means translateBatch's validation
+ * ladder (retry, then per-segment fallback) burns an extra call or two,
+ * whereas a wrong PERSISTED pessimistic guess would send think:true on
+ * every call to a model that never actually failed the probe. This value
+ * is deliberately never written to model-caps.json.
+ */
+const OPTIMISTIC_UNKNOWN_CAPS: ModelCaps = { structuredWithThinkOff: true }
+
+/**
  * Strips a <think>...</think> block from model output before JSON.parse.
  * The ollama client already separates message.thinking from message.content
  * in v0.6.x, so this should normally be a no-op - but some local models
@@ -169,28 +182,43 @@ export class OllamaBackend implements TranslationBackend {
     return failures.length > 0 ? { translations, failures } : { translations }
   }
 
-  /** One ollama.chat call for `req`, parsed and validated. Never throws - unparseable/schema-invalid responses become an all-'parse' failure list. */
+  /** One ollama.chat call for `req`, parsed and validated. Never throws - a transport-level failure becomes an all-'error' failure list, an unparseable/schema-invalid response becomes an all-'parse' one. */
   private async attemptGroup(
     req: BatchRequest,
     caps: ModelCaps
-  ): Promise<{ ok: TranslatedEntry[]; failed: { id: string; reason: ValidationFailure }[] }> {
+  ): Promise<{
+    ok: TranslatedEntry[]
+    failed: { id: string; reason: ValidationFailure | 'error' }[]
+  }> {
     const raw = await this.callChat(req, caps)
-    if (raw === null) {
+    if (raw.kind !== 'ok') {
       return {
         ok: [],
-        failed: req.segments.map((s) => ({ id: s.id, reason: 'parse' as const }))
+        failed: req.segments.map((s) => ({ id: s.id, reason: raw.kind }))
       }
     }
     return validateBatch(req, raw.translations)
   }
 
+  /**
+   * Distinguishes, in the return value rather than by collapsing both into
+   * `null`, WHY this call didn't produce usable translations: 'error' means
+   * the ollama.chat call itself threw (server down, connection reset,
+   * model still loading, any other transport-level failure) - the model
+   * never actually responded, so there's nothing to blame on its output.
+   * 'parse' means the model DID respond but that response wasn't valid
+   * JSON matching BATCH_SCHEMA - a genuine output problem. Callers
+   * (attemptGroup) surface this distinction as the failure reason instead
+   * of reporting every kind of failure as 'parse'.
+   */
   private async callChat(
     req: BatchRequest,
     caps: ModelCaps
-  ): Promise<{ translations: TranslatedEntry[] } | null> {
+  ): Promise<{ kind: 'ok'; translations: TranslatedEntry[] } | { kind: 'error' | 'parse' }> {
     const prompt = buildPrompt(req)
+    let res: Awaited<ReturnType<Ollama['chat']>>
     try {
-      const res = await this.client.chat({
+      res = await this.client.chat({
         model: req.model,
         messages: [
           { role: 'system', content: prompt.system },
@@ -204,12 +232,19 @@ export class OllamaBackend implements TranslationBackend {
         think: !caps.structuredWithThinkOff,
         stream: false
       })
+    } catch {
+      return { kind: 'error' }
+    }
+
+    try {
       const content = stripThinkTags(res.message.content)
       const parsed: unknown = JSON.parse(content)
       const result = BATCH_SCHEMA.safeParse(parsed)
-      return result.success ? result.data : null
+      return result.success
+        ? { kind: 'ok', translations: result.data.translations }
+        : { kind: 'parse' }
     } catch {
-      return null
+      return { kind: 'parse' }
     }
   }
 
@@ -230,22 +265,35 @@ export class OllamaBackend implements TranslationBackend {
     const cached = (await this.loadCapsFile())[model]
     if (cached) return cached
 
-    const caps = await this.probeModelCaps(model)
-    await this.persistModelCaps(model, caps)
-    return caps
+    const outcome = await this.probeModelCaps(model)
+    if (outcome.kind === 'unknown') return OPTIMISTIC_UNKNOWN_CAPS
+
+    await this.persistModelCaps(model, outcome.caps)
+    return outcome.caps
   }
 
   /**
    * Capability probe (contract point 4): a tiny schema request with
-   * think: false. If the response doesn't parse as valid JSON matching
-   * PROBE_SCHEMA - including any transport/client error - the model is
-   * recorded as unable to do structured output with thinking off, and
-   * every future translateBatch() call for this model uses thinking-on
-   * plus trace-stripping instead (see callChat/stripThinkTags).
+   * think: false. Two genuinely different outcomes here, which must NOT be
+   * conflated (that was the bug: both used to become a persisted, permanent
+   * structuredWithThinkOff:false):
+   *   - The model responds, but that response doesn't parse as valid JSON
+   *     matching PROBE_SCHEMA: a real, reproducible capability result -
+   *     this model can't honor a JSON schema with thinking off. Safe (and
+   *     meant) to cache forever.
+   *   - The ollama.chat call itself throws (server down, connection reset,
+   *     model still loading, any other transport error): we learned
+   *     nothing about the model at all. Caching `false` here would
+   *     permanently and incorrectly saddle a perfectly capable model with
+   *     think:true on every future call, for a failure that had nothing to
+   *     do with its capabilities.
    */
-  private async probeModelCaps(model: string): Promise<ModelCaps> {
+  private async probeModelCaps(
+    model: string
+  ): Promise<{ kind: 'known'; caps: ModelCaps } | { kind: 'unknown' }> {
+    let res: Awaited<ReturnType<Ollama['chat']>>
     try {
-      const res = await this.client.chat({
+      res = await this.client.chat({
         model,
         messages: [
           {
@@ -257,10 +305,18 @@ export class OllamaBackend implements TranslationBackend {
         think: false,
         stream: false
       })
-      const parsed: unknown = JSON.parse(stripThinkTags(res.message.content))
-      return { structuredWithThinkOff: PROBE_SCHEMA.safeParse(parsed).success }
     } catch {
-      return { structuredWithThinkOff: false }
+      return { kind: 'unknown' }
+    }
+
+    try {
+      const parsed: unknown = JSON.parse(stripThinkTags(res.message.content))
+      return {
+        kind: 'known',
+        caps: { structuredWithThinkOff: PROBE_SCHEMA.safeParse(parsed).success }
+      }
+    } catch {
+      return { kind: 'known', caps: { structuredWithThinkOff: false } }
     }
   }
 
@@ -268,7 +324,7 @@ export class OllamaBackend implements TranslationBackend {
     if (this.capsMemo) return this.capsMemo
     try {
       const raw = await readFile(this.capsPath, 'utf8')
-      this.capsMemo = JSON.parse(raw) as Record<string, ModelCaps>
+      this.capsMemo = sanitizeCapsFile(JSON.parse(raw))
     } catch {
       this.capsMemo = {}
     }
@@ -296,7 +352,7 @@ export class OllamaBackend implements TranslationBackend {
     this.capsWriteChain = this.capsWriteChain.then(async () => {
       let all: Record<string, ModelCaps>
       try {
-        all = JSON.parse(await readFile(this.capsPath, 'utf8')) as Record<string, ModelCaps>
+        all = sanitizeCapsFile(JSON.parse(await readFile(this.capsPath, 'utf8')))
       } catch {
         all = {}
       }
@@ -333,4 +389,33 @@ export class OllamaBackend implements TranslationBackend {
         `(kept in memory for this process only): ${err instanceof Error ? err.message : String(err)}`
     )
   }
+}
+
+/**
+ * Validates the on-disk shape of model-caps.json entry by entry: only an
+ * entry that is a plain object with a boolean `structuredWithThinkOff` is
+ * kept. Anything else for a given model key - the parsed value not being
+ * an object at all, a non-object entry, a missing field, or a field of the
+ * wrong type (hand-edited or corrupted file, or a future format this
+ * version doesn't understand) - is silently discarded rather than trusted
+ * or allowed to crash a probe: a discarded entry is treated exactly like
+ * that model was never cached, so resolveModelCaps() just re-probes it.
+ */
+function sanitizeCapsFile(parsed: unknown): Record<string, ModelCaps> {
+  if (typeof parsed !== 'object' || parsed === null) return {}
+
+  const out: Record<string, ModelCaps> = {}
+  for (const [model, entry] of Object.entries(parsed as Record<string, unknown>)) {
+    if (
+      typeof entry === 'object' &&
+      entry !== null &&
+      typeof (entry as { structuredWithThinkOff?: unknown }).structuredWithThinkOff === 'boolean'
+    ) {
+      out[model] = {
+        structuredWithThinkOff: (entry as { structuredWithThinkOff: boolean })
+          .structuredWithThinkOff
+      }
+    }
+  }
+  return out
 }
