@@ -273,7 +273,15 @@ export function setRunText(r: Element, text: string): void {
   if (!t) {
     const doc = r.ownerDocument
     if (!doc) throw new Error('Cannot set run text: <a:r> element has no owner document')
-    t = doc.createElementNS(A_NS, 'a:t')
+    // DrawingML isn't always bound to the conventional 'a:' prefix (e.g.
+    // LibreOffice/Keynote/third-party decks may use a different prefix, or
+    // in principle no prefix at all via a default namespace). Resolve the
+    // prefix actually in scope at this point in the tree; a hardcoded 'a:'
+    // would serialize an unbound prefix on decks that use something else,
+    // producing invalid XML that PowerPoint's repair dialog would flag.
+    const prefix = r.lookupPrefix(A_NS)
+    const qualifiedName = prefix === null ? 'a:t' : prefix === '' ? 't' : `${prefix}:t`
+    t = doc.createElementNS(A_NS, qualifiedName)
     r.appendChild(t)
   }
   t.textContent = text

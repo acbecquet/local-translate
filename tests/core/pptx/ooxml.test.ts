@@ -7,6 +7,9 @@ import path from 'node:path'
 import JSZip from 'jszip'
 import {
   A_NS,
+  P_NS,
+  R_NS,
+  RELS_NS,
   childElems,
   elems,
   openPptx,
@@ -140,6 +143,171 @@ describe('openPptx / PptxArchive', () => {
     }
   })
 
+  it('structural fidelity: dirtying+saving slide1 preserves table cell text, group child count/transform, and picture r:embed resolution', async () => {
+    const dir = await tmpDir('lt-ooxml-')
+    const srcBuffer = await buildSampleDeck()
+    const srcPath = path.join(dir, 'src.pptx')
+    await writeFile(srcPath, srcBuffer)
+
+    const archive = await openPptx(srcPath)
+    const slide1Path = archive.listSlidePaths()[0]
+    const doc = archive.readXml(slide1Path)
+    const run = elems(doc, A_NS, 'r')[0]
+    setRunText(run, 'dirtied')
+    archive.markDirty(slide1Path)
+
+    const outPath = path.join(dir, 'out.pptx')
+    await archive.save(outPath)
+
+    const reopened = await openPptx(outPath)
+    const reDoc = reopened.readXml(slide1Path)
+
+    // Table cell text intact (one a:t per cell, row-major a/b/c/d).
+    const cellTexts = elems(reDoc, A_NS, 'tc').map((tc) =>
+      elems(tc, A_NS, 't')
+        .map((t) => t.textContent)
+        .join('')
+    )
+    expect(cellTexts).toEqual(['a', 'b', 'c', 'd'])
+
+    // Group child count and chOff/chExt transform unchanged.
+    const grpSp = elems(reDoc, P_NS, 'grpSp')[0]
+    expect(grpSp).toBeDefined()
+    const grpSpPr = childElems(grpSp, P_NS, 'grpSpPr')[0]
+    const grpXfrm = childElems(grpSpPr, A_NS, 'xfrm')[0]
+    const chOff = childElems(grpXfrm, A_NS, 'chOff')[0]
+    const chExt = childElems(grpXfrm, A_NS, 'chExt')[0]
+    expect(chOff.getAttribute('x')).toBe('0')
+    expect(chOff.getAttribute('y')).toBe('0')
+    expect(chExt.getAttribute('cx')).toBe('200')
+    expect(chExt.getAttribute('cy')).toBe('200')
+    const groupChildren = ['sp', 'pic', 'graphicFrame', 'grpSp'].flatMap((local) =>
+      childElems(grpSp, P_NS, local)
+    )
+    expect(groupChildren).toHaveLength(1) // the one nested textbox from buildSampleDeck
+
+    // Picture r:embed (a cross-namespace attribute) resolves through the
+    // slide's own _rels to a Relationship entry whose target part actually
+    // exists in the saved archive.
+    const blip = elems(reDoc, A_NS, 'blip')[0]
+    expect(blip).toBeDefined()
+    const rId = blip.getAttributeNS(R_NS, 'embed')
+    expect(rId).toBeTruthy()
+    const relsDoc = reopened.readXml('ppt/slides/_rels/slide1.xml.rels')
+    const imageRel = elems(relsDoc, RELS_NS, 'Relationship').find(
+      (rel) => rel.getAttribute('Id') === rId
+    )
+    expect(imageRel).toBeDefined()
+    const target = imageRel!.getAttribute('Target')!
+    expect(target).toMatch(/^\.\.\/media\/image\d+\.png$/)
+    const mediaPath = path.posix.normalize(
+      path.posix.join(path.posix.dirname('ppt/slides/slide1.xml'), target)
+    )
+    const outZip = await JSZip.loadAsync(await readFile(outPath))
+    expect(outZip.file(mediaPath)).not.toBeNull()
+  })
+
+  it('setRunText resolves the run\'s actual DrawingML prefix instead of hardcoding "a:" (nonstandard-prefix decks)', async () => {
+    const dir = await tmpDir('lt-ooxml-')
+    const buffer = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            { kind: 'textbox', text: ['x'], box: { xEmu: 0, yEmu: 0, wEmu: 1000, hEmu: 500 } }
+          ]
+        }
+      ]
+    })
+
+    // Rebind DrawingML from the builder's default 'a:' prefix to a
+    // nonstandard 'dml:' prefix, and strip the a:t child from the run -
+    // simulates a LibreOffice/Keynote/third-party deck combined with the
+    // "run has no text child yet" case that setRunText must create for.
+    const zip = await JSZip.loadAsync(buffer)
+    const slidePath = 'ppt/slides/slide1.xml'
+    let slideXml = await zip.file(slidePath)!.async('string')
+    slideXml = slideXml
+      .replace(/xmlns:a=/g, 'xmlns:dml=')
+      .replace(/<a:/g, '<dml:')
+      .replace(/<\/a:/g, '</dml:')
+    expect(slideXml).toContain('<dml:t>x</dml:t>')
+    slideXml = slideXml.replace('<dml:t>x</dml:t>', '')
+    zip.file(slidePath, slideXml)
+    const patchedBuffer = await zip.generateAsync({ type: 'nodebuffer' })
+
+    const srcPath = path.join(dir, 'nonstandard-prefix.pptx')
+    await writeFile(srcPath, patchedBuffer)
+
+    const archive = await openPptx(srcPath)
+    const doc = archive.readXml(slidePath)
+    const run = elems(doc, A_NS, 'r')[0]
+    expect(childElems(run, A_NS, 't')).toHaveLength(0)
+
+    setRunText(run, 'resolved prefix works')
+    archive.markDirty(slidePath)
+
+    const outPath = path.join(dir, 'out.pptx')
+    await archive.save(outPath)
+
+    // Reopen from disk: proves the serialized element used a bound prefix
+    // (the document reparses cleanly and the text round-trips), not a
+    // hardcoded 'a:' that would be unbound in this document.
+    const reopened = await openPptx(outPath)
+    const reopenedDoc = reopened.readXml(slidePath)
+    const reopenedRun = elems(reopenedDoc, A_NS, 'r')[0]
+    expect(textOfRun(reopenedRun)).toBe('resolved prefix works')
+
+    const savedXml = await (
+      await JSZip.loadAsync(await readFile(outPath))
+    )
+      .file(slidePath)!
+      .async('string')
+    expect(savedXml).toContain('<dml:t>resolved prefix works</dml:t>')
+    expect(savedXml).not.toContain('<a:t>')
+  })
+
+  it('setRunText sets xml:space="preserve" for edge whitespace and removes it again when no longer needed', async () => {
+    const dir = await tmpDir('lt-ooxml-')
+    const buffer = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            { kind: 'textbox', text: ['x'], box: { xEmu: 0, yEmu: 0, wEmu: 1000, hEmu: 500 } }
+          ]
+        }
+      ]
+    })
+    const srcPath = path.join(dir, 'src.pptx')
+    await writeFile(srcPath, buffer)
+
+    const archive = await openPptx(srcPath)
+    const slide1Path = archive.listSlidePaths()[0]
+    const doc = archive.readXml(slide1Path)
+    const run = elems(doc, A_NS, 'r')[0]
+    const t = childElems(run, A_NS, 't')[0]
+
+    const padded = '  leading and trailing  '
+    setRunText(run, padded)
+    expect(t.getAttribute('xml:space')).toBe('preserve')
+    archive.markDirty(slide1Path)
+
+    const outPath = path.join(dir, 'out.pptx')
+    await archive.save(outPath)
+
+    // Round-trip through disk: XML whitespace normalization would otherwise
+    // collapse/strip the leading and trailing spaces on reparse.
+    const reopened = await openPptx(outPath)
+    const reDoc = reopened.readXml(slide1Path)
+    const reRun = elems(reDoc, A_NS, 'r')[0]
+    const reT = childElems(reRun, A_NS, 't')[0]
+    expect(textOfRun(reRun)).toBe(padded)
+    expect(reT.getAttribute('xml:space')).toBe('preserve')
+
+    // Setting text without edge whitespace removes the now-unneeded attribute.
+    setRunText(reRun, 'no edges')
+    expect(reT.hasAttribute('xml:space')).toBe(false)
+  })
+
   it('contract 3: a:t runs are findable via elems(doc, A_NS, "t"); textOfRun/setRunText round-trip CJK and XML-special characters', async () => {
     const dir = await tmpDir('lt-ooxml-')
     const original = 'Hello & <World> "quoted" \'apos\''
@@ -247,9 +415,9 @@ describe('openPptx / PptxArchive', () => {
     expect(lexicographic).not.toEqual(paths)
   })
 
-  it('lists notes parts numerically too', async () => {
+  it('lists notes parts numerically too - notesSlide10 after notesSlide9', async () => {
     const dir = await tmpDir('lt-ooxml-')
-    const slides = Array.from({ length: 3 }, (_, i) => ({
+    const slides = Array.from({ length: 10 }, (_, i) => ({
       shapes: [
         {
           kind: 'textbox' as const,
@@ -264,11 +432,22 @@ describe('openPptx / PptxArchive', () => {
     await writeFile(srcPath, buffer)
 
     const archive = await openPptx(srcPath)
-    expect(archive.listNotesPaths()).toEqual([
+    const notesPaths = archive.listNotesPaths()
+
+    expect(notesPaths).toEqual([
       'ppt/notesSlides/notesSlide1.xml',
       'ppt/notesSlides/notesSlide2.xml',
-      'ppt/notesSlides/notesSlide3.xml'
+      'ppt/notesSlides/notesSlide3.xml',
+      'ppt/notesSlides/notesSlide4.xml',
+      'ppt/notesSlides/notesSlide5.xml',
+      'ppt/notesSlides/notesSlide6.xml',
+      'ppt/notesSlides/notesSlide7.xml',
+      'ppt/notesSlides/notesSlide8.xml',
+      'ppt/notesSlides/notesSlide9.xml',
+      'ppt/notesSlides/notesSlide10.xml'
     ])
+    const lexicographic = [...notesPaths].sort()
+    expect(lexicographic).not.toEqual(notesPaths)
   })
 
   it('contract 5: layoutPathFor/masterPathFor resolve through _rels correctly', async () => {
@@ -300,6 +479,40 @@ describe('openPptx / PptxArchive', () => {
     const archive = await openPptx(srcPath)
     // presentation.xml has no slideLayout relationship of its own.
     expect(archive.layoutPathFor('ppt/presentation.xml')).toBeNull()
+  })
+
+  it('layoutPathFor returns null when the part has no _rels file at all', async () => {
+    const dir = await tmpDir('lt-ooxml-')
+    const buffer = await buildSampleDeck()
+    const srcPath = path.join(dir, 'src.pptx')
+    await writeFile(srcPath, buffer)
+
+    const archive = await openPptx(srcPath)
+    // A media part never has its own _rels/<name>.rels file - distinct from
+    // the "rels file exists but no matching Relationship" case above.
+    expect(archive.layoutPathFor('ppt/media/image1.png')).toBeNull()
+  })
+
+  it('resolves an absolute rel target ("/ppt/...") without treating it as relative to the referencing part', async () => {
+    const dir = await tmpDir('lt-ooxml-')
+    const buffer = await buildSampleDeck()
+
+    const zip = await JSZip.loadAsync(buffer)
+    const relsPath = 'ppt/slides/_rels/slide1.xml.rels'
+    let relsXml = await zip.file(relsPath)!.async('string')
+    expect(relsXml).toContain('Target="../slideLayouts/slideLayout1.xml"')
+    relsXml = relsXml.replace(
+      'Target="../slideLayouts/slideLayout1.xml"',
+      'Target="/ppt/slideLayouts/slideLayout1.xml"'
+    )
+    zip.file(relsPath, relsXml)
+    const patchedBuffer = await zip.generateAsync({ type: 'nodebuffer' })
+
+    const srcPath = path.join(dir, 'absolute-target.pptx')
+    await writeFile(srcPath, patchedBuffer)
+
+    const archive = await openPptx(srcPath)
+    expect(archive.layoutPathFor('ppt/slides/slide1.xml')).toBe('ppt/slideLayouts/slideLayout1.xml')
   })
 
   it('contract 6: corrupt/non-zip input rejects with a clear error naming the file, never hangs or partially writes', async () => {
