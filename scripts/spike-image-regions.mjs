@@ -515,11 +515,24 @@ async function main() {
 
   const rows = []
   const perImageForAgg = []
+  const failures = []
   let totalWallMs = 0
   for (const name of imageNames) {
     const buffer = readFileSync(path.join(fixturesDir, name))
     const t0 = Date.now()
-    const detected = await engine.detectRegions(buffer)
+    // Per-image isolation: an engine failure on one image (malformed VLM
+    // JSON, an ollama transport error, a model without vision support) must
+    // not discard the images already scored - a manual GPU run has to come
+    // back with every result it managed to produce plus a named failure
+    // list, never a bare stack trace and an empty table.
+    let detected
+    try {
+      detected = await engine.detectRegions(buffer)
+    } catch (err) {
+      failures.push({ name, error: err instanceof Error ? err.message : String(err) })
+      totalWallMs += Date.now() - t0
+      continue
+    }
     const wallMs = Date.now() - t0
     totalWallMs += wallMs
     const scored = scoreImage(labels[name] ?? [], detected)
@@ -529,6 +542,15 @@ async function main() {
   const overall = aggregate(perImageForAgg)
 
   process.stdout.write(renderTable(engineName, rows, overall, totalWallMs) + '\n')
+  if (failures.length > 0) {
+    process.stdout.write(
+      `\n${failures.length}/${imageNames.length} images FAILED (excluded from the table above):\n`
+    )
+    for (const f of failures) {
+      process.stdout.write(`  ${f.name}: ${f.error}\n`)
+    }
+    process.exitCode = 1
+  }
 }
 
 main().catch((err) => {
