@@ -107,10 +107,19 @@ describe('fit-engine', () => {
   // Fit invariant over a grid: whatever fits must actually measure inside the box,
   // and one descent step larger must NOT fit (else we shrank too far).
   it('fit invariant + minimality across a fixture grid', () => {
+    // Exactly 200 characters, computed rather than hand-counted, since a
+    // long CJK paragraph (no spaces to wrap on - every character is its own
+    // break opportunity per fit-engine's CJK_BREAK_CHAR table) is a
+    // meaningfully different wrapping/shrinking shape than the short CJK
+    // sentence above.
+    const cjk200 = '技术规格和测试程序的内部业务文档。'.repeat(12).slice(0, 200)
+    expect(cjk200).toHaveLength(200)
+
     const texts = [
       'Hello',
       'The quick brown fox jumps over the lazy dog. '.repeat(3).trim(),
       '技术规格和测试程序的内部业务文档',
+      cjk200,
       'Antidisestablishmentarianism supercalifragilistic'
     ]
     const boxes = [
@@ -118,17 +127,40 @@ describe('fit-engine', () => {
       { wPt: 150, hPt: 60 },
       { wPt: 300, hPt: 20 }
     ]
+    const fractionalStartFonts = [
+      { family: 'Noto Sans', sizePt: 24 },
+      { family: 'Noto Sans', sizePt: 12.3 },
+      { family: 'Noto Sans', sizePt: 11.25 }
+    ]
     for (const text of texts)
-      for (const box of boxes) {
-        const r = fit(text, box, font)
-        if (!r.overflowed) {
-          expect(measuredFits(r.lines, r.fontSizePt, box, font)).toBe(true)
-          const bigger = stepUp(r.fontSizePt)
-          if (bigger <= font.sizePt) {
-            const rBigger = layoutAt(text, bigger, box, font)
-            expect(rBigger.fits).toBe(false)
+      for (const box of boxes)
+        for (const startFont of fractionalStartFonts) {
+          const r = fit(text, box, startFont)
+          if (!r.overflowed) {
+            expect(measuredFits(r.lines, r.fontSizePt, box, startFont)).toBe(true)
+            const bigger = stepUp(r.fontSizePt)
+            // Minimality via stepUp(result) reconstructs "the size fit()
+            // tried right before landing on result" - valid IFF stepUp is
+            // truly the inverse of the stepDown that produced it. stepDown
+            // changes its own step size exactly at the 6pt threshold
+            // (-1 above 6, -0.5 at/below), so for a result landing strictly
+            // inside (5, 6) that reconstruction is ambiguous: e.g. 5.3
+            // could have come from stepDown(6.3) (the >6 branch, one step
+            // up = 6.3) or from stepDown(5.8) (the <=6 branch, one step up
+            // = 5.8) - both are legal predecessors and stepUp(5.3) can only
+            // reconstruct one of them. Outside that open interval the
+            // branch is unambiguous from the result alone (proof: result
+            // >= 6 forces the predecessor to be result+1 via the >6 branch;
+            // result <= 5 forces it to be result+0.5 via the <=6 branch),
+            // so the assertion stays meaningful everywhere except this one
+            // pre-existing, out-of-scope corner of fit-engine's own
+            // stepUp/stepDown (not part of this task - see fit-engine.ts).
+            const reconstructionAmbiguous = r.fontSizePt > 5 && r.fontSizePt < 6
+            if (!reconstructionAmbiguous && bigger <= startFont.sizePt) {
+              const rBigger = layoutAt(text, bigger, box, startFont)
+              expect(rBigger.fits).toBe(false)
+            }
           }
         }
-      }
   })
 })

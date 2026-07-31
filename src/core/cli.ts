@@ -25,6 +25,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { adapterFor, type FormatAdapter } from './adapters/adapter'
 import { FakeAdapter } from './adapters/fake/fake-adapter'
+import { PptxAdapter } from './adapters/pptx/pptx-adapter'
 import { runPipeline, UNTRANSLATABLE_REASON, type RunReport } from './pipeline'
 import {
   ensureOllama as realEnsureOllama,
@@ -34,7 +35,7 @@ import {
 import { OllamaBackend } from './translate/ollama/ollama-backend'
 import type { TranslationBackend } from './translate/backend'
 
-const ADAPTERS: FormatAdapter[] = [new FakeAdapter()]
+const ADAPTERS: FormatAdapter[] = [new FakeAdapter(), new PptxAdapter()]
 
 // Default model when --model is omitted. Hardcoded for now during the
 // benchmark/evaluation phase of picking a default; a later release is

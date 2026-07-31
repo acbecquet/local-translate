@@ -14,6 +14,7 @@ const P_NS = 'http://schemas.openxmlformats.org/presentationml/2006/main'
 const R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 const RELS_NS = 'http://schemas.openxmlformats.org/package/2006/relationships'
 const CT_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
+const DGM_NS = 'http://schemas.openxmlformats.org/drawingml/2006/diagram'
 
 const REL_TYPE = {
   slideLayout: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout',
@@ -23,7 +24,15 @@ const REL_TYPE = {
   image: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image',
   officeDocument:
     'http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument',
-  slide: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide'
+  slide: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide',
+  chart: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart',
+  video: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/video',
+  diagramData: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData',
+  diagramLayout:
+    'http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramLayout',
+  diagramQuickStyle:
+    'http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramQuickStyle',
+  diagramColors: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramColors'
 }
 
 /** A 1x1 transparent PNG, embedded as the image part for 'picture' shapes. */
@@ -50,6 +59,8 @@ export interface TextboxShapeSpec {
   name?: string
   /** Explicit `a:bodyPr` insets (EMU); any side omitted falls back to the OOXML default. */
   insetsEmu?: { l?: number; r?: number; t?: number; b?: number }
+  /** Adds an `a:prstTxWarp` (non-"none") to `a:bodyPr` - exercises the adapter's WordArt-skip path. */
+  wordArt?: boolean
 }
 
 export interface PlaceholderShapeSpec {
@@ -94,20 +105,49 @@ export interface PictureShapeSpec {
   kind: 'picture'
   box: EmuBox
   name?: string
+  /** Adds an `a:videoFile` marker under `p:nvPr` (linked, external target) - exercises the adapter's video-skip log path. */
+  video?: boolean
+}
+
+/** A minimal chart graphicFrame: `a:graphicData` with the DrawingML chart URI, referencing a stub `ppt/charts/chartN.xml` part - never readable as text, exercises the adapter's chart-skip path. */
+export interface ChartShapeSpec {
+  kind: 'chart'
+  box: EmuBox
+  name?: string
+}
+
+/** A minimal SmartArt (DrawingML diagram) graphicFrame: a `dgm:relIds`-referenced `ppt/diagrams/dataN.xml` data model with one `dgm:pt`/`dgm:t` per entry in `points`. */
+export interface SmartArtShapeSpec {
+  kind: 'smartart'
+  box: EmuBox
+  name?: string
+  points: string[]
 }
 
 export type ShapeSpec =
-  TextboxShapeSpec | PlaceholderShapeSpec | TableShapeSpec | GroupShapeSpec | PictureShapeSpec
+  | TextboxShapeSpec
+  | PlaceholderShapeSpec
+  | TableShapeSpec
+  | GroupShapeSpec
+  | PictureShapeSpec
+  | ChartShapeSpec
+  | SmartArtShapeSpec
 
 export interface SlideSpec {
   shapes: ShapeSpec[]
   notes?: string
 }
 
+export interface PlaceholderBoxSpec {
+  phType: string
+  box: EmuBox
+}
+
 export interface BuildPptxOptions {
   slides: SlideSpec[]
-  layoutPlaceholderBox?: { phType: string; box: EmuBox }
-  masterPlaceholderBox?: { phType: string; box: EmuBox }
+  /** One spec, or several (e.g. both "title" and "body") - each becomes its own placeholder `p:sp` on the layout/master. */
+  layoutPlaceholderBox?: PlaceholderBoxSpec | PlaceholderBoxSpec[]
+  masterPlaceholderBox?: PlaceholderBoxSpec | PlaceholderBoxSpec[]
 }
 
 function escText(s: string): string {
@@ -126,20 +166,31 @@ function xfrmXml(box: EmuBox): string {
   return `<a:xfrm><a:off x="${box.xEmu}" y="${box.yEmu}"/><a:ext cx="${box.wEmu}" cy="${box.hEmu}"/></a:xfrm>`
 }
 
-function bodyPrXml(insetsEmu?: { l?: number; r?: number; t?: number; b?: number }): string {
-  if (!insetsEmu) return '<a:bodyPr/>'
-  const attrs = [
-    insetsEmu.l !== undefined ? `lIns="${insetsEmu.l}"` : null,
-    insetsEmu.r !== undefined ? `rIns="${insetsEmu.r}"` : null,
-    insetsEmu.t !== undefined ? `tIns="${insetsEmu.t}"` : null,
-    insetsEmu.b !== undefined ? `bIns="${insetsEmu.b}"` : null
-  ].filter((a): a is string => a !== null)
-  return attrs.length ? `<a:bodyPr ${attrs.join(' ')}/>` : '<a:bodyPr/>'
+function bodyPrXml(
+  insetsEmu?: { l?: number; r?: number; t?: number; b?: number },
+  wordArt?: boolean
+): string {
+  const attrs = insetsEmu
+    ? [
+        insetsEmu.l !== undefined ? `lIns="${insetsEmu.l}"` : null,
+        insetsEmu.r !== undefined ? `rIns="${insetsEmu.r}"` : null,
+        insetsEmu.t !== undefined ? `tIns="${insetsEmu.t}"` : null,
+        insetsEmu.b !== undefined ? `bIns="${insetsEmu.b}"` : null
+      ].filter((a): a is string => a !== null)
+    : []
+  const attrsStr = attrs.length ? ` ${attrs.join(' ')}` : ''
+  const warp = wordArt ? '<a:prstTxWarp prst="textArchUp"><a:avLst/></a:prstTxWarp>' : ''
+  return warp ? `<a:bodyPr${attrsStr}>${warp}</a:bodyPr>` : `<a:bodyPr${attrsStr}/>`
 }
 
-function relationshipsXml(rels: { id: string; type: string; target: string }[]): string {
+function relationshipsXml(
+  rels: { id: string; type: string; target: string; external?: boolean }[]
+): string {
   const body = rels
-    .map((r) => `<Relationship Id="${r.id}" Type="${r.type}" Target="${escAttr(r.target)}"/>`)
+    .map((r) => {
+      const mode = r.external ? ' TargetMode="External"' : ''
+      return `<Relationship Id="${r.id}" Type="${r.type}" Target="${escAttr(r.target)}"${mode}/>`
+    })
     .join('')
   return `${xmlDecl()}<Relationships xmlns="${RELS_NS}">${body}</Relationships>`
 }
@@ -183,6 +234,8 @@ function placeholderWithBoxXml(id: number, phType: string, box: EmuBox): string 
 interface BuildCtx {
   zip: JSZip
   mediaCounter: { n: number }
+  chartCounter: { n: number }
+  diagramCounter: { n: number }
   contentTypeOverrides: { partName: string; contentType: string }[]
 }
 
@@ -191,7 +244,7 @@ function buildShapeXml(
   shape: ShapeSpec,
   ordinal: number,
   nextId: () => number,
-  addRel: (type: string, target: string) => string
+  addRel: (type: string, target: string, external?: boolean) => string
 ): string {
   const id = nextId()
   switch (shape.kind) {
@@ -201,7 +254,7 @@ function buildShapeXml(
         `<p:sp><p:nvSpPr><p:cNvPr id="${id}" name="${escAttr(name)}"/>` +
         '<p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr/></p:nvSpPr>' +
         `<p:spPr>${xfrmXml(shape.box)}<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>` +
-        `<p:txBody>${bodyPrXml(shape.insetsEmu)}<a:lstStyle/>` +
+        `<p:txBody>${bodyPrXml(shape.insetsEmu, shape.wordArt)}<a:lstStyle/>` +
         paragraphsXml(shape.text, {
           fontPt: shape.fontPt,
           bold: shape.bold,
@@ -280,12 +333,102 @@ function buildShapeXml(
       const mediaName = `image${ctx.mediaCounter.n}.png`
       ctx.zip.file(`ppt/media/${mediaName}`, ONE_PX_PNG)
       const rId = addRel(REL_TYPE.image, `../media/${mediaName}`)
+      const nvPr = shape.video
+        ? (() => {
+            const videoRId = addRel(REL_TYPE.video, 'https://example.invalid/video.mp4', true)
+            return `<p:nvPr><a:videoFile r:link="${videoRId}"/></p:nvPr>`
+          })()
+        : '<p:nvPr/>'
       return (
         `<p:pic><p:nvPicPr><p:cNvPr id="${id}" name="${escAttr(name)}"/>` +
-        '<p:cNvPicPr/><p:nvPr/></p:nvPicPr>' +
+        `<p:cNvPicPr/>${nvPr}</p:nvPicPr>` +
         `<p:blipFill><a:blip r:embed="${rId}"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>` +
         `<p:spPr>${xfrmXml(shape.box)}<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>` +
         '</p:pic>'
+      )
+    }
+    case 'chart': {
+      const name = shape.name ?? `Chart ${ordinal}`
+      ctx.chartCounter.n += 1
+      const chartName = `chart${ctx.chartCounter.n}.xml`
+      // Never read as text by the adapter (chart graphicFrames are always
+      // skipped), so a minimal but well-formed stub is enough to keep the
+      // deck structurally valid (every part parses, content-types complete).
+      const chartXml = `${xmlDecl()}<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="${A_NS}" xmlns:r="${R_NS}"><c:chart><c:plotArea/></c:chart></c:chartSpace>`
+      ctx.zip.file(`ppt/charts/${chartName}`, chartXml)
+      ctx.zip.file(`ppt/charts/_rels/${chartName}.rels`, relationshipsXml([]))
+      ctx.contentTypeOverrides.push({
+        partName: `/ppt/charts/${chartName}`,
+        contentType: 'application/vnd.openxmlformats-officedocument.drawingml.chart+xml'
+      })
+      const rId = addRel(REL_TYPE.chart, `../charts/${chartName}`)
+      return (
+        `<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="${id}" name="${escAttr(name)}"/>` +
+        '<p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr>' +
+        `<p:xfrm><a:off x="${shape.box.xEmu}" y="${shape.box.yEmu}"/>` +
+        `<a:ext cx="${shape.box.wEmu}" cy="${shape.box.hEmu}"/></p:xfrm>` +
+        '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">' +
+        `<c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="${R_NS}" r:id="${rId}"/>` +
+        '</a:graphicData></a:graphic></p:graphicFrame>'
+      )
+    }
+    case 'smartart': {
+      const name = shape.name ?? `SmartArt ${ordinal}`
+      ctx.diagramCounter.n += 1
+      const n = ctx.diagramCounter.n
+
+      const ptsXml = shape.points
+        .map(
+          (text, i) =>
+            `<dgm:pt modelId="${i + 1}"><dgm:prSet/><dgm:spPr/>` +
+            `<dgm:t><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>${escText(text)}</a:t></a:r></a:p></dgm:t>` +
+            '</dgm:pt>'
+        )
+        .join('')
+      const dataXml =
+        `${xmlDecl()}<dgm:dataModel xmlns:dgm="${DGM_NS}" xmlns:a="${A_NS}" xmlns:r="${R_NS}">` +
+        `<dgm:ptLst><dgm:pt modelId="0" type="doc"><dgm:prSet/><dgm:spPr/></dgm:pt>${ptsXml}</dgm:ptLst>` +
+        '<dgm:cxnLst/><dgm:bg/><dgm:whole/></dgm:dataModel>'
+      const layoutXml = `${xmlDecl()}<dgm:layoutDef xmlns:dgm="${DGM_NS}" xmlns:a="${A_NS}" uniqueId="urn:test:layout"/>`
+      const styleXml = `${xmlDecl()}<dgm:styleDef xmlns:dgm="${DGM_NS}" xmlns:a="${A_NS}" uniqueId="urn:test:style"/>`
+      const colorsXml = `${xmlDecl()}<dgm:colorsDef xmlns:dgm="${DGM_NS}" xmlns:a="${A_NS}" uniqueId="urn:test:colors"/>`
+
+      ctx.zip.file(`ppt/diagrams/data${n}.xml`, dataXml)
+      ctx.zip.file(`ppt/diagrams/layout${n}.xml`, layoutXml)
+      ctx.zip.file(`ppt/diagrams/quickStyle${n}.xml`, styleXml)
+      ctx.zip.file(`ppt/diagrams/colors${n}.xml`, colorsXml)
+      ctx.contentTypeOverrides.push(
+        {
+          partName: `/ppt/diagrams/data${n}.xml`,
+          contentType: 'application/vnd.openxmlformats-officedocument.drawingml.diagramData+xml'
+        },
+        {
+          partName: `/ppt/diagrams/layout${n}.xml`,
+          contentType: 'application/vnd.openxmlformats-officedocument.drawingml.diagramLayout+xml'
+        },
+        {
+          partName: `/ppt/diagrams/quickStyle${n}.xml`,
+          contentType: 'application/vnd.openxmlformats-officedocument.drawingml.diagramStyle+xml'
+        },
+        {
+          partName: `/ppt/diagrams/colors${n}.xml`,
+          contentType: 'application/vnd.openxmlformats-officedocument.drawingml.diagramColors+xml'
+        }
+      )
+
+      const dmRid = addRel(REL_TYPE.diagramData, `../diagrams/data${n}.xml`)
+      const loRid = addRel(REL_TYPE.diagramLayout, `../diagrams/layout${n}.xml`)
+      const qsRid = addRel(REL_TYPE.diagramQuickStyle, `../diagrams/quickStyle${n}.xml`)
+      const csRid = addRel(REL_TYPE.diagramColors, `../diagrams/colors${n}.xml`)
+
+      return (
+        `<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="${id}" name="${escAttr(name)}"/>` +
+        '<p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr>' +
+        `<p:xfrm><a:off x="${shape.box.xEmu}" y="${shape.box.yEmu}"/>` +
+        `<a:ext cx="${shape.box.wEmu}" cy="${shape.box.hEmu}"/></p:xfrm>` +
+        `<a:graphic><a:graphicData uri="${DGM_NS}">` +
+        `<dgm:relIds xmlns:dgm="${DGM_NS}" xmlns:r="${R_NS}" r:dm="${dmRid}" r:lo="${loRid}" r:qs="${qsRid}" r:cs="${csRid}"/>` +
+        '</a:graphicData></a:graphic></p:graphicFrame>'
       )
     }
   }
@@ -298,16 +441,16 @@ function buildSlide(
 ): { slideXml: string; relsXml: string } {
   let shapeId = 1
   let relCounter = 0
-  const rels: { id: string; type: string; target: string }[] = []
+  const rels: { id: string; type: string; target: string; external?: boolean }[] = []
 
   const nextId = (): number => {
     shapeId += 1
     return shapeId
   }
-  const addRel = (type: string, target: string): string => {
+  const addRel = (type: string, target: string, external?: boolean): string => {
     relCounter += 1
     const id = `rId${relCounter}`
-    rels.push({ id, type, target })
+    rels.push({ id, type, target, external })
     return id
   }
 
@@ -354,10 +497,17 @@ const CLR_MAP_ATTRS =
   'accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" ' +
   'hlink="hlink" folHlink="folHlink"'
 
-function buildSlideMaster(masterPlaceholderBox?: { phType: string; box: EmuBox }): string {
-  const placeholder = masterPlaceholderBox
-    ? placeholderWithBoxXml(2, masterPlaceholderBox.phType, masterPlaceholderBox.box)
-    : ''
+function asArray<T>(x: T | T[] | undefined): T[] {
+  if (x === undefined) return []
+  return Array.isArray(x) ? x : [x]
+}
+
+function buildSlideMaster(
+  masterPlaceholderBox?: PlaceholderBoxSpec | PlaceholderBoxSpec[]
+): string {
+  const placeholder = asArray(masterPlaceholderBox)
+    .map((spec, i) => placeholderWithBoxXml(2 + i, spec.phType, spec.box))
+    .join('')
   return (
     `${xmlDecl()}<p:sldMaster xmlns:a="${A_NS}" xmlns:r="${R_NS}" xmlns:p="${P_NS}">` +
     `<p:cSld><p:spTree>${rootGroupXml()}${placeholder}</p:spTree></p:cSld>` +
@@ -368,10 +518,12 @@ function buildSlideMaster(masterPlaceholderBox?: { phType: string; box: EmuBox }
   )
 }
 
-function buildSlideLayout(layoutPlaceholderBox?: { phType: string; box: EmuBox }): string {
-  const placeholder = layoutPlaceholderBox
-    ? placeholderWithBoxXml(2, layoutPlaceholderBox.phType, layoutPlaceholderBox.box)
-    : ''
+function buildSlideLayout(
+  layoutPlaceholderBox?: PlaceholderBoxSpec | PlaceholderBoxSpec[]
+): string {
+  const placeholder = asArray(layoutPlaceholderBox)
+    .map((spec, i) => placeholderWithBoxXml(2 + i, spec.phType, spec.box))
+    .join('')
   return (
     `${xmlDecl()}<p:sldLayout xmlns:a="${A_NS}" xmlns:r="${R_NS}" xmlns:p="${P_NS}" type="obj" preserve="1">` +
     `<p:cSld name="Layout1"><p:spTree>${rootGroupXml()}${placeholder}</p:spTree></p:cSld>` +
@@ -447,7 +599,13 @@ const CONTENT_TYPE = {
  */
 export async function buildPptx(opts: BuildPptxOptions): Promise<Buffer> {
   const zip = new JSZip()
-  const ctx: BuildCtx = { zip, mediaCounter: { n: 0 }, contentTypeOverrides: [] }
+  const ctx: BuildCtx = {
+    zip,
+    mediaCounter: { n: 0 },
+    chartCounter: { n: 0 },
+    diagramCounter: { n: 0 },
+    contentTypeOverrides: []
+  }
   const hasNotes = opts.slides.some((s) => s.notes !== undefined)
 
   ctx.contentTypeOverrides.push({
