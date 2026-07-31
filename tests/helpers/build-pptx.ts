@@ -69,6 +69,8 @@ export interface TextboxShapeSpec {
   insetsEmu?: { l?: number; r?: number; t?: number; b?: number }
   /** Adds an `a:prstTxWarp` (non-"none") to `a:bodyPr` - exercises the adapter's WordArt-skip path. */
   wordArt?: boolean
+  /** 0-based indices into `text` whose paragraph is emitted as an `a:fld` (auto-field, e.g. slide number/date placeholder) instead of a plain `a:r` - exercises the adapter's fld-as-text-carrier handling. */
+  fldParagraphs?: number[]
 }
 
 export interface PlaceholderShapeSpec {
@@ -223,17 +225,33 @@ function rootGroupXml(): string {
 
 function paragraphsXml(
   lines: string[],
-  opts?: { fontPt?: number; bold?: boolean; fontFamily?: string; eaFontFamily?: string }
+  opts?: {
+    fontPt?: number
+    bold?: boolean
+    fontFamily?: string
+    eaFontFamily?: string
+    /** 0-based indices into `lines` whose paragraph is wrapped in `a:fld` instead of `a:r` - see TextboxShapeSpec.fldParagraphs. */
+    fldIndices?: Set<number>
+  }
 ): string {
   if (lines.length === 0) return '<a:p/>'
   return lines
-    .map((line) => {
+    .map((line, i) => {
       const attrParts = ['lang="en-US"']
       if (opts?.fontPt !== undefined) attrParts.push(`sz="${Math.round(opts.fontPt * 100)}"`)
       if (opts?.bold) attrParts.push('b="1"')
       const latin = opts?.fontFamily ? `<a:latin typeface="${escAttr(opts.fontFamily)}"/>` : ''
       const ea = opts?.eaFontFamily ? `<a:ea typeface="${escAttr(opts.eaFontFamily)}"/>` : ''
       const rPr = `<a:rPr ${attrParts.join(' ')}>${latin}${ea}</a:rPr>`
+      if (opts?.fldIndices?.has(i)) {
+        // A real auto-field carries a GUID id + a recognized type
+        // ("slidenum", "datetime1", ...) - neither is validated by this
+        // codebase, so a fixed placeholder value is fine for every fld.
+        return (
+          `<a:p><a:fld id="{6E4B2C10-0000-0000-0000-00000000000${i}}" type="slidenum">` +
+          `${rPr}<a:t>${escText(line)}</a:t></a:fld></a:p>`
+        )
+      }
       return `<a:p><a:r>${rPr}<a:t>${escText(line)}</a:t></a:r></a:p>`
     })
     .join('')
@@ -278,7 +296,8 @@ function buildShapeXml(
           fontPt: shape.fontPt,
           bold: shape.bold,
           fontFamily: shape.fontFamily,
-          eaFontFamily: shape.eaFontFamily
+          eaFontFamily: shape.eaFontFamily,
+          fldIndices: shape.fldParagraphs ? new Set(shape.fldParagraphs) : undefined
         }) +
         '</p:txBody></p:sp>'
       )

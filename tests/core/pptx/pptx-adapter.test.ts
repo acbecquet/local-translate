@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import JSZip from 'jszip'
+import type { Element } from '@xmldom/xmldom'
 import { A_NS, elems, openPptx } from '../../../src/core/adapters/pptx/ooxml'
 import { PptxAdapter } from '../../../src/core/adapters/pptx/pptx-adapter'
 import { runPipeline } from '../../../src/core/pipeline'
@@ -106,6 +107,17 @@ async function roundTrip(
 
 function byId<T extends { id: string }>(items: T[]): Map<string, T> {
   return new Map(items.map((i) => [i.id, i]))
+}
+
+/** `localName` of every direct ELEMENT child of `el`, in document order - for asserting exact CT_TextParagraph child sequence (pPr?, (r|br|fld)*, endParaRPr?). */
+function directChildElementNames(el: Element): (string | null)[] {
+  const names: (string | null)[] = []
+  const children = el.childNodes
+  for (let i = 0; i < children.length; i++) {
+    const child = children.item(i)
+    if (child && child.nodeType === 1) names.push((child as Element).localName)
+  }
+  return names
 }
 
 let warnSpy: ReturnType<typeof vi.spyOn>
@@ -1375,6 +1387,60 @@ describe('PptxAdapter.apply', () => {
     expect(integrity.ok).toBe(true)
   })
 
+  it('SmartArt cached drawing: two data points sharing identical source text but DIFFERENT translations are left untouched in the cache and logged as ambiguous (no last-write-wins)', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'smartart',
+              name: 'Cycle',
+              box: { xEmu: 0, yEmu: 0, wEmu: 4000 * EMU_PER_PT, hEmu: 2000 * EMU_PER_PT },
+              points: ['Same', 'Same'],
+              cachedDrawing: true
+            }
+          ]
+        }
+      ]
+    })
+
+    const adapter = new PptxAdapter()
+    const segments = await adapter.extract(srcPath)
+    expect(segments).toHaveLength(2)
+    expect(segments.every((s) => s.text === 'Same')).toBe(true)
+
+    // Same source text, deliberately DIFFERENT translations - the exact
+    // ambiguous scenario a naive last-write-wins map would mis-resolve.
+    const translated = [
+      makeTranslated(segments[0], { translation: 'First' }),
+      makeTranslated(segments[1], { translation: 'Second' })
+    ]
+    const outPath = path.join(path.dirname(srcPath), 'out.pptx')
+    await adapter.apply(srcPath, outPath, translated)
+
+    expect(warnMessages.some((m) => /ambiguous/.test(m) && /Same/.test(m))).toBe(true)
+
+    // The DATA MODEL still gets each point's own distinct translation -
+    // the ambiguity only affects the cached drawing's mirrored text.
+    const reExtracted = await adapter.extract(outPath)
+    expect(reExtracted.map((s) => s.text).sort()).toEqual(['First', 'Second'])
+
+    // The cached drawing leaves BOTH mirrored runs untouched (still
+    // "Same"), rather than guessing which translation applies to which.
+    const outDrawingXml = await (
+      await JSZip.loadAsync(await readFile(outPath))
+    )
+      .file('ppt/diagrams/drawing1.xml')!
+      .async('string')
+    const sameCount = (outDrawingXml.match(/<a:t>Same<\/a:t>/g) ?? []).length
+    expect(sameCount).toBe(2)
+    expect(outDrawingXml).not.toContain('<a:t>First</a:t>')
+    expect(outDrawingXml).not.toContain('<a:t>Second</a:t>')
+
+    const integrity = await checkPptxIntegrity(await readFile(outPath))
+    expect(integrity.ok).toBe(true)
+  })
+
   it('a blank middle paragraph (empty text, but still has a run) round-trips as an empty line, not lost and not merging its neighbors', async () => {
     const srcPath = await writeDeck({
       slides: [
@@ -1505,6 +1571,157 @@ describe('PptxAdapter.apply', () => {
 
     const reExtracted = await adapter.extract(outPath)
     expect(reExtracted[0].text).toBe('Un\nDeux')
+  })
+
+  it('a run-less paragraph carrying a:pPr gets its fabricated run inserted AFTER a:pPr (schema order pPr -> r -> endParaRPr), never before it', async () => {
+    const buffer = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['One', 'Two'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT }
+            }
+          ]
+        }
+      ]
+    })
+    const zip = await JSZip.loadAsync(buffer)
+    const slidePath = 'ppt/slides/slide1.xml'
+    let xml = await zip.file(slidePath)!.async('string')
+    const twoParagraph = /<a:p><a:r><a:rPr[^>]*><\/a:rPr><a:t>Two<\/a:t><\/a:r><\/a:p>/
+    expect(xml).toMatch(twoParagraph)
+    // A run-less paragraph carrying BOTH paragraph properties (e.g. a
+    // bullet/indent level) and end-paragraph run properties - the real
+    // shape of a "spacer at list level 1" paragraph.
+    xml = xml.replace(twoParagraph, '<a:p><a:pPr lvl="1"/><a:endParaRPr lang="en-US" b="1"/></a:p>')
+    zip.file(slidePath, xml)
+    const patchedBuffer = await zip.generateAsync({ type: 'nodebuffer' })
+
+    const dir = await tmpDir('lt-pptx-adapter-')
+    const srcPath = path.join(dir, 'src.pptx')
+    await writeFile(srcPath, patchedBuffer)
+
+    const adapter = new PptxAdapter()
+    const [seg] = await adapter.extract(srcPath)
+    expect(seg.text).toBe('One\n')
+
+    const translated = makeTranslated(seg, { translation: 'Un\nDeux' })
+    const outPath = path.join(dir, 'out.pptx')
+    await adapter.apply(srcPath, outPath, [translated])
+
+    const integrity = await checkPptxIntegrity(await readFile(outPath))
+    expect(integrity.ok).toBe(true)
+
+    const archive = await openPptx(outPath)
+    const doc = archive.readXml(slidePath)
+    const paragraphs = elems(doc, A_NS, 'p')
+    // CT_TextParagraph schema order: pPr?, (r|br|fld)*, endParaRPr? - the
+    // fabricated run must land strictly between pPr and endParaRPr, never
+    // before pPr (which would be schema-invalid child order).
+    expect(directChildElementNames(paragraphs[1])).toEqual(['pPr', 'r', 'endParaRPr'])
+    expect(elems(paragraphs[1], A_NS, 't')[0].textContent).toBe('Deux')
+    expect(elems(paragraphs[1], A_NS, 'rPr')[0]?.getAttribute('b')).toBe('1') // still cloned from endParaRPr
+    expect(elems(paragraphs[1], A_NS, 'pPr')[0]?.getAttribute('lvl')).toBe('1') // pPr itself untouched
+
+    const reExtracted = await adapter.extract(outPath)
+    expect(reExtracted[0].text).toBe('Un\nDeux')
+  })
+
+  it('a fld-only paragraph (auto-field placeholder) round-trips to exactly the translation - no duplicate run alongside the field', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Auto Date'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT },
+              fldParagraphs: [0]
+            }
+          ]
+        }
+      ]
+    })
+    const adapter = new PptxAdapter()
+    const [seg] = await adapter.extract(srcPath)
+    expect(seg.text).toBe('Auto Date')
+
+    const translated = makeTranslated(seg, { translation: 'Date Automatique' })
+    const outPath = path.join(path.dirname(srcPath), 'out.pptx')
+    await adapter.apply(srcPath, outPath, [translated])
+
+    const integrity = await checkPptxIntegrity(await readFile(outPath))
+    expect(integrity.ok).toBe(true)
+
+    const archive = await openPptx(outPath)
+    const doc = archive.readXml(archive.listSlidePaths()[0])
+    const paragraph = elems(doc, A_NS, 'p')[0]
+    // Exactly the original a:fld, rewritten in place - no sibling a:r
+    // fabricated alongside it (the duplication bug).
+    expect(elems(paragraph, A_NS, 'fld')).toHaveLength(1)
+    expect(elems(paragraph, A_NS, 'r')).toHaveLength(0)
+    expect(elems(paragraph, A_NS, 't')[0].textContent).toBe('Date Automatique')
+
+    const reExtracted = await adapter.extract(outPath)
+    expect(reExtracted[0].text).toBe('Date Automatique')
+  })
+
+  it('a mixed run+fld paragraph: the translated line writes into the first carrier, the other carrier is emptied (not duplicated)', async () => {
+    const buffer = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Placeholder'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT }
+            }
+          ]
+        }
+      ]
+    })
+    const zip = await JSZip.loadAsync(buffer)
+    const slidePath = 'ppt/slides/slide1.xml'
+    let xml = await zip.file(slidePath)!.async('string')
+    const original = /<a:p><a:r><a:rPr[^>]*><\/a:rPr><a:t>Placeholder<\/a:t><\/a:r><\/a:p>/
+    expect(xml).toMatch(original)
+    // A "Page " run followed by a slide-number field on the SAME line - the
+    // classic mixed run+fld paragraph a real deck's footer/header carries.
+    xml = xml.replace(
+      original,
+      '<a:p><a:r><a:t>Page </a:t></a:r>' +
+        '<a:fld id="{6E4B2C10-0000-0000-0000-000000000099}" type="slidenum"><a:t>1</a:t></a:fld></a:p>'
+    )
+    zip.file(slidePath, xml)
+    const patchedBuffer = await zip.generateAsync({ type: 'nodebuffer' })
+
+    const dir = await tmpDir('lt-pptx-adapter-')
+    const srcPath = path.join(dir, 'src.pptx')
+    await writeFile(srcPath, patchedBuffer)
+
+    const adapter = new PptxAdapter()
+    const [seg] = await adapter.extract(srcPath)
+    expect(seg.text).toBe('Page 1') // run + fld text concatenated, no separator
+
+    const translated = makeTranslated(seg, { translation: 'Page Un' })
+    const outPath = path.join(dir, 'out.pptx')
+    await adapter.apply(srcPath, outPath, [translated])
+
+    const integrity = await checkPptxIntegrity(await readFile(outPath))
+    expect(integrity.ok).toBe(true)
+
+    const archive = await openPptx(outPath)
+    const doc = archive.readXml(slidePath)
+    const paragraph = elems(doc, A_NS, 'p')[0]
+    const run = elems(paragraph, A_NS, 'r')[0]
+    const fld = elems(paragraph, A_NS, 'fld')[0]
+    expect(elems(run, A_NS, 't')[0].textContent).toBe('Page Un') // first carrier gets the whole line
+    expect(elems(fld, A_NS, 't')[0].textContent).toBe('') // second carrier emptied, not left duplicated
+
+    const reExtracted = await adapter.extract(outPath)
+    expect(reExtracted[0].text).toBe('Page Un') // no duplication in the round trip
   })
 
   it('a:br apply symmetry: a paragraph with an existing a:br consumes one translated line per br-group, not per-paragraph (no phantom blank line)', async () => {

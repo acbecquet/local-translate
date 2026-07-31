@@ -76,6 +76,21 @@ const WRAP_SAFETY = 0.96
  */
 const SENTINEL_BOX: Box = { wPt: 1_000_000, hPt: 1_000_000 }
 
+/**
+ * Sentinel stored in a SmartArt drawing-part update map (see
+ * PptxAdapter.apply's `drawingUpdates`) in place of a translation, once a
+ * source text is found to map to more than one DIFFERENT translation
+ * within the same cached drawing part - i.e. two data points share
+ * identical source text but got different translations (independently
+ * translated, or one was hand-edited). Applying either translation to
+ * every matching cached run would be a coin flip about which data point's
+ * text a given cached shape actually corresponds to; applySmartArtDrawingText
+ * treats this as "leave every matching run untouched and log it", the same
+ * outcome as a text with no match at all, rather than silently picking
+ * whichever translation happened to be seen last (last-write-wins).
+ */
+const AMBIGUOUS_TRANSLATION = Symbol('smartart-ambiguous-translation')
+
 /** Used only when neither an explicit run size nor (for shapes) a placeholder-type default resolves anything. */
 const DEFAULT_FALLBACK_FONT_PT = 18
 /** Used only when a segment's first non-empty run carries no a:latin/a:ea typeface at all. */
@@ -155,12 +170,15 @@ export class PptxAdapter implements FormatAdapter {
    * loop (see applySmartArtDrawingText), since a drawing part's "which
    * runs are unmatched" question can only be answered once every one of
    * its diagram's data points has been considered, not one segment at a
-   * time.
+   * time. When two data points in the SAME diagram share identical source
+   * text but got DIFFERENT translations, that source text is recorded as
+   * `AMBIGUOUS_TRANSLATION` instead of either translation - see its own
+   * doc comment for why silently picking one (last-write-wins) is wrong.
    */
   async apply(filePath: string, outPath: string, segments: TranslatedSegment[]): Promise<void> {
     const archive = await openPptx(filePath)
     const siteById = new Map(collectSites(archive).map((s) => [s.id, s]))
-    const drawingUpdates = new Map<string, Map<string, string>>()
+    const drawingUpdates = new Map<string, Map<string, string | typeof AMBIGUOUS_TRANSLATION>>()
 
     for (const seg of segments) {
       const site = siteById.get(seg.id)
@@ -182,7 +200,12 @@ export class PptxAdapter implements FormatAdapter {
           bySourceText = new Map()
           drawingUpdates.set(site.smartArtDrawingPath, bySourceText)
         }
-        bySourceText.set(seg.text, seg.translation)
+        const existing = bySourceText.get(seg.text)
+        if (existing === undefined || existing === seg.translation) {
+          bySourceText.set(seg.text, seg.translation)
+        } else {
+          bySourceText.set(seg.text, AMBIGUOUS_TRANSLATION)
+        }
       }
 
       // Relies on fit-engine's fit() returning font.sizePt back bit-identically
@@ -629,14 +652,24 @@ function handleNotes(ctx: WalkCtx): void {
 // ---- apply-side writers ----
 
 /**
- * One "line slot" within a paragraph: the run(s) between two successive
- * `a:br` siblings (or the paragraph's start/end when there's no `a:br` on
- * that side). `precedingBr` is the `a:br` that opens this group (null for
- * the paragraph's first group, which has nothing before it). A paragraph's
- * line CAPACITY - how many translation lines it can hold without inventing
- * or losing an `a:br` - is exactly `paragraphGroups(p).length`, which is
- * always `(direct-child a:br count) + 1`, matching how paragraphText()
- * (the extraction side) turns each `a:br` into its own `\n`.
+ * One "line slot" within a paragraph: the text-carrying element(s) between
+ * two successive `a:br` siblings (or the paragraph's start/end when there's
+ * no `a:br` on that side). `precedingBr` is the `a:br` that opens this
+ * group (null for the paragraph's first group, which has nothing before
+ * it). A paragraph's line CAPACITY - how many translation lines it can
+ * hold without inventing or losing an `a:br` - is exactly
+ * `paragraphGroups(p).length`, which is always `(direct-child a:br count) +
+ * 1`, matching how paragraphText() (the extraction side) turns each `a:br`
+ * into its own `\n`.
+ *
+ * `runs` holds both `a:r` AND `a:fld` elements - despite the field's name
+ * (kept for brevity/continuity with pre-fld code), an `a:fld` (an
+ * auto-field placeholder, e.g. slide number or date) is just as much a
+ * text carrier as an `a:r`: it has the exact same `a:rPr?, a:t?` shape, so
+ * `textOfRun`/`setRunText` (ooxml.ts) work on it identically. Treating it
+ * as a carrier here is what paragraphText() (the extraction side) already
+ * effectively assumes by reading `a:fld` text too - see its own doc
+ * comment.
  */
 interface RunGroup {
   runs: Element[]
@@ -661,7 +694,7 @@ function paragraphGroups(p: Element): RunGroup[] {
     if (el.localName === 'br') {
       groups.push(current)
       current = { runs: [], precedingBr: el }
-    } else if (el.localName === 'r') {
+    } else if (el.localName === 'r' || el.localName === 'fld') {
       current.runs.push(el)
     }
   }
@@ -728,15 +761,20 @@ function writeTranslation(bodyEl: Element, translation: string): void {
 }
 
 /**
- * Writes `text` into one br-delimited line group: the group's first run
- * gets all of it (keeping its a:rPr - the run is rewritten in place, never
- * recreated); every sibling run in that SAME group is emptied, not
+ * Writes `text` into one br-delimited line group: the group's first
+ * carrier (an `a:r` OR an `a:fld` - see RunGroup's doc comment) gets all
+ * of it (keeping its a:rPr - the element is rewritten in place, never
+ * recreated); every sibling carrier in that SAME group is emptied, not
  * deleted, so its formatting markers survive even though it no longer
- * carries text. A group with zero runs at all (a bare `<a:p/>` spacer line,
- * or an empty slot between two `a:br`s) has no run to reuse - a new `a:r`
- * is created at the group's position (see createGroupRun) rather than
- * silently dropping non-empty text, mirroring appendBreakLine's own
- * prefix-resolved run creation.
+ * carries text - this is also what prevents the mixed "run(s) + fld"
+ * case from duplicating text: an existing `a:fld` counts as the group
+ * already having a carrier, so a translated line lands on the first
+ * carrier (whichever kind it is) instead of a new `a:r` being fabricated
+ * alongside the untouched field. A group with zero carriers at all (a bare
+ * `<a:p/>` spacer line, or an empty slot between two `a:br`s) has nothing
+ * to reuse - a new `a:r` is created at the group's position (see
+ * createGroupRun) rather than silently dropping non-empty text, mirroring
+ * appendBreakLine's own prefix-resolved run creation.
  */
 function writeLineIntoGroup(paragraph: Element, group: RunGroup, text: string): void {
   if (group.runs.length > 0) {
@@ -749,16 +787,25 @@ function writeLineIntoGroup(paragraph: Element, group: RunGroup, text: string): 
 
 /**
  * Creates a new `a:r` holding `text` at the exact position group's (empty)
- * content belongs: right after `group.precedingBr` (or as the paragraph's
- * very first child when this is the paragraph's opening group, before
- * anything else - including a trailing `a:endParaRPr`, which CT_TextParagraph
- * requires to stay the paragraph's LAST child). The run's namespace prefix
- * matches whatever's already bound in scope (same resolution approach as
- * setRunText/ensureRPr/appendBreakLine). If the paragraph carries an
- * `a:endParaRPr` - the run PowerPoint would otherwise have used as this
- * paragraph's "would-be formatting" - its attributes/children are cloned
- * onto the new run's `a:rPr` so the fabricated line doesn't silently fall
- * back to bare defaults; no `a:endParaRPr` present is fine too (bare rPr-less run).
+ * content belongs: right after `group.precedingBr`, or - for the
+ * paragraph's opening group (no preceding br) - right after the
+ * paragraph's own `a:pPr` when one is present, else as the paragraph's very
+ * first child. Either way, the run always lands BEFORE a trailing
+ * `a:endParaRPr` (whether that's because we insert relative to
+ * `precedingBr`/`pPr`, both of which necessarily precede it, or because
+ * `paragraph.firstChild`/`pPr.nextSibling` naturally IS `endParaRPr` on a
+ * paragraph with nothing else in it). This matters because
+ * CT_TextParagraph's schema is a strict sequence - `pPr?, (r|br|fld)*,
+ * endParaRPr?` - so a run inserted before `pPr` (a run-less paragraph
+ * carrying paragraph properties, e.g. `<a:p><a:pPr lvl="1"/></a:p>`) would
+ * produce schema-invalid child order that real PowerPoint may flag with
+ * its repair dialog. The run's namespace prefix matches whatever's already
+ * bound in scope (same resolution approach as setRunText/ensureRPr/
+ * appendBreakLine). If the paragraph carries an `a:endParaRPr` - the run
+ * PowerPoint would otherwise have used as this paragraph's "would-be
+ * formatting" - its attributes/children are cloned onto the new run's
+ * `a:rPr` so the fabricated line doesn't silently fall back to bare
+ * defaults; no `a:endParaRPr` present is fine too (bare rPr-less run).
  */
 function createGroupRun(paragraph: Element, group: RunGroup, text: string): Element {
   const doc = paragraph.ownerDocument
@@ -786,7 +833,8 @@ function createGroupRun(paragraph: Element, group: RunGroup, text: string): Elem
   if (group.precedingBr) {
     paragraph.insertBefore(run, group.precedingBr.nextSibling)
   } else {
-    paragraph.insertBefore(run, paragraph.firstChild)
+    const pPr = childElems(paragraph, A_NS, 'pPr')[0]
+    paragraph.insertBefore(run, pPr ? pPr.nextSibling : paragraph.firstChild)
   }
 
   setRunText(run, text)
@@ -961,14 +1009,17 @@ function ensureRPr(run: Element): Element {
  * - e.g. a placeholder shape - repeated many times in the cache): the
  * drawing simply has no corresponding translated data point for it, which
  * can legitimately happen (the cache and the data model are allowed to
- * drift in a hand-edited or unusual deck). The drawing part is marked
- * dirty only when at least one run actually changed - an all-unmatched
- * drawing (e.g. a stale/foreign cache) is left byte-identical.
+ * drift in a hand-edited or unusual deck). A key mapped to
+ * `AMBIGUOUS_TRANSLATION` (two data points shared this source text but got
+ * different translations) is likewise left untouched and logged, distinctly
+ * from a plain unmatched text - see AMBIGUOUS_TRANSLATION's doc comment.
+ * The drawing part is marked dirty only when at least one run actually
+ * changed - an all-unmatched/all-ambiguous drawing is left byte-identical.
  */
 function applySmartArtDrawingText(
   archive: PptxArchive,
   drawingPath: string,
-  bySourceText: Map<string, string>
+  bySourceText: Map<string, string | typeof AMBIGUOUS_TRANSLATION>
 ): void {
   let drawingDoc: Document
   try {
@@ -982,12 +1033,17 @@ function applySmartArtDrawingText(
 
   let changed = false
   const unmatched = new Set<string>()
+  const ambiguous = new Set<string>()
   for (const run of elems(drawingDoc, A_NS, 'r')) {
     const text = textOfRun(run)
     if (text.trim() === '') continue
     const translation = bySourceText.get(text)
     if (translation === undefined) {
       unmatched.add(text)
+      continue
+    }
+    if (translation === AMBIGUOUS_TRANSLATION) {
+      ambiguous.add(text)
       continue
     }
     setRunText(run, translation)
@@ -997,6 +1053,12 @@ function applySmartArtDrawingText(
   for (const text of unmatched) {
     console.warn(
       `pptx adapter: SmartArt cached drawing text "${text}" has no matching translated data point - left untouched`
+    )
+  }
+  for (const text of ambiguous) {
+    console.warn(
+      `pptx adapter: SmartArt cached drawing text "${text}" is ambiguous (multiple data points share ` +
+        'this source text with different translations) - left untouched'
     )
   }
 
