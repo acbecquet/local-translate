@@ -18,7 +18,9 @@
     "check": "npm run typecheck && npm run lint && npm run format && npm run test",
     "dist": "electron-vite build && electron-builder --win nsis",
     "translate": "tsx src/core/cli.ts",
-    "make-gate-decks": "tsx scripts/make-gate-decks.mjs"
+    "make-gate-decks": "tsx scripts/make-gate-decks.mjs",
+    "make-image-fixtures": "tsx scripts/make-image-fixtures.mjs",
+    "spike-image-regions": "node scripts/spike-image-regions.mjs"
   },
   "dependencies": {
     "@xmldom/xmldom": "^0.9.10",
@@ -31,6 +33,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@gutenye/ocr-node": "^1.4.8",
     "@playwright/test": "^1.62.0",
     "@types/node": "^26.1.2",
     "@types/react": "^19.2.17",

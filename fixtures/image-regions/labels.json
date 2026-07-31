@@ -1,0 +1,327 @@
+{
+  "img01.png": [
+    {
+      "bbox": {
+        "x": 40,
+        "y": 30,
+        "w": 384.61,
+        "h": 33.6
+      },
+      "text": "Quarterly Results Overview"
+    },
+    {
+      "bbox": {
+        "x": 40,
+        "y": 120,
+        "w": 339.14,
+        "h": 21.6
+      },
+      "text": "Revenue grew 18 percent year over year"
+    },
+    {
+      "bbox": {
+        "x": 40,
+        "y": 170,
+        "w": 208.35,
+        "h": 16.8
+      },
+      "text": "Report generated automatically"
+    }
+  ],
+  "img02.png": [
+    {
+      "bbox": {
+        "x": 50,
+        "y": 40,
+        "w": 357.66,
+        "h": 38.4
+      },
+      "text": "Annual Summary 2025"
+    },
+    {
+      "bbox": {
+        "x": 50,
+        "y": 120,
+        "w": 295.58,
+        "h": 21.6
+      },
+      "text": "Prepared for the board of directors"
+    },
+    {
+      "bbox": {
+        "x": 50,
+        "y": 170,
+        "w": 201,
+        "h": 16.8
+      },
+      "text": "Confidential - internal use only"
+    },
+    {
+      "bbox": {
+        "x": 50,
+        "y": 210,
+        "w": 69.48,
+        "h": 14.4
+      },
+      "text": "Page 1 of 12"
+    }
+  ],
+  "img03.png": [
+    {
+      "bbox": {
+        "x": 60,
+        "y": 50,
+        "w": 372.24,
+        "h": 36
+      },
+      "text": "Product Launch Timeline"
+    },
+    {
+      "bbox": {
+        "x": 60,
+        "y": 130,
+        "w": 279.84,
+        "h": 24
+      },
+      "text": "Phase one begins next month"
+    },
+    {
+      "bbox": {
+        "x": 60,
+        "y": 180,
+        "w": 165.65,
+        "h": 19.2
+      },
+      "text": "Track progress weekly"
+    }
+  ],
+  "img04.png": [
+    {
+      "bbox": {
+        "x": 40,
+        "y": 30,
+        "w": 144,
+        "h": 28.8
+      },
+      "text": "季度业绩报告"
+    },
+    {
+      "bbox": {
+        "x": 40,
+        "y": 90,
+        "w": 128,
+        "h": 19.2
+      },
+      "text": "电池测试结果合格"
+    },
+    {
+      "bbox": {
+        "x": 40,
+        "y": 130,
+        "w": 96.71,
+        "h": 12
+      },
+      "text": "生成时间 2026 年 7 月"
+    }
+  ],
+  "img05.png": [
+    {
+      "bbox": {
+        "x": 40,
+        "y": 30,
+        "w": 182,
+        "h": 31.2
+      },
+      "text": "产品发布时间表"
+    },
+    {
+      "bbox": {
+        "x": 40,
+        "y": 100,
+        "w": 144,
+        "h": 21.6
+      },
+      "text": "第一阶段下月开始"
+    },
+    {
+      "bbox": {
+        "x": 40,
+        "y": 150,
+        "w": 84,
+        "h": 16.8
+      },
+      "text": "每周跟踪进度"
+    }
+  ],
+  "img06.png": [
+    {
+      "bbox": {
+        "x": 50,
+        "y": 40,
+        "w": 298.94,
+        "h": 26.4
+      },
+      "text": "System Status: Operational"
+    },
+    {
+      "bbox": {
+        "x": 50,
+        "y": 100,
+        "w": 209.6,
+        "h": 19.2
+      },
+      "text": "Last updated 3 minutes ago"
+    },
+    {
+      "bbox": {
+        "x": 400,
+        "y": 300,
+        "w": 210.17,
+        "h": 16.8
+      },
+      "text": "Contact support if issues persist"
+    }
+  ],
+  "img07.png": [
+    {
+      "bbox": {
+        "x": 50,
+        "y": 40,
+        "w": 136.93,
+        "h": 26.4
+      },
+      "text": "警告 高温风险"
+    },
+    {
+      "bbox": {
+        "x": 50,
+        "y": 110,
+        "w": 128,
+        "h": 19.2
+      },
+      "text": "请勿触摸金属部件"
+    },
+    {
+      "bbox": {
+        "x": 50,
+        "y": 170,
+        "w": 112,
+        "h": 16.8
+      },
+      "text": "损坏样品需要标记"
+    }
+  ],
+  "img08.png": [
+    {
+      "bbox": {
+        "x": 35,
+        "y": 60,
+        "w": 87.09,
+        "h": 15.6
+      },
+      "text": "Tester: Charlie"
+    },
+    {
+      "bbox": {
+        "x": 255,
+        "y": 60,
+        "w": 61.56,
+        "h": 15.6
+      },
+      "text": "Media: D8"
+    },
+    {
+      "bbox": {
+        "x": 475,
+        "y": 60,
+        "w": 79.08,
+        "h": 15.6
+      },
+      "text": "Power: 4.2 W"
+    },
+    {
+      "bbox": {
+        "x": 695,
+        "y": 60,
+        "w": 82.47,
+        "h": 15.6
+      },
+      "text": "Voltage: 3.2 V"
+    },
+    {
+      "bbox": {
+        "x": 35,
+        "y": 180,
+        "w": 90.04,
+        "h": 15.6
+      },
+      "text": "Resistance: 2.3"
+    },
+    {
+      "bbox": {
+        "x": 255,
+        "y": 180,
+        "w": 77.38,
+        "h": 15.6
+      },
+      "text": "Storage: 60C"
+    },
+    {
+      "bbox": {
+        "x": 475,
+        "y": 180,
+        "w": 63.22,
+        "h": 15.6
+      },
+      "text": "Time: 48 h"
+    },
+    {
+      "bbox": {
+        "x": 695,
+        "y": 180,
+        "w": 88.39,
+        "h": 15.6
+      },
+      "text": "Humidity: 60%"
+    }
+  ],
+  "img09.png": [
+    {
+      "bbox": {
+        "x": 40,
+        "y": 30,
+        "w": 207.1,
+        "h": 28.8
+      },
+      "text": "CCELL AIO Device"
+    },
+    {
+      "bbox": {
+        "x": 40,
+        "y": 90,
+        "w": 120,
+        "h": 24
+      },
+      "text": "标准测试结果"
+    },
+    {
+      "bbox": {
+        "x": 40,
+        "y": 140,
+        "w": 151.13,
+        "h": 16.8
+      },
+      "text": "Serial Number: A19082"
+    },
+    {
+      "bbox": {
+        "x": 40,
+        "y": 180,
+        "w": 102.33,
+        "h": 16.8
+      },
+      "text": "测试员：Charlie"
+    }
+  ],
+  "img10.png": []
+}
