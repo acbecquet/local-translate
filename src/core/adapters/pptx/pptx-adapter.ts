@@ -146,6 +146,10 @@ export class PptxAdapter implements FormatAdapter {
       writeTranslation(site.bodyEl, seg.translation)
       archive.markDirty(site.partPath)
 
+      // Relies on fit-engine's fit() returning font.sizePt back bit-identically
+      // (not merely a numerically-equal-but-recomputed value) whenever the
+      // text already fits at the starting size - i.e. that this comparison
+      // is a reliable proxy for "no shrink happened", not just a close one.
       if (site.kind !== 'notes' && seg.fittedSizePt !== seg.font.sizePt) {
         writeSize(site.bodyEl, seg.fittedSizePt)
       }
@@ -318,7 +322,7 @@ function handleGraphicFrame(
     handleSmartArt(gf, graphicData, groupScale, pathPrefix, ctx)
     return
   }
-  if (uri) logSkip(`unsupported graphic frame (${uri})`, name)
+  if (uri) logSkip(`graphic frame (${uri})`, name)
 }
 
 function handleTable(
@@ -342,7 +346,23 @@ function handleTable(
       // other cell covered by a merge carries hMerge and/or vMerge with no
       // text of its own (see tableCellBoxes's doc comment) - skip those so
       // a merged region is emitted exactly once, not once per covered cell.
-      if (tc.hasAttribute('hMerge') || tc.hasAttribute('vMerge')) continue
+      // This is intentional per OOXML merge semantics (a continuation cell
+      // is a layout placeholder for the anchor's span, not an independent
+      // cell) - if one somehow DOES carry stray text anyway (a malformed or
+      // hand-edited deck), that text is still dropped, but loudly logged
+      // rather than silently, since silently dropping real content is
+      // exactly the failure mode this adapter otherwise refuses to allow.
+      if (tc.hasAttribute('hMerge') || tc.hasAttribute('vMerge')) {
+        const strayTxBody = childElems(tc, A_NS, 'txBody')[0]
+        const strayText = strayTxBody && paragraphsText(strayTxBody).trim()
+        if (strayText) {
+          logSkip(
+            'merge-continuation cell with unexpected text (anchor-only extraction is intentional)',
+            `${name} r${r + 1}c${c + 1}`
+          )
+        }
+        continue
+      }
 
       const txBody = childElems(tc, A_NS, 'txBody')[0]
       if (!txBody) continue
@@ -504,35 +524,47 @@ function handleNotes(ctx: WalkCtx): void {
 /**
  * Writes `translation` into `bodyEl`'s existing `a:p` paragraphs.
  *
- * When the translation splits (on `\n`) into exactly as many lines as
- * `bodyEl` has paragraphs, each line maps onto its paragraph 1:1 (see
- * writeLineIntoParagraph). Otherwise every paragraph's structure is kept
- * (never added to or removed - a:p/a:r/a:rPr elements are formatting we
- * must not destroy) but the text can no longer be aligned per-paragraph, so
- * the WHOLE translation goes into the very first run found anywhere in
- * `bodyEl` (keeping that run's a:rPr), and every other run in every
- * paragraph is emptied, not deleted.
+ * Let k = min(translation's line count, `bodyEl`'s paragraph count). Lines
+ * 1..k map 1:1 onto the first k paragraphs (see writeLineIntoParagraph).
+ * Beyond that:
+ *
+ *  - MORE lines than paragraphs: every remaining line is appended to the
+ *    k-th (last written) paragraph as its own `a:br`-preceded run - a real
+ *    visual line break, but never a new `a:p` (a translation gaining an
+ *    extra line is not license to invent a whole new paragraph's worth of
+ *    formatting/list-level that the source never had).
+ *  - FEWER lines than paragraphs: every paragraph beyond the k-th is
+ *    DELETED outright.
+ *
+ * This is a deliberate redesign, not the obvious "keep every a:p, just
+ * empty the surplus ones" approach: emptied-but-retained surplus paragraphs
+ * are phantom blank lines - PowerPoint still renders each one as real
+ * vertical space the fit engine never measured against, AND (since
+ * paragraphText treats each a:p as its own `\n`-separated unit) a
+ * subsequent extract() would see extra blank lines that were never in the
+ * translation, breaking the round trip. Deleting the surplus paragraph does
+ * lose that paragraph's own per-paragraph formatting (bullet level,
+ * alignment, spacing) - accepted as the lesser cost versus a document that
+ * silently renders content the translation never asked for.
  */
 function writeTranslation(bodyEl: Element, translation: string): void {
   const lines = translation.split('\n')
   const paragraphs = childElems(bodyEl, A_NS, 'p')
+  // Unreachable in practice: a segment only ever reaches apply() if extract()
+  // found non-empty text in this same bodyEl, which requires at least one
+  // a:p to have existed. Guarded anyway so a malformed/hand-edited deck
+  // degrades to a no-op here instead of indexing paragraphs[-1] below.
+  if (paragraphs.length === 0) return
 
-  if (paragraphs.length === lines.length) {
-    paragraphs.forEach((p, i) => writeLineIntoParagraph(p, lines[i]))
-    return
+  const k = Math.min(lines.length, paragraphs.length)
+  for (let i = 0; i < k; i++) writeLineIntoParagraph(paragraphs[i], lines[i])
+
+  if (lines.length > k) {
+    const lastParagraph = paragraphs[k - 1]
+    for (let i = k; i < lines.length; i++) appendBreakLine(lastParagraph, lines[i])
   }
 
-  let wrote = false
-  for (const p of paragraphs) {
-    for (const run of childElems(p, A_NS, 'r')) {
-      if (!wrote) {
-        setRunText(run, lines.join('\n'))
-        wrote = true
-      } else {
-        setRunText(run, '')
-      }
-    }
-  }
+  for (let i = paragraphs.length - 1; i >= k; i--) bodyEl.removeChild(paragraphs[i])
 }
 
 /**
@@ -549,6 +581,32 @@ function writeTranslation(bodyEl: Element, translation: string): void {
 function writeLineIntoParagraph(p: Element, text: string): void {
   const runs = childElems(p, A_NS, 'r')
   runs.forEach((run, i) => setRunText(run, i === 0 ? text : ''))
+}
+
+/**
+ * Appends `text` to `paragraph` as a new visual line: an `a:br` followed by
+ * a fresh `a:r` run carrying `text`. The new run's namespace prefix matches
+ * whatever's already bound in scope (same resolution approach as
+ * setRunText/ensureRPr), and it clones the paragraph's own first run's
+ * `a:rPr` (if any) so the appended line's formatting matches rather than
+ * silently falling back to bare paragraph/list defaults.
+ */
+function appendBreakLine(paragraph: Element, text: string): void {
+  const doc = paragraph.ownerDocument
+  if (!doc) return
+  const prefix = paragraph.lookupPrefix(A_NS)
+  const qualified = (local: string): string =>
+    prefix === null ? `a:${local}` : prefix === '' ? local : `${prefix}:${local}`
+
+  paragraph.appendChild(doc.createElementNS(A_NS, qualified('br')))
+
+  const run = doc.createElementNS(A_NS, qualified('r'))
+  const sourceRun = childElems(paragraph, A_NS, 'r')[0]
+  const sourceRPr = sourceRun && childElems(sourceRun, A_NS, 'rPr')[0]
+  if (sourceRPr) run.appendChild(sourceRPr.cloneNode(true))
+  paragraph.appendChild(run)
+
+  setRunText(run, text)
 }
 
 /**
@@ -595,13 +653,33 @@ function ensureRPr(run: Element): Element {
 // ---- shape/text helpers ----
 
 function paragraphsText(bodyEl: Element): string {
-  return childElems(bodyEl, A_NS, 'p')
-    .map((p) =>
-      elems(p, A_NS, 't')
-        .map((t) => t.textContent ?? '')
-        .join('')
-    )
-    .join('\n')
+  return childElems(bodyEl, A_NS, 'p').map(paragraphText).join('\n')
+}
+
+/**
+ * One paragraph's text, walking its direct children in document order so an
+ * `a:br` (an explicit line break WITHIN a paragraph - e.g. one appended by
+ * writeTranslation's own overflow path, or authored by hand in a source
+ * deck) becomes a `\n`, matching how the paragraph-vs-line accounting in
+ * writeTranslation treats it on the way back in. `a:r` and `a:fld` runs
+ * contribute their own `a:t` text; nothing else (end-paragraph run
+ * properties, etc.) carries text.
+ */
+function paragraphText(p: Element): string {
+  const parts: string[] = []
+  const children = p.childNodes
+  for (let i = 0; i < children.length; i++) {
+    const child = children.item(i)
+    if (!child || child.nodeType !== ELEMENT_NODE) continue
+    const el = child as Element
+    if (el.namespaceURI !== A_NS) continue
+    if (el.localName === 'br') {
+      parts.push('\n')
+    } else if (el.localName === 'r' || el.localName === 'fld') {
+      parts.push(childElems(el, A_NS, 't')[0]?.textContent ?? '')
+    }
+  }
+  return parts.join('')
 }
 
 function isWordArt(bodyEl: Element): boolean {
@@ -702,9 +780,7 @@ function shapeName(shape: Element): string {
 }
 
 function logSkip(kind: string, name: string): void {
-  console.warn(
-    `pptx adapter: skipping unsupported ${kind} shape "${name}" - left untouched on apply`
-  )
+  console.warn(`pptx adapter: skipping unsupported ${kind} "${name}" - left untouched on apply`)
 }
 
 // ---- small generic/id/relationship utilities ----

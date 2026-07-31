@@ -55,7 +55,10 @@ export interface TextboxShapeSpec {
   box: EmuBox
   fontPt?: number
   bold?: boolean
+  /** `a:latin` typeface. */
   fontFamily?: string
+  /** `a:ea` (East Asian) typeface - lets a fixture carry both a Latin and an East Asian typeface so tests can exercise the adapter's script-based a:ea-vs-a:latin preference. */
+  eaFontFamily?: string
   name?: string
   /** Explicit `a:bodyPr` insets (EMU); any side omitted falls back to the OOXML default. */
   insetsEmu?: { l?: number; r?: number; t?: number; b?: number }
@@ -205,7 +208,7 @@ function rootGroupXml(): string {
 
 function paragraphsXml(
   lines: string[],
-  opts?: { fontPt?: number; bold?: boolean; fontFamily?: string }
+  opts?: { fontPt?: number; bold?: boolean; fontFamily?: string; eaFontFamily?: string }
 ): string {
   if (lines.length === 0) return '<a:p/>'
   return lines
@@ -213,8 +216,9 @@ function paragraphsXml(
       const attrParts = ['lang="en-US"']
       if (opts?.fontPt !== undefined) attrParts.push(`sz="${Math.round(opts.fontPt * 100)}"`)
       if (opts?.bold) attrParts.push('b="1"')
-      const typeface = opts?.fontFamily ? `<a:latin typeface="${escAttr(opts.fontFamily)}"/>` : ''
-      const rPr = `<a:rPr ${attrParts.join(' ')}>${typeface}</a:rPr>`
+      const latin = opts?.fontFamily ? `<a:latin typeface="${escAttr(opts.fontFamily)}"/>` : ''
+      const ea = opts?.eaFontFamily ? `<a:ea typeface="${escAttr(opts.eaFontFamily)}"/>` : ''
+      const rPr = `<a:rPr ${attrParts.join(' ')}>${latin}${ea}</a:rPr>`
       return `<a:p><a:r>${rPr}<a:t>${escText(line)}</a:t></a:r></a:p>`
     })
     .join('')
@@ -258,7 +262,8 @@ function buildShapeXml(
         paragraphsXml(shape.text, {
           fontPt: shape.fontPt,
           bold: shape.bold,
-          fontFamily: shape.fontFamily
+          fontFamily: shape.fontFamily,
+          eaFontFamily: shape.eaFontFamily
         }) +
         '</p:txBody></p:sp>'
       )

@@ -58,14 +58,25 @@ function mockTranslate(text: string): string {
     .join('\n')
 }
 
-function reverseTranslateBackend(): TranslationBackend {
+function translateBackend(translateFn: (text: string) => string): TranslationBackend {
   return {
     listModels: vi.fn().mockResolvedValue([]),
     pullModel: vi.fn().mockResolvedValue(undefined),
     translateBatch: vi.fn(async (req: BatchRequest): Promise<BatchResponse> => ({
-      translations: req.segments.map((s) => ({ id: s.id, translation: mockTranslate(s.text) }))
+      translations: req.segments.map((s) => ({ id: s.id, translation: translateFn(s.text) }))
     }))
   }
+}
+
+/** Appends one extra line to every segment - a count-CHANGING mock translator (more lines out than in), for the paragraph-mismatch round-trip tests. */
+function addLineTranslate(text: string): string {
+  return `${mockTranslate(text)}\nEXTRA LINE`
+}
+
+/** Drops the last line of every multi-line segment - a count-CHANGING mock translator (fewer lines out than in). Single-line segments are still reversed so they're never an echo. */
+function dropLineTranslate(text: string): string {
+  const lines = mockTranslate(text).split('\n')
+  return lines.length > 1 ? lines.slice(0, -1).join('\n') : lines[0]
 }
 
 interface RoundTrip {
@@ -75,7 +86,10 @@ interface RoundTrip {
 }
 
 /** extract -> mock-translate (via runPipeline) -> apply -> re-extract. */
-async function roundTrip(srcPath: string): Promise<RoundTrip> {
+async function roundTrip(
+  srcPath: string,
+  translateFn: (text: string) => string = mockTranslate
+): Promise<RoundTrip> {
   const adapter = new PptxAdapter()
   const originalSegments = await adapter.extract(srcPath)
   const report = await runPipeline({
@@ -84,7 +98,7 @@ async function roundTrip(srcPath: string): Promise<RoundTrip> {
     targetLang: 'French',
     model: 'test-model',
     adapter,
-    backend: reverseTranslateBackend()
+    backend: translateBackend(translateFn)
   })
   const reExtracted = await adapter.extract(report.outPath)
   return { outPath: report.outPath, originalSegments, reExtracted }
@@ -227,6 +241,35 @@ describe('PptxAdapter.extract', () => {
     expect(anchor.box.hPt).toBeCloseTo(1200, 6)
   })
 
+  it('a merge-continuation cell that unexpectedly carries text is still dropped (anchor-only is intentional), but logs a warning instead of failing silently', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'table',
+              name: 'Malformed Table',
+              box: { xEmu: 0, yEmu: 0, wEmu: 2000 * EMU_PER_PT, hEmu: 600 * EMU_PER_PT },
+              colWidthsEmu: [1000 * EMU_PER_PT, 1000 * EMU_PER_PT],
+              rowHeightsEmu: [600 * EMU_PER_PT],
+              rows: [
+                [
+                  { text: 'Anchor', gridSpan: 2 },
+                  { text: 'stray leftover text', hMerge: true }
+                ]
+              ]
+            }
+          ]
+        }
+      ]
+    })
+
+    const segments = await new PptxAdapter().extract(srcPath)
+    expect(segments).toHaveLength(1) // the continuation cell's stray text is still never extracted
+    expect(segments[0].text).toBe('Anchor')
+    expect(warnMessages.some((m) => /merge-continuation cell/.test(m) && /r1c2/.test(m))).toBe(true)
+  })
+
   it('a two-level nested group compounds the id path and the box/font scale', async () => {
     // Outer group: ext 400x400 / chExt 200x200 -> sx=sy=2. Inner group (in
     // outer's child space): ext 100x100 / chExt 50x50 -> sx=sy=2. Compounded: 4x.
@@ -275,6 +318,92 @@ describe('PptxAdapter.extract', () => {
     expect(s.font.sizePt).toBe(10 * 4)
   })
 
+  it('a table nested one level inside an asymmetrically-scaled group has its cell box scaled by groupScale exactly once (tableCellBoxes is scale-naive; handleTable multiplies externally)', async () => {
+    // ext 400x200 / chExt 100x100 -> sx=4, sy=2: distinct axes so a
+    // transposed or double-applied scale would produce a visibly different,
+    // wrong pair of numbers rather than coincidentally matching.
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'group',
+              name: 'Scaler',
+              box: { xEmu: 0, yEmu: 0, wEmu: 400 * EMU_PER_PT, hEmu: 200 * EMU_PER_PT },
+              chOff: { xEmu: 0, yEmu: 0 },
+              chExt: { wEmu: 100 * EMU_PER_PT, hEmu: 100 * EMU_PER_PT },
+              children: [
+                {
+                  kind: 'table',
+                  name: 'Inner Table',
+                  box: { xEmu: 0, yEmu: 0, wEmu: 20 * EMU_PER_PT, hEmu: 10 * EMU_PER_PT },
+                  colWidthsEmu: [20 * EMU_PER_PT],
+                  rowHeightsEmu: [10 * EMU_PER_PT],
+                  rows: [['Cell text']]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    })
+
+    const segments = await new PptxAdapter().extract(srcPath)
+    expect(segments).toHaveLength(1)
+    const s = segments[0]
+    expect(s.id).toBe('slide1/group[name=Scaler]/table[gf-name=Inner Table]/r1c1')
+    // Raw cell box from tableCellBoxes (scale-naive, pure gridCol/tr EMU math): 20pt x 10pt.
+    // handleTable applies sx to width and sy to height EXTERNALLY, exactly
+    // once, then WRAP_SAFETY on width only.
+    expect(s.box.wPt).toBeCloseTo(20 * 4 * 0.96, 6)
+    expect(s.box.hPt).toBeCloseTo(10 * 2, 6)
+  })
+
+  it('a SmartArt graphicFrame nested one level inside an asymmetrically-scaled group has its box scaled exactly once via geometry.ts', async () => {
+    // Same 400x200 / 100x100 group as the table test above -> sx=4, sy=2.
+    // Unlike the table (whose box the adapter scales externally), a
+    // SmartArt graphicFrame's box comes from resolveShapeGeom() itself,
+    // which applies groupScale internally - a genuinely different code path,
+    // worth its own proof that it isn't ALSO scaled a second time externally.
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'group',
+              name: 'Scaler',
+              box: { xEmu: 0, yEmu: 0, wEmu: 400 * EMU_PER_PT, hEmu: 200 * EMU_PER_PT },
+              chOff: { xEmu: 0, yEmu: 0 },
+              chExt: { wEmu: 100 * EMU_PER_PT, hEmu: 100 * EMU_PER_PT },
+              children: [
+                {
+                  kind: 'smartart',
+                  name: 'Diagram',
+                  box: { xEmu: 0, yEmu: 0, wEmu: 40 * EMU_PER_PT, hEmu: 20 * EMU_PER_PT },
+                  points: ['Point A']
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    })
+
+    const segments = await new PptxAdapter().extract(srcPath)
+    expect(segments).toHaveLength(1)
+    const s = segments[0]
+    expect(s.id).toBe('slide1/group[name=Scaler]/smartart[gf-name=Diagram]/pt1')
+    // resolveShapeGeom subtracts default insets (91440/45720 EMU = 7.2pt/
+    // 3.6pt) from the RAW (unscaled) ext before scaling, then scales the
+    // already-inset-adjusted width/height by sx/sy respectively - so
+    // box.wPt = (40 - 7.2 - 7.2) * 4, not 40*4 - 7.2 - 7.2 (a double-scale
+    // bug would produce (40-7.2-7.2)*4*4, easily distinguished from this).
+    const insetW = 40 - 7.2 - 7.2
+    const insetH = 20 - 3.6 - 3.6
+    expect(s.box.wPt).toBeCloseTo(insetW * 4 * 0.96, 6)
+    expect(s.box.hPt).toBeCloseTo(insetH * 2, 6)
+  })
+
   it('extracts an all-Chinese deck, preferring the a:ea typeface for CJK text', async () => {
     const srcPath = await writeDeck({
       slides: [
@@ -295,10 +424,50 @@ describe('PptxAdapter.extract', () => {
     const segments = await new PptxAdapter().extract(srcPath)
     expect(segments).toHaveLength(1)
     expect(segments[0].text).toBe('这是第一段中文文本。\n这是第二段中文文本，内容更长一些。')
-    // The builder only ever sets a:latin (fontFamily), never a:ea, so with
-    // no a:ea present resolveBodyFont must fall back to the a:latin
-    // typeface that IS there rather than reporting the generic default.
+    // Only a:latin is set here (no a:ea), so with no a:ea present
+    // resolveBodyFont must fall back to the a:latin typeface that IS there
+    // rather than reporting the generic default. The "prefer a:ea over
+    // a:latin when BOTH are present and the text is CJK" branch is covered
+    // separately below.
     expect(segments[0].font.family).toBe('Microsoft YaHei')
+  })
+
+  it('prefers a:ea over a:latin for CJK text, and a:latin over a:ea for Latin text, when a run carries both typefaces', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              name: 'CJK Box',
+              text: ['中文文本'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 3000 * EMU_PER_PT, hEmu: 1500 * EMU_PER_PT },
+              fontFamily: 'Calibri',
+              eaFontFamily: 'Microsoft YaHei'
+            },
+            {
+              kind: 'textbox',
+              name: 'Latin Box',
+              text: ['English text'],
+              box: {
+                xEmu: 0,
+                yEmu: 1600 * EMU_PER_PT,
+                wEmu: 3000 * EMU_PER_PT,
+                hEmu: 1500 * EMU_PER_PT
+              },
+              fontFamily: 'Calibri',
+              eaFontFamily: 'Microsoft YaHei'
+            }
+          ]
+        }
+      ]
+    })
+
+    const segments = await new PptxAdapter().extract(srcPath)
+    const cjk = segments.find((s) => s.text === '中文文本')!
+    const latin = segments.find((s) => s.text === 'English text')!
+    expect(cjk.font.family).toBe('Microsoft YaHei') // a:ea preferred for CJK text
+    expect(latin.font.family).toBe('Calibri') // a:latin preferred for Latin text, even with a:ea also present
   })
 
   it('extracts notes with groupKey slide<N>-notes, context "notes", and a sentinel (never-shrink) box', async () => {
@@ -601,7 +770,7 @@ describe('PptxAdapter.apply', () => {
     expect(integrity.ok).toBe(true)
   })
 
-  it('paragraph count mismatch: all text collapses into the first run found; every other run (any paragraph) is emptied, not deleted', async () => {
+  it('MORE translated lines than source paragraphs: first k lines map 1:1, the rest append to the last paragraph as a:br-separated runs (no new a:p)', async () => {
     const srcPath = await writeDeck({
       slides: [
         {
@@ -618,7 +787,7 @@ describe('PptxAdapter.apply', () => {
     })
     const adapter = new PptxAdapter()
     const [seg] = await adapter.extract(srcPath)
-    // 3 lines vs 2 source paragraphs: count mismatch.
+    // 3 lines vs 2 source paragraphs: k = 2, "Trois" is the overflow line.
     const translated = makeTranslated(seg, { translation: 'Un\nDeux\nTrois' })
 
     const outPath = path.join(path.dirname(srcPath), 'out.pptx')
@@ -626,14 +795,95 @@ describe('PptxAdapter.apply', () => {
 
     const archive = await openPptx(outPath)
     const doc = archive.readXml(archive.listSlidePaths()[0])
-    const runs = elems(doc, A_NS, 'r')
-    expect(runs).toHaveLength(2) // one run per original paragraph, neither deleted nor added to
-    expect(elems(runs[0], A_NS, 't')[0].textContent).toBe('Un\nDeux\nTrois')
-    expect(elems(runs[1], A_NS, 't')[0].textContent).toBe('')
-    // Formatting retained on the emptied run (never deleted).
-    const rPr2 = elems(runs[1], A_NS, 'rPr')[0]
-    expect(rPr2).toBeDefined()
-    expect(rPr2.getAttribute('b')).toBe('1')
+    const paragraphs = elems(doc, A_NS, 'p')
+    expect(paragraphs).toHaveLength(2) // no paragraph was added
+
+    expect(elems(paragraphs[0], A_NS, 'r').map((r) => elems(r, A_NS, 't')[0].textContent)).toEqual([
+      'Un'
+    ])
+    expect(elems(paragraphs[0], A_NS, 'br')).toHaveLength(0)
+
+    const secondRuns = elems(paragraphs[1], A_NS, 'r')
+    expect(secondRuns.map((r) => elems(r, A_NS, 't')[0].textContent)).toEqual(['Deux', 'Trois'])
+    expect(elems(paragraphs[1], A_NS, 'br')).toHaveLength(1) // one real visual line break
+    // The appended run's formatting matches the paragraph's original run (bold carried over).
+    expect(elems(secondRuns[1], A_NS, 'rPr')[0]?.getAttribute('b')).toBe('1')
+
+    // Round-trips back to the exact translation: a:br re-extracts as \n.
+    const reExtracted = await adapter.extract(outPath)
+    expect(reExtracted[0].text).toBe('Un\nDeux\nTrois')
+
+    const integrity = await checkPptxIntegrity(await readFile(outPath))
+    expect(integrity.ok).toBe(true)
+  })
+
+  it('FEWER translated lines than source paragraphs: first k lines map 1:1, the surplus paragraphs are deleted outright (no phantom blank lines)', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['One', 'Two', 'Three'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT }
+            }
+          ]
+        }
+      ]
+    })
+    const adapter = new PptxAdapter()
+    const [seg] = await adapter.extract(srcPath)
+    // 1 line vs 3 source paragraphs: k = 1, paragraphs 2 and 3 are deleted.
+    const translated = makeTranslated(seg, { translation: 'Uno' })
+
+    const outPath = path.join(path.dirname(srcPath), 'out.pptx')
+    await adapter.apply(srcPath, outPath, [translated])
+
+    const archive = await openPptx(outPath)
+    const doc = archive.readXml(archive.listSlidePaths()[0])
+    const paragraphs = elems(doc, A_NS, 'p')
+    expect(paragraphs).toHaveLength(1) // the 2 surplus paragraphs are gone, not just emptied
+    expect(elems(paragraphs[0], A_NS, 't')[0].textContent).toBe('Uno')
+
+    const reExtracted = await adapter.extract(outPath)
+    expect(reExtracted[0].text).toBe('Uno') // no phantom blank lines from emptied-but-retained paragraphs
+
+    const integrity = await checkPptxIntegrity(await readFile(outPath))
+    expect(integrity.ok).toBe(true)
+  })
+
+  it('a:br within a paragraph re-extracts as \\n (extract/apply agree on what a "line" is)', async () => {
+    // Build a plain 1-paragraph, 1-run textbox, then hand-insert an a:br +
+    // a second run - simulating either a hand-authored deck with a manual
+    // line break, or this adapter's own overflow-append output.
+    const buffer = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Hello'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT }
+            }
+          ]
+        }
+      ]
+    })
+    const zip = await JSZip.loadAsync(buffer)
+    const slidePath = 'ppt/slides/slide1.xml'
+    let xml = await zip.file(slidePath)!.async('string')
+    const original = /<a:p>(<a:r>.*?<\/a:r>)<\/a:p>/
+    expect(xml).toMatch(original)
+    xml = xml.replace(original, '<a:p>$1<a:br/><a:r><a:t>World</a:t></a:r></a:p>')
+    zip.file(slidePath, xml)
+    const patchedBuffer = await zip.generateAsync({ type: 'nodebuffer' })
+
+    const dir = await tmpDir('lt-pptx-adapter-')
+    const srcPath = path.join(dir, 'src.pptx')
+    await writeFile(srcPath, patchedBuffer)
+
+    const [seg] = await new PptxAdapter().extract(srcPath)
+    expect(seg.text).toBe('Hello\nWorld')
   })
 
   it('a paragraph with multiple runs: the first run gets the whole line, sibling runs in the SAME paragraph are emptied but keep their a:rPr', async () => {
@@ -1359,6 +1609,63 @@ describe('PptxAdapter round-trip', () => {
     expect(outDigests.get(colorsPart)).toBe(srcDigests.get(colorsPart))
     // The data part DID change (that's where the translated point text lives).
     expect(outDigests.get(dataPart)).not.toBe(srcDigests.get(dataPart))
+
+    const integrity = await checkPptxIntegrity(await readFile(outPath))
+    expect(integrity.ok).toBe(true)
+  })
+
+  it('count-changing translator, MORE lines: a multi-paragraph textbox round-trips exactly even when every translation gains a line', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Paragraph one.', 'Paragraph two.'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT }
+            }
+          ]
+        }
+      ]
+    })
+
+    const { outPath, originalSegments, reExtracted } = await roundTrip(srcPath, addLineTranslate)
+    expect(originalSegments).toHaveLength(1)
+    const reById = byId(reExtracted)
+    for (const orig of originalSegments) {
+      // Exact match - not just "contains the text somewhere" - proves the
+      // a:br-appended overflow line re-extracts as \n, matching exactly
+      // what was applied.
+      expect(reById.get(orig.id)!.text).toBe(addLineTranslate(orig.text))
+    }
+
+    const integrity = await checkPptxIntegrity(await readFile(outPath))
+    expect(integrity.ok).toBe(true)
+  })
+
+  it('count-changing translator, FEWER lines: a multi-paragraph textbox round-trips exactly even when every translation loses a line', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Paragraph one.', 'Paragraph two.', 'Paragraph three.'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT }
+            }
+          ]
+        }
+      ]
+    })
+
+    const { outPath, originalSegments, reExtracted } = await roundTrip(srcPath, dropLineTranslate)
+    expect(originalSegments).toHaveLength(1)
+    const reById = byId(reExtracted)
+    for (const orig of originalSegments) {
+      // Exact match - proves the deleted surplus paragraph doesn't leave a
+      // phantom blank line (which would show up here as an extra trailing \n).
+      expect(reById.get(orig.id)!.text).toBe(dropLineTranslate(orig.text))
+    }
 
     const integrity = await checkPptxIntegrity(await readFile(outPath))
     expect(integrity.ok).toBe(true)
