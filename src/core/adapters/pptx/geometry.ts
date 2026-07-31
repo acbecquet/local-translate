@@ -133,7 +133,17 @@ export function resolveShapeGeom(opts: ResolveShapeGeomOptions): ShapeGeom {
   return { box, fontPt, insetsPt }
 }
 
-/** [row][col] cell boxes; horizontal (gridSpan) and vertical (rowSpan/vMerge) merges unioned. */
+/**
+ * [row][col] cell boxes; horizontal (gridSpan) and vertical (rowSpan/vMerge)
+ * merges unioned, then the anchor cell's own `a:tcPr` margins (explicit or
+ * the OOXML default) are subtracted from that union EXACTLY ONCE - mirroring
+ * how `resolveShapeGeom` subtracts `bodyPr` insets from a shape's box.
+ * Every cell covered by a merge shares the identical anchor, so they all
+ * report the identical post-margin union; a covered (hMerge/vMerge-only)
+ * cell's own `a:tcPr` is never consulted, matching how only the anchor
+ * carries real span/formatting information per OOXML merge semantics (see
+ * the anchorOf() doc comment below).
+ */
 export function tableCellBoxes(graphicFrame: Element): ResolvedBox[][] {
   const tbl = elems(graphicFrame, A_NS, 'tbl')[0]
   if (!tbl) return []
@@ -177,13 +187,35 @@ export function tableCellBoxes(graphicFrame: Element): ResolvedBox[][] {
       const anchor = tcAt(ar, ac)
       const colSpan = clampSpan(anchor?.getAttribute('gridSpan'))
       const rowSpan = clampSpan(anchor?.getAttribute('rowSpan'))
+      const marginsEmu = readCellMarginsEmu(anchor)
+      const rawWEmu = sumRange(colWidthsEmu, ac, colSpan)
+      const rawHEmu = sumRange(rowHeightsEmu, ar, rowSpan)
       boxes[r][c] = {
-        wPt: sumRange(colWidthsEmu, ac, colSpan) / EMU_PER_PT,
-        hPt: sumRange(rowHeightsEmu, ar, rowSpan) / EMU_PER_PT
+        wPt: Math.max(0, rawWEmu - marginsEmu.l - marginsEmu.r) / EMU_PER_PT,
+        hPt: Math.max(0, rawHEmu - marginsEmu.t - marginsEmu.b) / EMU_PER_PT
       }
     }
   }
   return boxes
+}
+
+/** `a:tcPr` margin amounts in EMU (explicit or the OOXML default) for one table cell - mirrors readInsetsEmu's shape for bodyPr insets. `tc` is undefined only for a malformed deck missing the anchor cell entirely, in which case the OOXML defaults apply. */
+function readCellMarginsEmu(tc: Element | undefined): {
+  l: number
+  r: number
+  t: number
+  b: number
+} {
+  const tcPr = tc && childElems(tc, A_NS, 'tcPr')[0]
+  const readOr = (attr: string, fallback: number): number =>
+    tcPr?.hasAttribute(attr) ? Number(tcPr.getAttribute(attr)) : fallback
+
+  return {
+    l: readOr('marL', DEFAULT_LR_INSET_EMU),
+    r: readOr('marR', DEFAULT_LR_INSET_EMU),
+    t: readOr('marT', DEFAULT_TB_INSET_EMU),
+    b: readOr('marB', DEFAULT_TB_INSET_EMU)
+  }
 }
 
 /** { sx, sy } = ext / chExt (the group's own transform, not compounded with any ancestor). */

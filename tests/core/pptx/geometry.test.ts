@@ -532,7 +532,14 @@ describe('resolveShapeGeom', () => {
 })
 
 describe('tableCellBoxes', () => {
-  it('contract 4: cell widths from a:gridCol, heights from a:tr, gridSpan unions widths, rowSpan/vMerge unions heights', async () => {
+  // ECMA-376 CT_TableCellProperties margin defaults, same EMU values as
+  // bodyPr's text insets (DEFAULT_LR_INSET_EMU/DEFAULT_TB_INSET_EMU in
+  // geometry.ts) - marL/marR default 91440 EMU (7.2pt) each side, marT/marB
+  // default 45720 EMU (3.6pt) each side.
+  const DEFAULT_MAR_LR_PT = 91440 / EMU_PER_PT
+  const DEFAULT_MAR_TB_PT = 45720 / EMU_PER_PT
+
+  it("contract 4: cell widths from a:gridCol, heights from a:tr, gridSpan unions widths, rowSpan/vMerge unions heights - each box minus its own cell's default tcPr margins", async () => {
     const colWidthsEmu = [1000 * EMU_PER_PT, 2000 * EMU_PER_PT, 3000 * EMU_PER_PT]
     const rowHeightsEmu = [500 * EMU_PER_PT, 600 * EMU_PER_PT, 700 * EMU_PER_PT]
 
@@ -562,27 +569,62 @@ describe('tableCellBoxes', () => {
 
     const boxes = tableCellBoxes(graphicFrame)
 
-    const pt = (emu: number): number => emu / EMU_PER_PT
+    const w = (emu: number): number => emu / EMU_PER_PT - 2 * DEFAULT_MAR_LR_PT
+    const h = (emu: number): number => emu / EMU_PER_PT - 2 * DEFAULT_MAR_TB_PT
 
     // Row 0: col0 plain; col1+col2 unioned by gridSpan (both report the same union).
-    expect(boxes[0][0]).toEqual({ wPt: pt(colWidthsEmu[0]), hPt: pt(rowHeightsEmu[0]) })
-    const row0UnionW = pt(colWidthsEmu[1] + colWidthsEmu[2])
-    expect(boxes[0][1]).toEqual({ wPt: row0UnionW, hPt: pt(rowHeightsEmu[0]) })
-    expect(boxes[0][2]).toEqual({ wPt: row0UnionW, hPt: pt(rowHeightsEmu[0]) })
+    expect(boxes[0][0]).toEqual({ wPt: w(colWidthsEmu[0]), hPt: h(rowHeightsEmu[0]) })
+    const row0UnionW = w(colWidthsEmu[1] + colWidthsEmu[2])
+    expect(boxes[0][1]).toEqual({ wPt: row0UnionW, hPt: h(rowHeightsEmu[0]) })
+    expect(boxes[0][2]).toEqual({ wPt: row0UnionW, hPt: h(rowHeightsEmu[0]) })
 
     // Column 0, rows 1-2: unioned by rowSpan/vMerge (both report the same union).
-    const col0UnionH = pt(rowHeightsEmu[1] + rowHeightsEmu[2])
-    expect(boxes[1][0]).toEqual({ wPt: pt(colWidthsEmu[0]), hPt: col0UnionH })
-    expect(boxes[2][0]).toEqual({ wPt: pt(colWidthsEmu[0]), hPt: col0UnionH })
+    const col0UnionH = h(rowHeightsEmu[1] + rowHeightsEmu[2])
+    expect(boxes[1][0]).toEqual({ wPt: w(colWidthsEmu[0]), hPt: col0UnionH })
+    expect(boxes[2][0]).toEqual({ wPt: w(colWidthsEmu[0]), hPt: col0UnionH })
 
     // Untouched cells: plain per-cell box from their own column width / row height.
-    expect(boxes[1][1]).toEqual({ wPt: pt(colWidthsEmu[1]), hPt: pt(rowHeightsEmu[1]) })
-    expect(boxes[1][2]).toEqual({ wPt: pt(colWidthsEmu[2]), hPt: pt(rowHeightsEmu[1]) })
-    expect(boxes[2][1]).toEqual({ wPt: pt(colWidthsEmu[1]), hPt: pt(rowHeightsEmu[2]) })
-    expect(boxes[2][2]).toEqual({ wPt: pt(colWidthsEmu[2]), hPt: pt(rowHeightsEmu[2]) })
+    expect(boxes[1][1]).toEqual({ wPt: w(colWidthsEmu[1]), hPt: h(rowHeightsEmu[1]) })
+    expect(boxes[1][2]).toEqual({ wPt: w(colWidthsEmu[2]), hPt: h(rowHeightsEmu[1]) })
+    expect(boxes[2][1]).toEqual({ wPt: w(colWidthsEmu[1]), hPt: h(rowHeightsEmu[2]) })
+    expect(boxes[2][2]).toEqual({ wPt: w(colWidthsEmu[2]), hPt: h(rowHeightsEmu[2]) })
   })
 
-  it('contract 4b: combined horizontal+vertical merge (2x2 anchor) - every covered cell reports the identical union box', async () => {
+  it('contract 4a: explicit tcPr margins override the defaults, subtracted from the cell box', async () => {
+    const colWidthsEmu = [2000 * EMU_PER_PT]
+    const rowHeightsEmu = [1000 * EMU_PER_PT]
+    const marginsEmu = {
+      l: 10 * EMU_PER_PT,
+      r: 20 * EMU_PER_PT,
+      t: 30 * EMU_PER_PT,
+      b: 40 * EMU_PER_PT
+    }
+
+    const buffer = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'table',
+              box: { xEmu: 0, yEmu: 0, wEmu: 2000 * EMU_PER_PT, hEmu: 1000 * EMU_PER_PT },
+              colWidthsEmu,
+              rowHeightsEmu,
+              rows: [[{ text: 'A', marginsEmu }]]
+            }
+          ]
+        }
+      ]
+    })
+    const archive = await openDeck(buffer)
+    const doc = archive.readXml(archive.listSlidePaths()[0])
+    const graphicFrame = elems(doc, P_NS, 'graphicFrame')[0]
+
+    const boxes = tableCellBoxes(graphicFrame)
+
+    expect(boxes[0][0]).toEqual({ wPt: 2000 - 10 - 20, hPt: 1000 - 30 - 40 })
+  })
+
+  it("contract 4b: combined horizontal+vertical merge (2x2 anchor) - every covered cell reports the identical union box, minus the ANCHOR cell's margins subtracted exactly once (a covered cell's own tcPr margins are ignored)", async () => {
     // Per real OOXML markup, only the true top-left anchor carries
     // gridSpan/rowSpan; the other 3 cells in the 2x2 block carry just
     // hMerge and/or vMerge with no repeated span attributes - an anchor
@@ -591,6 +633,22 @@ describe('tableCellBoxes', () => {
     // column 1.
     const colWidthsEmu = [1000 * EMU_PER_PT, 2000 * EMU_PER_PT]
     const rowHeightsEmu = [500 * EMU_PER_PT, 600 * EMU_PER_PT]
+    const anchorMarginsEmu = {
+      l: 5 * EMU_PER_PT,
+      r: 5 * EMU_PER_PT,
+      t: 2 * EMU_PER_PT,
+      b: 2 * EMU_PER_PT
+    }
+    // Deliberately huge/different margins on a covered cell - if the
+    // implementation ever read a covered cell's OWN tcPr instead of always
+    // deferring to the anchor, these would visibly change the union box
+    // (or blow it negative), making the bug obvious rather than silent.
+    const coveredCellDecoyMarginsEmu = {
+      l: 900 * EMU_PER_PT,
+      r: 900 * EMU_PER_PT,
+      t: 900 * EMU_PER_PT,
+      b: 900 * EMU_PER_PT
+    }
 
     const buffer = await buildPptx({
       slides: [
@@ -603,12 +661,17 @@ describe('tableCellBoxes', () => {
               rowHeightsEmu,
               rows: [
                 [
-                  { text: 'anchor', gridSpan: 2, rowSpan: 2 },
-                  { text: '', hMerge: true }
+                  { text: 'anchor', gridSpan: 2, rowSpan: 2, marginsEmu: anchorMarginsEmu },
+                  { text: '', hMerge: true, marginsEmu: coveredCellDecoyMarginsEmu }
                 ],
                 [
-                  { text: '', vMerge: true },
-                  { text: '', hMerge: true, vMerge: true }
+                  { text: '', vMerge: true, marginsEmu: coveredCellDecoyMarginsEmu },
+                  {
+                    text: '',
+                    hMerge: true,
+                    vMerge: true,
+                    marginsEmu: coveredCellDecoyMarginsEmu
+                  }
                 ]
               ]
             }
@@ -623,8 +686,8 @@ describe('tableCellBoxes', () => {
     const boxes = tableCellBoxes(graphicFrame)
 
     const union = {
-      wPt: (colWidthsEmu[0] + colWidthsEmu[1]) / EMU_PER_PT,
-      hPt: (rowHeightsEmu[0] + rowHeightsEmu[1]) / EMU_PER_PT
+      wPt: (colWidthsEmu[0] + colWidthsEmu[1]) / EMU_PER_PT - 5 - 5,
+      hPt: (rowHeightsEmu[0] + rowHeightsEmu[1]) / EMU_PER_PT - 2 - 2
     }
     expect(boxes[0][0]).toEqual(union)
     expect(boxes[0][1]).toEqual(union)

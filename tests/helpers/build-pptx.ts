@@ -15,6 +15,8 @@ const R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationship
 const RELS_NS = 'http://schemas.openxmlformats.org/package/2006/relationships'
 const CT_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
 const DGM_NS = 'http://schemas.openxmlformats.org/drawingml/2006/diagram'
+/** The cached-diagram-drawing namespace (Microsoft extension, not core ECMA-376) - real PowerPoint's `ppt/diagrams/drawingN.xml` cached shape-tree parts use this. */
+const DSP_NS = 'http://schemas.microsoft.com/office/drawing/2008/diagram'
 
 const REL_TYPE = {
   slideLayout: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout',
@@ -32,7 +34,10 @@ const REL_TYPE = {
     'http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramLayout',
   diagramQuickStyle:
     'http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramQuickStyle',
-  diagramColors: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramColors'
+  diagramColors:
+    'http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramColors',
+  /** Microsoft extension relationship type: links a diagram's own data part (dataN.xml) to its cached drawing part (drawingN.xml), via a relationship in the DATA part's own `_rels/dataN.xml.rels` - not the slide's. */
+  diagramDrawing: 'http://schemas.microsoft.com/office/2007/relationships/diagramDrawing'
 }
 
 /** A 1x1 transparent PNG, embedded as the image part for 'picture' shapes. */
@@ -83,6 +88,8 @@ export interface TableCellSpec {
   /** Set only on a merge's continuation (placeholder) cells. */
   hMerge?: boolean
   vMerge?: boolean
+  /** Explicit `a:tcPr` margins (EMU): marL/marR/marT/marB. Any side omitted falls back to the OOXML default. */
+  marginsEmu?: { l?: number; r?: number; t?: number; b?: number }
 }
 
 export interface TableShapeSpec {
@@ -125,6 +132,14 @@ export interface SmartArtShapeSpec {
   box: EmuBox
   name?: string
   points: string[]
+  /**
+   * When true, also emits a cached `ppt/diagrams/drawingN.xml` (dsp
+   * namespace) mirroring each of `points` as its own `dsp:sp/dsp:txBody`
+   * text run, wired via the data part's `dgm:extLst/a:ext/dsp:dataModelExt`
+   * relId - the same mechanism real PowerPoint uses to cache a diagram's
+   * rendered shape tree alongside its data model.
+   */
+  cachedDrawing?: boolean
 }
 
 export type ShapeSpec =
@@ -296,10 +311,21 @@ function buildShapeXml(
                 .filter((a): a is string => a !== null)
                 .join(' ')
               const tcAttrs = attrs ? ` ${attrs}` : ''
+              const marginAttrs = spec.marginsEmu
+                ? [
+                    spec.marginsEmu.l !== undefined ? `marL="${spec.marginsEmu.l}"` : null,
+                    spec.marginsEmu.r !== undefined ? `marR="${spec.marginsEmu.r}"` : null,
+                    spec.marginsEmu.t !== undefined ? `marT="${spec.marginsEmu.t}"` : null,
+                    spec.marginsEmu.b !== undefined ? `marB="${spec.marginsEmu.b}"` : null
+                  ]
+                    .filter((a): a is string => a !== null)
+                    .join(' ')
+                : ''
+              const tcPrXml = marginAttrs ? `<a:tcPr ${marginAttrs}/>` : '<a:tcPr/>'
               return (
                 `<a:tc${tcAttrs}><a:txBody><a:bodyPr/><a:lstStyle/>` +
                 `<a:p><a:r><a:t>${escText(spec.text)}</a:t></a:r></a:p>` +
-                '</a:txBody><a:tcPr/></a:tc>'
+                `</a:txBody>${tcPrXml}</a:tc>`
               )
             })
             .join('')
@@ -390,10 +416,21 @@ function buildShapeXml(
             '</dgm:pt>'
         )
         .join('')
+
+      // A cached drawing part (when requested) needs a relationship FROM the
+      // data part TO the drawing part, referenced by the data part's own
+      // dgm:extLst/a:ext/dsp:dataModelExt/@relId - resolved via the data
+      // part's OWN _rels file, not the slide's (mirroring real PowerPoint).
+      const drawingRelId = 'rIdDrawing'
+      const extLstXml = shape.cachedDrawing
+        ? `<dgm:extLst><a:ext uri="${DSP_NS}">` +
+          `<dsp:dataModelExt xmlns:dsp="${DSP_NS}" relId="${drawingRelId}" ` +
+          `minVer="${DGM_NS}"/></a:ext></dgm:extLst>`
+        : ''
       const dataXml =
         `${xmlDecl()}<dgm:dataModel xmlns:dgm="${DGM_NS}" xmlns:a="${A_NS}" xmlns:r="${R_NS}">` +
         `<dgm:ptLst><dgm:pt modelId="0" type="doc"><dgm:prSet/><dgm:spPr/></dgm:pt>${ptsXml}</dgm:ptLst>` +
-        '<dgm:cxnLst/><dgm:bg/><dgm:whole/></dgm:dataModel>'
+        `<dgm:cxnLst/><dgm:bg/><dgm:whole/>${extLstXml}</dgm:dataModel>`
       const layoutXml = `${xmlDecl()}<dgm:layoutDef xmlns:dgm="${DGM_NS}" xmlns:a="${A_NS}" uniqueId="urn:test:layout"/>`
       const styleXml = `${xmlDecl()}<dgm:styleDef xmlns:dgm="${DGM_NS}" xmlns:a="${A_NS}" uniqueId="urn:test:style"/>`
       const colorsXml = `${xmlDecl()}<dgm:colorsDef xmlns:dgm="${DGM_NS}" xmlns:a="${A_NS}" uniqueId="urn:test:colors"/>`
@@ -420,6 +457,36 @@ function buildShapeXml(
           contentType: 'application/vnd.openxmlformats-officedocument.drawingml.diagramColors+xml'
         }
       )
+
+      if (shape.cachedDrawing) {
+        // Mirrors each data point's text as its own dsp:sp/dsp:txBody run -
+        // the same a: (DrawingML) text-body shape real cached drawing parts
+        // use, just wrapped in dsp:sp instead of p:sp.
+        const shapesXml = shape.points
+          .map(
+            (text, i) =>
+              `<dsp:sp modelId="${i + 1}"><dsp:nvSpPr><dsp:cNvPr id="${i + 2}" name=""/>` +
+              '<dsp:cNvSpPr/></dsp:nvSpPr><dsp:spPr/>' +
+              '<dsp:txBody><a:bodyPr/><a:lstStyle/>' +
+              `<a:p><a:r><a:t>${escText(text)}</a:t></a:r></a:p></dsp:txBody></dsp:sp>`
+          )
+          .join('')
+        const drawingXml =
+          `${xmlDecl()}<dsp:drawing xmlns:dsp="${DSP_NS}" xmlns:a="${A_NS}" xmlns:r="${R_NS}">` +
+          `<dsp:spTree><dsp:nvGrpSpPr><dsp:cNvPr id="0" name=""/><dsp:cNvGrpSpPr/></dsp:nvGrpSpPr>` +
+          `<dsp:grpSpPr/>${shapesXml}</dsp:spTree></dsp:drawing>`
+        ctx.zip.file(`ppt/diagrams/drawing${n}.xml`, drawingXml)
+        ctx.zip.file(
+          `ppt/diagrams/_rels/data${n}.xml.rels`,
+          relationshipsXml([
+            { id: drawingRelId, type: REL_TYPE.diagramDrawing, target: `drawing${n}.xml` }
+          ])
+        )
+        ctx.contentTypeOverrides.push({
+          partName: `/ppt/diagrams/drawing${n}.xml`,
+          contentType: 'application/vnd.ms-office.drawingml.diagramDrawing+xml'
+        })
+      }
 
       const dmRid = addRel(REL_TYPE.diagramData, `../diagrams/data${n}.xml`)
       const loRid = addRel(REL_TYPE.diagramLayout, `../diagrams/layout${n}.xml`)

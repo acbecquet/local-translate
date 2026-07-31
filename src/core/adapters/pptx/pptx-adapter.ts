@@ -41,6 +41,8 @@ import { groupChildScale, resolveShapeGeom, tableCellBoxes } from './geometry'
 
 /** DrawingML diagram (SmartArt) namespace - not part of ooxml.ts's exported constants (only a:/p:/r:/rels are). */
 const DGM_NS = 'http://schemas.openxmlformats.org/drawingml/2006/diagram'
+/** Cached-diagram-drawing namespace (Microsoft extension) - real PowerPoint's `ppt/diagrams/drawingN.xml` cached shape-tree parts use this; see resolveSmartArtDrawingPath. Its relationship (found in the DATA part's own `_rels/dataN.xml.rels`, not the slide's) is resolved by relId alone, via the existing resolveRelById helper - its Type isn't needed for that. */
+const DSP_NS = 'http://schemas.microsoft.com/office/drawing/2008/diagram'
 
 const REL_TYPE_NOTES_SLIDE =
   'http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide'
@@ -96,15 +98,27 @@ interface Site {
   partPath: string
   /** The `a:txBody` (shape/table cell/notes) or `dgm:t` (SmartArt point) element itself - has `a:bodyPr` + `a:p`* children directly, regardless of which wrapper it is. */
   bodyEl: Element
+  /** SmartArt data-point sites only: the resolved cached `dsp:drawing` part path (see resolveSmartArtDrawingPath) mirroring this site's text, when the deck has one wired via the data part's extLst relId - undefined otherwise (no cached drawing, or not a SmartArt site at all). */
+  smartArtDrawingPath?: string
 }
 
 export class PptxAdapter implements FormatAdapter {
   readonly name = 'pptx'
   readonly extensions = ['.pptx']
 
+  /** Skips recorded by the MOST RECENT extract() call; read (and never re-populated) by apply() re-walking the same content, and by collectSkips(). */
+  private lastSkips: { id: string; reason: string }[] = []
+
   async extract(filePath: string): Promise<TextSegment[]> {
     const archive = await openPptx(filePath)
-    return collectSites(archive).map((s) => ({
+    const skips: { id: string; reason: string }[] = []
+    const sites = collectSites(archive, (id, kind, name) => {
+      console.warn(`pptx adapter: skipping unsupported ${kind} "${name}" - left untouched on apply`)
+      skips.push({ id, reason: kind })
+    })
+    this.lastSkips = skips
+
+    return sites.map((s) => ({
       id: s.id,
       text: s.text,
       box: s.box,
@@ -113,6 +127,11 @@ export class PptxAdapter implements FormatAdapter {
       groupKey: s.groupKey,
       kind: s.kind
     }))
+  }
+
+  /** See FormatAdapter.collectSkips's doc comment (adapter.ts). */
+  collectSkips(): { id: string; reason: string }[] {
+    return this.lastSkips
   }
 
   /**
@@ -127,10 +146,21 @@ export class PptxAdapter implements FormatAdapter {
    * apply contract requires. Because markDirty is only ever called for a
    * part that had at least one real mutation, a slide/notes/diagram part
    * with zero net changes is copied out byte-identical by archive.save().
+   *
+   * A SmartArt data-point site whose deck wires a cached `dsp:drawing` part
+   * (site.smartArtDrawingPath - see resolveSmartArtDrawingPath) ALSO
+   * collects its {source text -> translation} into `drawingUpdates`, keyed
+   * by drawing part, so the cache stays in sync with the data model it
+   * mirrors - handled in one batched pass per drawing part AFTER the main
+   * loop (see applySmartArtDrawingText), since a drawing part's "which
+   * runs are unmatched" question can only be answered once every one of
+   * its diagram's data points has been considered, not one segment at a
+   * time.
    */
   async apply(filePath: string, outPath: string, segments: TranslatedSegment[]): Promise<void> {
     const archive = await openPptx(filePath)
     const siteById = new Map(collectSites(archive).map((s) => [s.id, s]))
+    const drawingUpdates = new Map<string, Map<string, string>>()
 
     for (const seg of segments) {
       const site = siteById.get(seg.id)
@@ -146,6 +176,15 @@ export class PptxAdapter implements FormatAdapter {
       writeTranslation(site.bodyEl, seg.translation)
       archive.markDirty(site.partPath)
 
+      if (site.smartArtDrawingPath) {
+        let bySourceText = drawingUpdates.get(site.smartArtDrawingPath)
+        if (!bySourceText) {
+          bySourceText = new Map()
+          drawingUpdates.set(site.smartArtDrawingPath, bySourceText)
+        }
+        bySourceText.set(seg.text, seg.translation)
+      }
+
       // Relies on fit-engine's fit() returning font.sizePt back bit-identically
       // (not merely a numerically-equal-but-recomputed value) whenever the
       // text already fits at the starting size - i.e. that this comparison
@@ -155,11 +194,18 @@ export class PptxAdapter implements FormatAdapter {
       }
     }
 
+    for (const [drawingPath, bySourceText] of drawingUpdates) {
+      applySmartArtDrawingText(archive, drawingPath, bySourceText)
+    }
+
     await archive.save(outPath)
   }
 }
 
 // ---- tree walk (shared by extract and apply) ----
+
+/** Called for every unsupported-but-present thing collectSites' walk skips - `(id, kind, name)`, the same triple logSkip's console.warn is built from. */
+type SkipRecorder = (id: string, kind: string, name: string) => void
 
 interface WalkCtx {
   slideN: number
@@ -170,9 +216,26 @@ interface WalkCtx {
   archive: PptxArchive
   usedIds: Set<string>
   sites: Site[]
+  /**
+   * Undefined when this walk must stay silent - specifically, apply()'s own
+   * re-walk of the same content extract() already walked (and already
+   * recorded/logged skips for). Passing a recorder only from extract() is
+   * what fixes logSkip's double-firing: without this, every skip would be
+   * logged/recorded once per collectSites() call, and runPipeline calls
+   * extract() then apply() against the same file every run.
+   */
+  recordSkip?: SkipRecorder
 }
 
-function collectSites(archive: PptxArchive): Site[] {
+/**
+ * Walks every slide (and its notes) once, collecting every translatable
+ * Site. `onSkip`, when given, is invoked for every unsupported-but-present
+ * thing the walk skips along the way (see SkipRecorder) - extract() passes
+ * a recorder that both logs AND accumulates into `collectSkips()`'s return
+ * value; apply() passes none, since it re-walks the SAME content purely to
+ * relocate nodes to write into, and extract() already reported those skips.
+ */
+function collectSites(archive: PptxArchive, onSkip?: SkipRecorder): Site[] {
   const sites: Site[] = []
   const usedIds = new Set<string>()
 
@@ -192,7 +255,8 @@ function collectSites(archive: PptxArchive): Site[] {
       masterDoc,
       archive,
       usedIds,
-      sites
+      sites,
+      recordSkip: onSkip
     }
 
     const spTree = elems(slideDoc, P_NS, 'spTree')[0]
@@ -221,7 +285,7 @@ function walkContainer(
         handleSp(child, groupScale, pathPrefix, ctx)
         break
       case 'pic':
-        handlePic(child)
+        handlePic(child, pathPrefix, ctx)
         break
       case 'graphicFrame':
         handleGraphicFrame(child, groupScale, pathPrefix, ctx)
@@ -248,7 +312,8 @@ function handleSp(
   if (!txBody) return
 
   if (isWordArt(txBody)) {
-    logSkip('WordArt', shapeName(shape))
+    const name = shapeName(shape)
+    logSkip(ctx, `slide${ctx.slideN}/${pathPrefix}shape[name=${escId(name)}]`, 'WordArt', name)
     return
   }
 
@@ -284,13 +349,16 @@ function handleSp(
   })
 }
 
-function handlePic(pic: Element): void {
+function handlePic(pic: Element, pathPrefix: string, ctx: WalkCtx): void {
   const nvPicPr = childElems(pic, P_NS, 'nvPicPr')[0]
   const nvPr = nvPicPr && childElems(nvPicPr, P_NS, 'nvPr')[0]
   if (!nvPr) return
   const isVideo =
     elems(nvPr, A_NS, 'videoFile').length > 0 || elems(nvPr, P_NS, 'videoFile').length > 0
-  if (isVideo) logSkip('video', shapeName(pic))
+  if (isVideo) {
+    const name = shapeName(pic)
+    logSkip(ctx, `slide${ctx.slideN}/${pathPrefix}pic[name=${escId(name)}]`, 'video', name)
+  }
   // Pictures never carry a txBody - nothing else to do either way.
 }
 
@@ -309,20 +377,21 @@ function handleGraphicFrame(
   const graphicData = graphic && childElems(graphic, A_NS, 'graphicData')[0]
   const uri = graphicData?.getAttribute('uri') ?? ''
   const name = shapeName(gf)
+  const id = `slide${ctx.slideN}/${pathPrefix}graphicFrame[name=${escId(name)}]`
 
   if (uri === GRAPHIC_URI.chart) {
-    logSkip('chart', name)
+    logSkip(ctx, id, 'chart', name)
     return
   }
   if (uri === GRAPHIC_URI.ole) {
-    logSkip('OLE object', name)
+    logSkip(ctx, id, 'OLE object', name)
     return
   }
   if (uri === GRAPHIC_URI.diagram && graphicData) {
     handleSmartArt(gf, graphicData, groupScale, pathPrefix, ctx)
     return
   }
-  if (uri) logSkip(`graphic frame (${uri})`, name)
+  if (uri) logSkip(ctx, id, `graphic frame (${uri})`, name)
 }
 
 function handleTable(
@@ -357,6 +426,8 @@ function handleTable(
         const strayText = strayTxBody && paragraphsText(strayTxBody).trim()
         if (strayText) {
           logSkip(
+            ctx,
+            `slide${ctx.slideN}/${pathPrefix}table[gf-name=${escId(name)}]/r${r + 1}c${c + 1}`,
             'merge-continuation cell with unexpected text (anchor-only extraction is intentional)',
             `${name} r${r + 1}c${c + 1}`
           )
@@ -370,11 +441,19 @@ function handleTable(
       if (!text.trim()) continue
 
       const font = resolveBodyFont(txBody)
-      const cellBox = boxes[r]?.[c] ?? { wPt: 0, hPt: 0 }
-      const id = uniqueId(
-        `slide${ctx.slideN}/${pathPrefix}table[gf-name=${escId(name)}]/r${r + 1}c${c + 1}`,
-        ctx.usedIds
-      )
+      const resolvedCellBox = boxes[r]?.[c]
+      const cellLabel = `${name} r${r + 1}c${c + 1}`
+      const rawId = `slide${ctx.slideN}/${pathPrefix}table[gf-name=${escId(name)}]/r${r + 1}c${c + 1}`
+      if (!resolvedCellBox) {
+        // A row carrying more a:tc than the table's own tblGrid defines
+        // columns for (malformed/hand-edited deck) - tableCellBoxes has no
+        // real box to report. Falling back to a fabricated { wPt: 0, hPt: 0 }
+        // would shrink this cell's text to the fit floor for no real
+        // reason; the SENTINEL_BOX convention (fit skipped, size preserved)
+        // is the same fallback every other unresolvable-geometry case uses.
+        logSkip(ctx, rawId, 'table cell (no matching grid column - size preserved)', cellLabel)
+      }
+      const id = uniqueId(rawId, ctx.usedIds)
 
       ctx.sites.push({
         id,
@@ -388,10 +467,12 @@ function handleTable(
           bold: font?.bold ?? false,
           italic: font?.italic ?? false
         },
-        box: {
-          wPt: cellBox.wPt * groupScale.sx * WRAP_SAFETY,
-          hPt: cellBox.hPt * groupScale.sy
-        },
+        box: resolvedCellBox
+          ? {
+              wPt: resolvedCellBox.wPt * groupScale.sx * WRAP_SAFETY,
+              hPt: resolvedCellBox.hPt * groupScale.sy
+            }
+          : SENTINEL_BOX,
         partPath: ctx.slidePath,
         bodyEl: txBody
       })
@@ -407,16 +488,17 @@ function handleSmartArt(
   ctx: WalkCtx
 ): void {
   const name = shapeName(gf)
+  const id = `slide${ctx.slideN}/${pathPrefix}smartart[gf-name=${escId(name)}]`
   const relIds = elems(graphicData, DGM_NS, 'relIds')[0]
   const dmRid = relIds?.getAttributeNS(R_NS, 'dm')
   if (!dmRid) {
-    logSkip('SmartArt (no data relationship)', name)
+    logSkip(ctx, id, 'SmartArt (no data relationship)', name)
     return
   }
 
   const dataPath = resolveRelById(ctx.archive, ctx.slidePath, dmRid)
   if (!dataPath) {
-    logSkip('SmartArt (data part unresolved)', name)
+    logSkip(ctx, id, 'SmartArt (data part unresolved)', name)
     return
   }
 
@@ -424,7 +506,7 @@ function handleSmartArt(
   try {
     dataDoc = ctx.archive.readXml(dataPath)
   } catch {
-    logSkip('SmartArt (data part unreadable)', name)
+    logSkip(ctx, id, 'SmartArt (data part unreadable)', name)
     return
   }
 
@@ -436,6 +518,7 @@ function handleSmartArt(
     groupScale
   })
   const box = geom.box ? { wPt: geom.box.wPt * WRAP_SAFETY, hPt: geom.box.hPt } : SENTINEL_BOX
+  const drawingPath = resolveSmartArtDrawingPath(ctx.archive, dataDoc, dataPath)
 
   for (const pt of elems(dataDoc, DGM_NS, 'pt')) {
     const t = childElems(pt, DGM_NS, 't')[0]
@@ -464,9 +547,33 @@ function handleSmartArt(
       },
       box,
       partPath: dataPath,
-      bodyEl: t
+      bodyEl: t,
+      smartArtDrawingPath: drawingPath ?? undefined
     })
   }
+}
+
+/**
+ * Resolves a diagram's cached drawing part, mirroring how real PowerPoint
+ * wires one: the data part's own `dgm:extLst/a:ext/dsp:dataModelExt/@relId`
+ * names a relationship in the DATA part's OWN `_rels` file (not the
+ * slide's) of type diagramDrawing, pointing at `ppt/diagrams/drawingN.xml`.
+ * Returns null when the deck has no cached drawing wired up at all (a
+ * perfectly normal, common case - PowerPoint doesn't always cache one).
+ */
+function resolveSmartArtDrawingPath(
+  archive: PptxArchive,
+  dataDoc: Document,
+  dataPath: string
+): string | null {
+  const extLst = elems(dataDoc, DGM_NS, 'extLst')[0]
+  if (!extLst) return null
+  for (const ext of childElems(extLst, A_NS, 'ext')) {
+    const dataModelExt = childElems(ext, DSP_NS, 'dataModelExt')[0]
+    const relId = dataModelExt?.getAttribute('relId')
+    if (relId) return resolveRelById(archive, dataPath, relId)
+  }
+  return null
 }
 
 function handleNotes(ctx: WalkCtx): void {
@@ -522,30 +629,72 @@ function handleNotes(ctx: WalkCtx): void {
 // ---- apply-side writers ----
 
 /**
- * Writes `translation` into `bodyEl`'s existing `a:p` paragraphs.
+ * One "line slot" within a paragraph: the run(s) between two successive
+ * `a:br` siblings (or the paragraph's start/end when there's no `a:br` on
+ * that side). `precedingBr` is the `a:br` that opens this group (null for
+ * the paragraph's first group, which has nothing before it). A paragraph's
+ * line CAPACITY - how many translation lines it can hold without inventing
+ * or losing an `a:br` - is exactly `paragraphGroups(p).length`, which is
+ * always `(direct-child a:br count) + 1`, matching how paragraphText()
+ * (the extraction side) turns each `a:br` into its own `\n`.
+ */
+interface RunGroup {
+  runs: Element[]
+  precedingBr: Element | null
+}
+
+/**
+ * Splits `p`'s direct children into its `a:br`-delimited line groups, in
+ * document order. Every paragraph has at least one group (possibly empty),
+ * even a bare `<a:p/>` with no children at all - so `groups.length` is a
+ * safe, always-positive line-capacity count for writeTranslation.
+ */
+function paragraphGroups(p: Element): RunGroup[] {
+  const groups: RunGroup[] = []
+  let current: RunGroup = { runs: [], precedingBr: null }
+  const children = p.childNodes
+  for (let i = 0; i < children.length; i++) {
+    const child = children.item(i)
+    if (!child || child.nodeType !== ELEMENT_NODE) continue
+    const el = child as Element
+    if (el.namespaceURI !== A_NS) continue
+    if (el.localName === 'br') {
+      groups.push(current)
+      current = { runs: [], precedingBr: el }
+    } else if (el.localName === 'r') {
+      current.runs.push(el)
+    }
+  }
+  groups.push(current)
+  return groups
+}
+
+/**
+ * Writes `translation` into `bodyEl`'s existing `a:p` paragraphs, honoring
+ * each paragraph's real line capacity - `(direct-child a:br count) + 1`,
+ * see `paragraphGroups` - rather than treating every paragraph as exactly
+ * one line slot (that mismatch is what let extraction and apply disagree
+ * on what a "line" is whenever a paragraph already contained a manual
+ * `a:br`).
  *
- * Let k = min(translation's line count, `bodyEl`'s paragraph count). Lines
- * 1..k map 1:1 onto the first k paragraphs (see writeLineIntoParagraph).
- * Beyond that:
+ * Lines are consumed in document order, each paragraph taking up to its own
+ * capacity (see writeLineIntoGroup for how one line lands in one group).
+ * Let totalCapacity = sum of every paragraph's capacity. Beyond that:
  *
- *  - MORE lines than paragraphs: every remaining line is appended to the
- *    k-th (last written) paragraph as its own `a:br`-preceded run - a real
- *    visual line break, but never a new `a:p` (a translation gaining an
- *    extra line is not license to invent a whole new paragraph's worth of
- *    formatting/list-level that the source never had).
- *  - FEWER lines than paragraphs: every paragraph beyond the k-th is
- *    DELETED outright.
- *
- * This is a deliberate redesign, not the obvious "keep every a:p, just
- * empty the surplus ones" approach: emptied-but-retained surplus paragraphs
- * are phantom blank lines - PowerPoint still renders each one as real
- * vertical space the fit engine never measured against, AND (since
- * paragraphText treats each a:p as its own `\n`-separated unit) a
- * subsequent extract() would see extra blank lines that were never in the
- * translation, breaking the round trip. Deleting the surplus paragraph does
- * lose that paragraph's own per-paragraph formatting (bullet level,
- * alignment, spacing) - accepted as the lesser cost versus a document that
- * silently renders content the translation never asked for.
+ *  - MORE lines than totalCapacity: once every paragraph/group is full,
+ *    every remaining line is appended to the LAST paragraph as its own new
+ *    `a:br`-preceded run - a real visual line break, but never a new `a:p`
+ *    (a translation gaining an extra line is not license to invent a whole
+ *    new paragraph's worth of formatting/list-level the source never had).
+ *  - FEWER lines than totalCapacity: a paragraph that receives zero lines
+ *    (because every earlier paragraph together already exhausted the
+ *    translation) is DELETED outright, exactly as before this line-capacity
+ *    redesign. A paragraph that receives SOME but not all of its groups'
+ *    worth of lines keeps only the groups it actually got text for; its
+ *    surplus trailing `a:br` + run(s) are removed - symmetric with whole
+ *    surplus-paragraph deletion, for exactly the same reason: an emptied
+ *    but retained `a:br` is a phantom blank line PowerPoint still renders
+ *    and a subsequent extract() would still see as an extra `\n`.
  */
 function writeTranslation(bodyEl: Element, translation: string): void {
   const lines = translation.split('\n')
@@ -553,34 +702,102 @@ function writeTranslation(bodyEl: Element, translation: string): void {
   // Unreachable in practice: a segment only ever reaches apply() if extract()
   // found non-empty text in this same bodyEl, which requires at least one
   // a:p to have existed. Guarded anyway so a malformed/hand-edited deck
-  // degrades to a no-op here instead of indexing paragraphs[-1] below.
+  // degrades to a no-op here instead of indexing paragraphs[0] below.
   if (paragraphs.length === 0) return
 
-  const k = Math.min(lines.length, paragraphs.length)
-  for (let i = 0; i < k; i++) writeLineIntoParagraph(paragraphs[i], lines[i])
+  let lineIdx = 0
+  let lastWrittenParagraph = paragraphs[0]
 
-  if (lines.length > k) {
-    const lastParagraph = paragraphs[k - 1]
-    for (let i = k; i < lines.length; i++) appendBreakLine(lastParagraph, lines[i])
+  for (const paragraph of paragraphs) {
+    if (lineIdx >= lines.length) {
+      bodyEl.removeChild(paragraph)
+      continue
+    }
+
+    lastWrittenParagraph = paragraph
+    const groups = paragraphGroups(paragraph)
+    const fillCount = Math.min(groups.length, lines.length - lineIdx)
+    for (let gi = 0; gi < fillCount; gi++) {
+      writeLineIntoGroup(paragraph, groups[gi], lines[lineIdx])
+      lineIdx++
+    }
+    for (let gi = groups.length - 1; gi >= fillCount; gi--) removeGroup(paragraph, groups[gi])
   }
 
-  for (let i = paragraphs.length - 1; i >= k; i--) bodyEl.removeChild(paragraphs[i])
+  for (; lineIdx < lines.length; lineIdx++) appendBreakLine(lastWrittenParagraph, lines[lineIdx])
 }
 
 /**
- * Writes `text` into one paragraph: the paragraph's first run gets all of
- * it (keeping its a:rPr - the run is rewritten in place, never recreated);
- * every sibling run in that same paragraph is emptied, not deleted, so its
- * formatting markers survive even though it no longer carries text. A
- * paragraph with zero runs at all (a bare `<a:p/>` spacer line) has nowhere
- * to put non-empty text - a deliberate, documented limitation rather than
- * fabricating a brand-new `a:r` (which would need its own schema-correct
- * placement and namespace-prefix handling for a vanishingly rare case: a
- * translation inventing content for a paragraph that had none).
+ * Writes `text` into one br-delimited line group: the group's first run
+ * gets all of it (keeping its a:rPr - the run is rewritten in place, never
+ * recreated); every sibling run in that SAME group is emptied, not
+ * deleted, so its formatting markers survive even though it no longer
+ * carries text. A group with zero runs at all (a bare `<a:p/>` spacer line,
+ * or an empty slot between two `a:br`s) has no run to reuse - a new `a:r`
+ * is created at the group's position (see createGroupRun) rather than
+ * silently dropping non-empty text, mirroring appendBreakLine's own
+ * prefix-resolved run creation.
  */
-function writeLineIntoParagraph(p: Element, text: string): void {
-  const runs = childElems(p, A_NS, 'r')
-  runs.forEach((run, i) => setRunText(run, i === 0 ? text : ''))
+function writeLineIntoGroup(paragraph: Element, group: RunGroup, text: string): void {
+  if (group.runs.length > 0) {
+    group.runs.forEach((run, i) => setRunText(run, i === 0 ? text : ''))
+    return
+  }
+  if (text === '') return // nothing to show, nothing worth fabricating a run for
+  createGroupRun(paragraph, group, text)
+}
+
+/**
+ * Creates a new `a:r` holding `text` at the exact position group's (empty)
+ * content belongs: right after `group.precedingBr` (or as the paragraph's
+ * very first child when this is the paragraph's opening group, before
+ * anything else - including a trailing `a:endParaRPr`, which CT_TextParagraph
+ * requires to stay the paragraph's LAST child). The run's namespace prefix
+ * matches whatever's already bound in scope (same resolution approach as
+ * setRunText/ensureRPr/appendBreakLine). If the paragraph carries an
+ * `a:endParaRPr` - the run PowerPoint would otherwise have used as this
+ * paragraph's "would-be formatting" - its attributes/children are cloned
+ * onto the new run's `a:rPr` so the fabricated line doesn't silently fall
+ * back to bare defaults; no `a:endParaRPr` present is fine too (bare rPr-less run).
+ */
+function createGroupRun(paragraph: Element, group: RunGroup, text: string): Element {
+  const doc = paragraph.ownerDocument
+  if (!doc) throw new Error('Cannot create run: <a:p> element has no owner document')
+  const prefix = paragraph.lookupPrefix(A_NS)
+  const qualified = (local: string): string =>
+    prefix === null ? `a:${local}` : prefix === '' ? local : `${prefix}:${local}`
+
+  const run = doc.createElementNS(A_NS, qualified('r'))
+
+  const endParaRPr = childElems(paragraph, A_NS, 'endParaRPr')[0]
+  if (endParaRPr) {
+    const rPr = doc.createElementNS(A_NS, qualified('rPr'))
+    for (let i = 0; i < endParaRPr.attributes.length; i++) {
+      const attr = endParaRPr.attributes.item(i)
+      if (attr) rPr.setAttribute(attr.name, attr.value)
+    }
+    for (let i = 0; i < endParaRPr.childNodes.length; i++) {
+      const child = endParaRPr.childNodes.item(i)
+      if (child) rPr.appendChild(child.cloneNode(true))
+    }
+    run.appendChild(rPr)
+  }
+
+  if (group.precedingBr) {
+    paragraph.insertBefore(run, group.precedingBr.nextSibling)
+  } else {
+    paragraph.insertBefore(run, paragraph.firstChild)
+  }
+
+  setRunText(run, text)
+  group.runs.push(run)
+  return run
+}
+
+/** Removes a surplus line group entirely: its opening `a:br` (if any - the paragraph's first group has none) and every run it held. Symmetric with whole surplus-paragraph deletion in writeTranslation. */
+function removeGroup(paragraph: Element, group: RunGroup): void {
+  if (group.precedingBr) paragraph.removeChild(group.precedingBr)
+  for (const run of group.runs) paragraph.removeChild(run)
 }
 
 /**
@@ -610,17 +827,24 @@ function appendBreakLine(paragraph: Element, text: string): void {
 }
 
 /**
- * Sets `sz` (hundredths of a point, rounded to the nearest quarter point)
- * on every run in `bodyEl` whose current text is non-empty, and marks
- * `bodyEl`'s `a:bodyPr` with a bare `<a:normAutofit/>` (see
- * ensureNormAutofit's own doc comment for why) as a belt-and-suspenders
- * safety net on top of our explicit size. Must run AFTER writeTranslation
- * so "non-empty run" reflects the post-translation state (runs
- * writeTranslation just emptied are correctly left untouched here).
+ * Sets `sz` (hundredths of a point, FLOORED to the quarter point) on every
+ * run in `bodyEl` whose current text is non-empty, and marks `bodyEl`'s
+ * `a:bodyPr` with a bare `<a:normAutofit/>` (see ensureNormAutofit's own
+ * doc comment for why) as a belt-and-suspenders safety net on top of our
+ * explicit size. Must run AFTER writeTranslation so "non-empty run"
+ * reflects the post-translation state (runs writeTranslation just emptied
+ * are correctly left untouched here).
+ *
+ * Floored, not rounded: `sizePt` is the fit engine's own measured "this
+ * size fits" answer. Rounding to the NEAREST quarter point can round UP -
+ * writing a size larger than what was actually measured to fit, silently
+ * reintroducing the very overflow fit() was asked to prevent. Flooring
+ * only ever writes a size at or below what was measured, which can only
+ * ever make the fit margin more conservative, never less.
  */
 function writeSize(bodyEl: Element, sizePt: number): void {
   const QUARTER_POINT = 25
-  const hundredths = Math.round((sizePt * 100) / QUARTER_POINT) * QUARTER_POINT
+  const hundredths = Math.floor((sizePt * 100) / QUARTER_POINT) * QUARTER_POINT
 
   for (const run of elems(bodyEl, A_NS, 'r')) {
     if (textOfRun(run).trim() === '') continue
@@ -722,6 +946,61 @@ function ensureRPr(run: Element): Element {
   if (run.firstChild) run.insertBefore(rPr, run.firstChild)
   else run.appendChild(rPr)
   return rPr
+}
+
+/**
+ * Keeps a SmartArt's cached `dsp:drawing` part in sync with its data model:
+ * every `a:r` anywhere in the drawing doc (regardless of nesting - `elems`
+ * is a descendant search, and `dsp:txBody` reuses plain `a:r`/`a:t` runs
+ * exactly like every other DrawingML text body) whose text EXACTLY matches
+ * a key in `bySourceText` is rewritten to that key's translation - ALL
+ * occurrences, not just the first, since the cache can repeat the same
+ * label in more than one cached shape. A run whose non-empty text matches
+ * no key is left untouched and logged once per distinct unmatched text
+ * (not once per occurrence, to avoid warning spam from a decorative label
+ * - e.g. a placeholder shape - repeated many times in the cache): the
+ * drawing simply has no corresponding translated data point for it, which
+ * can legitimately happen (the cache and the data model are allowed to
+ * drift in a hand-edited or unusual deck). The drawing part is marked
+ * dirty only when at least one run actually changed - an all-unmatched
+ * drawing (e.g. a stale/foreign cache) is left byte-identical.
+ */
+function applySmartArtDrawingText(
+  archive: PptxArchive,
+  drawingPath: string,
+  bySourceText: Map<string, string>
+): void {
+  let drawingDoc: Document
+  try {
+    drawingDoc = archive.readXml(drawingPath)
+  } catch {
+    console.warn(
+      `pptx adapter: SmartArt cached drawing part "${drawingPath}" could not be read - left untouched`
+    )
+    return
+  }
+
+  let changed = false
+  const unmatched = new Set<string>()
+  for (const run of elems(drawingDoc, A_NS, 'r')) {
+    const text = textOfRun(run)
+    if (text.trim() === '') continue
+    const translation = bySourceText.get(text)
+    if (translation === undefined) {
+      unmatched.add(text)
+      continue
+    }
+    setRunText(run, translation)
+    changed = true
+  }
+
+  for (const text of unmatched) {
+    console.warn(
+      `pptx adapter: SmartArt cached drawing text "${text}" has no matching translated data point - left untouched`
+    )
+  }
+
+  if (changed) archive.markDirty(drawingPath)
 }
 
 // ---- shape/text helpers ----
@@ -853,8 +1132,9 @@ function shapeName(shape: Element): string {
   return id ? `Shape ${id}` : 'Shape'
 }
 
-function logSkip(kind: string, name: string): void {
-  console.warn(`pptx adapter: skipping unsupported ${kind} "${name}" - left untouched on apply`)
+/** Routes one skip through `ctx.recordSkip` (a no-op when undefined - apply()'s silent re-walk, see WalkCtx's doc comment) rather than logging directly; extract()'s recorder is what actually does the console.warn AND the collectSkips() accounting, in one place, exactly once per real skip. */
+function logSkip(ctx: WalkCtx, id: string, kind: string, name: string): void {
+  ctx.recordSkip?.(id, kind, name)
 }
 
 // ---- small generic/id/relationship utilities ----

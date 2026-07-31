@@ -236,9 +236,12 @@ describe('PptxAdapter.extract', () => {
     expect(anchor.text).toBe('Anchor')
     expect(anchor.context).toBe('table cell')
     expect(anchor.kind).toBe('table-cell')
-    // Union box: 2 cols x 2 rows = 2000pt x 1200pt (before WRAP_SAFETY on width).
-    expect(anchor.box.wPt).toBeCloseTo(2000 * 0.96, 6)
-    expect(anchor.box.hPt).toBeCloseTo(1200, 6)
+    // Union box: 2 cols x 2 rows = 2000pt x 1200pt, minus the anchor cell's
+    // default tcPr margins (91440/45720 EMU = 7.2pt/3.6pt per side, applied
+    // ONCE for the whole union, not once per covered cell), before
+    // WRAP_SAFETY on width.
+    expect(anchor.box.wPt).toBeCloseTo((2000 - 7.2 - 7.2) * 0.96, 6)
+    expect(anchor.box.hPt).toBeCloseTo(1200 - 3.6 - 3.6, 6)
   })
 
   it('a merge-continuation cell that unexpectedly carries text is still dropped (anchor-only is intentional), but logs a warning instead of failing silently', async () => {
@@ -268,6 +271,42 @@ describe('PptxAdapter.extract', () => {
     expect(segments).toHaveLength(1) // the continuation cell's stray text is still never extracted
     expect(segments[0].text).toBe('Anchor')
     expect(warnMessages.some((m) => /merge-continuation cell/.test(m) && /r1c2/.test(m))).toBe(true)
+  })
+
+  it('a row with more a:tc than gridCol entries keeps the out-of-grid cell at its original size (sentinel box, never a fabricated zero box) and logs a warning', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'table',
+              name: 'Ragged Table',
+              box: { xEmu: 0, yEmu: 0, wEmu: 2000 * EMU_PER_PT, hEmu: 600 * EMU_PER_PT },
+              // Only 1 gridCol, but the row carries 2 a:tc - a malformed/
+              // hand-edited deck where the grid and the row disagree.
+              colWidthsEmu: [2000 * EMU_PER_PT],
+              rowHeightsEmu: [600 * EMU_PER_PT],
+              rows: [['Cell1', 'Extra']]
+            }
+          ]
+        }
+      ]
+    })
+
+    const segments = await new PptxAdapter().extract(srcPath)
+    expect(segments).toHaveLength(2)
+    const inGrid = segments.find((s) => s.text === 'Cell1')!
+    const outOfGrid = segments.find((s) => s.text === 'Extra')!
+
+    // The in-grid cell resolves a real, small box as usual.
+    expect(inGrid.box.wPt).toBeLessThan(100_000)
+    // The out-of-grid cell falls back to the sentinel (never-shrink) box,
+    // never a fabricated { wPt: 0, hPt: 0 } that would shrink its text to
+    // the fit floor for no real reason.
+    expect(outOfGrid.box.wPt).toBeGreaterThan(100_000)
+    expect(outOfGrid.box.hPt).toBeGreaterThan(100_000)
+
+    expect(warnMessages.some((m) => /r1c2/.test(m))).toBe(true)
   })
 
   it('a two-level nested group compounds the id path and the box/font scale', async () => {
@@ -352,11 +391,15 @@ describe('PptxAdapter.extract', () => {
     expect(segments).toHaveLength(1)
     const s = segments[0]
     expect(s.id).toBe('slide1/group[name=Scaler]/table[gf-name=Inner Table]/r1c1')
-    // Raw cell box from tableCellBoxes (scale-naive, pure gridCol/tr EMU math): 20pt x 10pt.
+    // Raw cell box from tableCellBoxes (scale-naive, pure gridCol/tr EMU
+    // math): 20pt x 10pt, minus the cell's default tcPr margins (7.2pt each
+    // side horizontally, 3.6pt each side vertically) -> 5.6pt x 2.8pt.
     // handleTable applies sx to width and sy to height EXTERNALLY, exactly
     // once, then WRAP_SAFETY on width only.
-    expect(s.box.wPt).toBeCloseTo(20 * 4 * 0.96, 6)
-    expect(s.box.hPt).toBeCloseTo(10 * 2, 6)
+    const marginW = 20 - 7.2 - 7.2
+    const marginH = 10 - 3.6 - 3.6
+    expect(s.box.wPt).toBeCloseTo(marginW * 4 * 0.96, 6)
+    expect(s.box.hPt).toBeCloseTo(marginH * 2, 6)
   })
 
   it('a SmartArt graphicFrame nested one level inside an asymmetrically-scaled group has its box scaled exactly once via geometry.ts', async () => {
@@ -720,6 +763,85 @@ describe('PptxAdapter.extract', () => {
   })
 })
 
+describe('PptxAdapter.collectSkips', () => {
+  it('returns the unsupported-content skips recorded during the most recent extract() call, as {id, reason}', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Real text'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 1000, hEmu: 500 }
+            },
+            { kind: 'chart', box: { xEmu: 0, yEmu: 900, wEmu: 400, hEmu: 400 } }
+          ]
+        }
+      ]
+    })
+
+    const adapter = new PptxAdapter()
+    await adapter.extract(srcPath)
+
+    const skips = adapter.collectSkips!()
+    expect(skips).toHaveLength(1)
+    expect(skips[0].id).toContain('slide1')
+    expect(skips[0].reason).toMatch(/chart/)
+  })
+
+  it('an adapter that has extracted nothing skippable reports an empty list', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Nothing unsupported here'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 1000, hEmu: 500 }
+            }
+          ]
+        }
+      ]
+    })
+
+    const adapter = new PptxAdapter()
+    await adapter.extract(srcPath)
+    expect(adapter.collectSkips!()).toEqual([])
+  })
+
+  it('apply() re-walking the same skip-bearing content does not re-log or re-count it (fix for logSkip double-firing across extract + apply)', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Real text'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 1000, hEmu: 500 }
+            },
+            { kind: 'chart', box: { xEmu: 0, yEmu: 900, wEmu: 400, hEmu: 400 } }
+          ]
+        }
+      ]
+    })
+
+    const adapter = new PptxAdapter()
+    const segments = await adapter.extract(srcPath)
+    expect(warnMessages).toHaveLength(1) // extract() logs the chart skip once
+    expect(adapter.collectSkips!()).toHaveLength(1)
+
+    const translated = segments.map((s) => makeTranslated(s, { translation: 'Translated' }))
+    const outPath = path.join(path.dirname(srcPath), 'out.pptx')
+    await adapter.apply(srcPath, outPath, translated)
+
+    // apply() re-walks the same deck internally (to relocate nodes to write
+    // into) - the chart is "seen" again by that walk, but must not log or
+    // record a second time: extract() already reported it once.
+    expect(warnMessages).toHaveLength(1)
+    expect(adapter.collectSkips!()).toHaveLength(1)
+  })
+})
+
 /** Builds a TranslatedSegment from a TextSegment, defaulting to "nothing changed" (translation === text, fittedSizePt === font.sizePt) unless overridden - the zero-diff baseline every apply() test starts from. */
 function makeTranslated(
   seg: TextSegment,
@@ -936,7 +1058,7 @@ describe('PptxAdapter.apply', () => {
     expect(elems(runs[1], A_NS, 'rPr')[0].getAttribute('b')).toBe('1') // sibling's rPr retained, not deleted
   })
 
-  it('writes sz (hundredths, rounded to the nearest quarter point) on every non-empty run only when the fitted size differs, and resets a stale a:normAutofit to a bare one', async () => {
+  it('writes sz (hundredths, floored to the quarter point - never rounded up past the fitted size) on every non-empty run only when the fitted size differs, and resets a stale a:normAutofit to a bare one', async () => {
     const buffer = await buildPptx({
       slides: [
         {
@@ -981,7 +1103,10 @@ describe('PptxAdapter.apply', () => {
     const archive = await openPptx(outPath)
     const doc = archive.readXml(slidePath)
     const rPr = elems(doc, A_NS, 'rPr')[0]
-    expect(rPr.getAttribute('sz')).toBe('1350') // 13.4pt -> 1340 hundredths -> nearest 25 -> 1350
+    // 13.4pt -> 1340 hundredths -> floored to the nearest 25 below -> 1325
+    // (never 1350: rounding UP would write a size larger than what fit()
+    // actually measured as fitting).
+    expect(rPr.getAttribute('sz')).toBe('1325')
     const bodyPr = elems(doc, A_NS, 'bodyPr')[0]
     const normAutofit = elems(bodyPr, A_NS, 'normAutofit')
     expect(normAutofit).toHaveLength(1) // belt-and-suspenders: PowerPoint may still autofit further
@@ -1188,6 +1313,68 @@ describe('PptxAdapter.apply', () => {
     await expect(adapter.apply(srcPath, outPath, [bogus])).rejects.toThrow(/slide99/)
   })
 
+  it('SmartArt cached drawing: a run whose text matches no translated data point is left untouched and logs a warning, while matching runs still get translated', async () => {
+    const buffer = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'smartart',
+              name: 'Cycle',
+              box: { xEmu: 0, yEmu: 0, wEmu: 4000 * EMU_PER_PT, hEmu: 2000 * EMU_PER_PT },
+              points: ['Only'],
+              cachedDrawing: true
+            }
+          ]
+        }
+      ]
+    })
+    const zip = await JSZip.loadAsync(buffer)
+    const drawingPath = 'ppt/diagrams/drawing1.xml'
+    let drawingXml = await zip.file(drawingPath)!.async('string')
+    // Inject a decorative shape the data model has no corresponding
+    // translated point for (a legitimate drift between cache and data
+    // model - e.g. a title/legend shape the cache renders but the data
+    // model doesn't track as a dgm:pt).
+    drawingXml = drawingXml.replace(
+      '</dsp:spTree>',
+      '<dsp:sp modelId="99"><dsp:nvSpPr><dsp:cNvPr id="99" name=""/><dsp:cNvSpPr/></dsp:nvSpPr>' +
+        '<dsp:spPr/><dsp:txBody><a:bodyPr/><a:lstStyle/>' +
+        '<a:p><a:r><a:t>Decorative Label</a:t></a:r></a:p></dsp:txBody></dsp:sp></dsp:spTree>'
+    )
+    zip.file(drawingPath, drawingXml)
+    const patchedBuffer = await zip.generateAsync({ type: 'nodebuffer' })
+
+    const dir = await tmpDir('lt-pptx-adapter-')
+    const srcPath = path.join(dir, 'src.pptx')
+    await writeFile(srcPath, patchedBuffer)
+
+    const adapter = new PptxAdapter()
+    const [seg] = await adapter.extract(srcPath)
+    expect(seg.text).toBe('Only')
+
+    const translated = makeTranslated(seg, { translation: 'Seulement' })
+    const outPath = path.join(dir, 'out.pptx')
+    await adapter.apply(srcPath, outPath, [translated])
+
+    expect(
+      warnMessages.some(
+        (m) => /has no matching translated data point/.test(m) && /Decorative Label/.test(m)
+      )
+    ).toBe(true)
+
+    const outDrawingXml = await (
+      await JSZip.loadAsync(await readFile(outPath))
+    )
+      .file(drawingPath)!
+      .async('string')
+    expect(outDrawingXml).toContain('<a:t>Seulement</a:t>') // matched run translated
+    expect(outDrawingXml).toContain('<a:t>Decorative Label</a:t>') // unmatched run left untouched
+
+    const integrity = await checkPptxIntegrity(await readFile(outPath))
+    expect(integrity.ok).toBe(true)
+  })
+
   it('a blank middle paragraph (empty text, but still has a run) round-trips as an empty line, not lost and not merging its neighbors', async () => {
     const srcPath = await writeDeck({
       slides: [
@@ -1214,14 +1401,14 @@ describe('PptxAdapter.apply', () => {
     expect(reExtracted[0].text).toBe('Bonjour\n\nMonde')
   })
 
-  it('a genuinely run-less paragraph (bare <a:p/>) that would need non-empty text has nowhere to write it - documented limitation, not a crash or corruption', async () => {
+  it('a run-less middle paragraph (bare <a:p/>) gets a newly created run for its translated line instead of silently dropping it', async () => {
     const buffer = await buildPptx({
       slides: [
         {
           shapes: [
             {
               kind: 'textbox',
-              text: ['Hello', 'World'],
+              text: ['One', 'Two', 'Three'],
               box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT }
             }
           ]
@@ -1231,12 +1418,12 @@ describe('PptxAdapter.apply', () => {
     const zip = await JSZip.loadAsync(buffer)
     const slidePath = 'ppt/slides/slide1.xml'
     let xml = await zip.file(slidePath)!.async('string')
-    // Replace the second paragraph (originally "World", one run) with a bare,
-    // run-less paragraph - the structurally-empty-spacer-line case real
-    // decks do contain.
-    const worldParagraph = /<a:p><a:r><a:rPr[^>]*><\/a:rPr><a:t>World<\/a:t><\/a:r><\/a:p>/
-    expect(xml).toMatch(worldParagraph)
-    xml = xml.replace(worldParagraph, '<a:p/>')
+    // Replace the MIDDLE paragraph ("Two", one run) with a bare, run-less
+    // paragraph - the structurally-empty-spacer-line case real decks do
+    // contain (e.g. <a:p/> or <a:p><a:endParaRPr/></a:p>).
+    const twoParagraph = /<a:p><a:r><a:rPr[^>]*><\/a:rPr><a:t>Two<\/a:t><\/a:r><\/a:p>/
+    expect(xml).toMatch(twoParagraph)
+    xml = xml.replace(twoParagraph, '<a:p/>')
     zip.file(slidePath, xml)
     const patchedBuffer = await zip.generateAsync({ type: 'nodebuffer' })
 
@@ -1246,13 +1433,10 @@ describe('PptxAdapter.apply', () => {
 
     const adapter = new PptxAdapter()
     const [seg] = await adapter.extract(srcPath)
-    // The run-less second paragraph still contributes an empty line (the
-    // paragraph itself exists, it just has no a:t anywhere inside it).
-    expect(seg.text).toBe('Hello\n')
+    // The run-less middle paragraph still contributes an empty line on extract.
+    expect(seg.text).toBe('One\n\nThree')
 
-    // 2 lines matching the 2 real a:p elements: exercises the 1:1 path,
-    // where the second line has no run in its paragraph to land in.
-    const translated = makeTranslated(seg, { translation: 'Bonjour\nMonde' })
+    const translated = makeTranslated(seg, { translation: 'Un\nDeux\nTrois' })
     const outPath = path.join(dir, 'out.pptx')
 
     await expect(adapter.apply(srcPath, outPath, [translated])).resolves.toBeUndefined()
@@ -1260,12 +1444,174 @@ describe('PptxAdapter.apply', () => {
     const integrity = await checkPptxIntegrity(await readFile(outPath))
     expect(integrity.ok).toBe(true)
 
+    // The middle line is no longer silently dropped: it round-trips exactly.
+    const reExtracted = await adapter.extract(outPath)
+    expect(reExtracted[0].text).toBe('Un\nDeux\nTrois')
+
     const archive = await openPptx(outPath)
     const doc = archive.readXml(slidePath)
     const paragraphs = elems(doc, A_NS, 'p')
-    expect(paragraphs).toHaveLength(2)
-    expect(elems(paragraphs[0], A_NS, 't')[0].textContent).toBe('Bonjour') // first paragraph's run did get its line
-    expect(elems(paragraphs[1], A_NS, 'r')).toHaveLength(0) // second paragraph stays run-less - "Monde" has nowhere to go
+    expect(paragraphs).toHaveLength(3)
+    const middleRuns = elems(paragraphs[1], A_NS, 'r')
+    expect(middleRuns).toHaveLength(1) // a run was created where there was none
+    expect(elems(middleRuns[0], A_NS, 't')[0].textContent).toBe('Deux')
+  })
+
+  it('a run-less paragraph carrying only a:endParaRPr clones it as the newly created run\'s a:rPr (the "would-be formatting")', async () => {
+    const buffer = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['One', 'Two'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT }
+            }
+          ]
+        }
+      ]
+    })
+    const zip = await JSZip.loadAsync(buffer)
+    const slidePath = 'ppt/slides/slide1.xml'
+    let xml = await zip.file(slidePath)!.async('string')
+    const twoParagraph = /<a:p><a:r><a:rPr[^>]*><\/a:rPr><a:t>Two<\/a:t><\/a:r><\/a:p>/
+    expect(xml).toMatch(twoParagraph)
+    xml = xml.replace(twoParagraph, '<a:p><a:endParaRPr lang="en-US" b="1"/></a:p>')
+    zip.file(slidePath, xml)
+    const patchedBuffer = await zip.generateAsync({ type: 'nodebuffer' })
+
+    const dir = await tmpDir('lt-pptx-adapter-')
+    const srcPath = path.join(dir, 'src.pptx')
+    await writeFile(srcPath, patchedBuffer)
+
+    const adapter = new PptxAdapter()
+    const [seg] = await adapter.extract(srcPath)
+    expect(seg.text).toBe('One\n')
+
+    const translated = makeTranslated(seg, { translation: 'Un\nDeux' })
+    const outPath = path.join(dir, 'out.pptx')
+    await adapter.apply(srcPath, outPath, [translated])
+
+    const integrity = await checkPptxIntegrity(await readFile(outPath))
+    expect(integrity.ok).toBe(true)
+
+    const archive = await openPptx(outPath)
+    const doc = archive.readXml(slidePath)
+    const paragraphs = elems(doc, A_NS, 'p')
+    const runs = elems(paragraphs[1], A_NS, 'r')
+    expect(runs).toHaveLength(1)
+    expect(elems(runs[0], A_NS, 't')[0].textContent).toBe('Deux')
+    expect(elems(runs[0], A_NS, 'rPr')[0]?.getAttribute('b')).toBe('1') // cloned from endParaRPr
+
+    const reExtracted = await adapter.extract(outPath)
+    expect(reExtracted[0].text).toBe('Un\nDeux')
+  })
+
+  it('a:br apply symmetry: a paragraph with an existing a:br consumes one translated line per br-group, not per-paragraph (no phantom blank line)', async () => {
+    const buffer = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Hello'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT }
+            }
+          ]
+        }
+      ]
+    })
+    const zip = await JSZip.loadAsync(buffer)
+    const slidePath = 'ppt/slides/slide1.xml'
+    let xml = await zip.file(slidePath)!.async('string')
+    const original = /<a:p>(<a:r>.*?<\/a:r>)<\/a:p>/
+    expect(xml).toMatch(original)
+    xml = xml.replace(original, '<a:p>$1<a:br/><a:r><a:t>World</a:t></a:r></a:p>')
+    zip.file(slidePath, xml)
+    const patchedBuffer = await zip.generateAsync({ type: 'nodebuffer' })
+
+    const dir = await tmpDir('lt-pptx-adapter-')
+    const srcPath = path.join(dir, 'src.pptx')
+    await writeFile(srcPath, patchedBuffer)
+
+    const adapter = new PptxAdapter()
+    const [seg] = await adapter.extract(srcPath)
+    expect(seg.text).toBe('Hello\nWorld')
+
+    const translated = makeTranslated(seg, { translation: 'Bonjour\nMonde' })
+    const outPath = path.join(dir, 'out.pptx')
+    await adapter.apply(srcPath, outPath, [translated])
+
+    const integrity = await checkPptxIntegrity(await readFile(outPath))
+    expect(integrity.ok).toBe(true)
+
+    // Exact match - a naive per-paragraph writer would append a SECOND a:br
+    // on top of the existing one, producing "Bonjour\n\nMonde".
+    const reExtracted = await adapter.extract(outPath)
+    expect(reExtracted[0].text).toBe('Bonjour\nMonde')
+
+    const archive = await openPptx(outPath)
+    const doc = archive.readXml(slidePath)
+    const paragraphs = elems(doc, A_NS, 'p')
+    expect(paragraphs).toHaveLength(1)
+    expect(elems(paragraphs[0], A_NS, 'br')).toHaveLength(1) // still exactly one break, not two
+    const runs = elems(paragraphs[0], A_NS, 'r')
+    expect(runs.map((r) => elems(r, A_NS, 't')[0].textContent)).toEqual(['Bonjour', 'Monde'])
+  })
+
+  it('a:br apply symmetry, fewer lines than br-capacity: the surplus br and its run are removed, not left as a phantom blank line', async () => {
+    const buffer = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['A'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT }
+            }
+          ]
+        }
+      ]
+    })
+    const zip = await JSZip.loadAsync(buffer)
+    const slidePath = 'ppt/slides/slide1.xml'
+    let xml = await zip.file(slidePath)!.async('string')
+    const original = /<a:p>(<a:r>.*?<\/a:r>)<\/a:p>/
+    expect(xml).toMatch(original)
+    // 3 br-groups in one paragraph: "A", "B", "C".
+    xml = xml.replace(
+      original,
+      '<a:p>$1<a:br/><a:r><a:t>B</a:t></a:r><a:br/><a:r><a:t>C</a:t></a:r></a:p>'
+    )
+    zip.file(slidePath, xml)
+    const patchedBuffer = await zip.generateAsync({ type: 'nodebuffer' })
+
+    const dir = await tmpDir('lt-pptx-adapter-')
+    const srcPath = path.join(dir, 'src.pptx')
+    await writeFile(srcPath, patchedBuffer)
+
+    const adapter = new PptxAdapter()
+    const [seg] = await adapter.extract(srcPath)
+    expect(seg.text).toBe('A\nB\nC')
+
+    // Only 2 lines for a 3-line-capacity paragraph: the 3rd br-group is surplus.
+    const translated = makeTranslated(seg, { translation: 'X\nY' })
+    const outPath = path.join(dir, 'out.pptx')
+    await adapter.apply(srcPath, outPath, [translated])
+
+    const integrity = await checkPptxIntegrity(await readFile(outPath))
+    expect(integrity.ok).toBe(true)
+
+    const reExtracted = await adapter.extract(outPath)
+    expect(reExtracted[0].text).toBe('X\nY') // no phantom blank line from a leftover br
+
+    const archive = await openPptx(outPath)
+    const doc = archive.readXml(slidePath)
+    const paragraphs = elems(doc, A_NS, 'p')
+    expect(paragraphs).toHaveLength(1)
+    expect(elems(paragraphs[0], A_NS, 'br')).toHaveLength(1) // the surplus br was removed
+    const runs = elems(paragraphs[0], A_NS, 'r')
+    expect(runs.map((r) => elems(r, A_NS, 't')[0].textContent)).toEqual(['X', 'Y'])
   })
 })
 
@@ -1657,6 +2003,54 @@ describe('PptxAdapter round-trip', () => {
     expect(outDigests.get(colorsPart)).toBe(srcDigests.get(colorsPart))
     // The data part DID change (that's where the translated point text lives).
     expect(outDigests.get(dataPart)).not.toBe(srcDigests.get(dataPart))
+
+    const integrity = await checkPptxIntegrity(await readFile(outPath))
+    expect(integrity.ok).toBe(true)
+  })
+
+  it('SmartArt with a cached dsp:drawing part: apply() keeps BOTH the data model and the cached drawing in sync with the translation', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'smartart',
+              name: 'Cycle',
+              box: { xEmu: 0, yEmu: 0, wEmu: 4000 * EMU_PER_PT, hEmu: 2000 * EMU_PER_PT },
+              points: ['Plan', 'Do', 'Check', 'Act'],
+              cachedDrawing: true
+            }
+          ]
+        }
+      ]
+    })
+
+    const srcDigests = await digestParts(await readFile(srcPath))
+    const { outPath, originalSegments, reExtracted } = await roundTrip(srcPath)
+
+    expect(originalSegments).toHaveLength(4)
+    const reById = byId(reExtracted)
+    for (const orig of originalSegments) {
+      expect(reById.get(orig.id)!.text).toBe(mockTranslate(orig.text))
+    }
+    // No mismatch warnings: the builder's cached drawing mirrors the data
+    // part's text exactly, so every drawing run should find its match.
+    expect(warnMessages.some((m) => /has no matching translated data point/.test(m))).toBe(false)
+
+    const outDigests = await digestParts(await readFile(outPath))
+    const dataPart = [...srcDigests.keys()].find((p) => p.startsWith('ppt/diagrams/data'))!
+    const drawingPart = [...srcDigests.keys()].find((p) => p.startsWith('ppt/diagrams/drawing'))!
+    expect(drawingPart).toBeDefined()
+    expect(outDigests.get(dataPart)).not.toBe(srcDigests.get(dataPart))
+    // The cached drawing part DID change too - both parts carry the translation.
+    expect(outDigests.get(drawingPart)).not.toBe(srcDigests.get(drawingPart))
+
+    const outZip = await JSZip.loadAsync(await readFile(outPath))
+    const drawingXml = await outZip.file(drawingPart)!.async('string')
+    for (const orig of originalSegments) {
+      expect(drawingXml).toContain(`<a:t>${mockTranslate(orig.text)}</a:t>`)
+      expect(drawingXml).not.toContain(`<a:t>${orig.text}</a:t>`)
+    }
 
     const integrity = await checkPptxIntegrity(await readFile(outPath))
     expect(integrity.ok).toBe(true)
