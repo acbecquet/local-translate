@@ -139,13 +139,18 @@ Plus `real/`: extract 4 representative media parts from the benchmark deck (2 pn
 
 ```ts
 // src/core/images/regions.ts
-export interface RegionBBox { x: number; y: number; w: number; h: number } // px
+export interface RegionBBox {
+  x: number
+  y: number
+  w: number
+  h: number
+} // px
 export interface TextRegion {
-  id: string           // 'r1', 'r2', ... stable ordering within one image
-  bbox: RegionBBox     // clamped to image bounds
-  text: string         // source text as read
-  confidence: number   // 0..1
-  rotated?: boolean    // true -> caller must skip-with-log, never paint
+  id: string // 'r1', 'r2', ... stable ordering within one image
+  bbox: RegionBBox // clamped to image bounds
+  text: string // source text as read
+  confidence: number // 0..1
+  rotated?: boolean // true -> caller must skip-with-log, never paint
 }
 export interface RegionEngine {
   detectRegions(image: Buffer): Promise<TextRegion[]>
@@ -185,11 +190,14 @@ import type { FontSpec } from '../segments'
 import type { RegionBBox } from './regions'
 export interface OverlayRegion {
   bbox: RegionBBox
-  lines: string[]      // FitEngine's fittedLines
-  fontSizePt: number   // FitEngine's fittedSizePt
-  font: FontSpec       // family/bold/italic; colorHex ignored (sampled instead)
+  lines: string[] // FitEngine's fittedLines
+  fontSizePt: number // FitEngine's fittedSizePt
+  font: FontSpec // family/bold/italic; colorHex ignored (sampled instead)
 }
-export interface OverlayResult { image: Buffer; format: 'png' | 'jpeg' }
+export interface OverlayResult {
+  image: Buffer
+  format: 'png' | 'jpeg'
+}
 export function renderOverlay(image: Buffer, regions: OverlayRegion[]): Promise<OverlayResult>
 ```
 
@@ -231,7 +239,9 @@ export function createImageAdapter(engine: RegionEngine): FormatAdapter
 // extensions: ['.png', '.jpg', '.jpeg']
 
 // registry.ts (breaking change to its export, both call sites updated here)
-export interface AdapterDeps { regionEngine: RegionEngine | null }
+export interface AdapterDeps {
+  regionEngine: RegionEngine | null
+}
 export function buildAdapters(deps: AdapterDeps): FormatAdapter[]
 // regionEngine null (e.g. engine unavailable) -> image adapter excluded; pptx/fake still present
 ```
@@ -265,7 +275,10 @@ export function buildAdapters(deps: AdapterDeps): FormatAdapter[]
 
 ```ts
 // ooxml.ts additions
-export interface MediaRef { mediaPath: string; slidePath: string } // one per usage
+export interface MediaRef {
+  mediaPath: string
+  slidePath: string
+} // one per usage
 export function listPictureMedia(archive: PptxArchive): MediaRef[] // via a:blip r:embed rels, raster only
 export function readMediaBytes(archive: PptxArchive, mediaPath: string): Promise<Buffer>
 export function writeMediaBytes(archive: PptxArchive, mediaPath: string, bytes: Buffer): void // marks part dirty
