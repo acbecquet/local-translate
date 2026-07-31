@@ -1,0 +1,44 @@
+{
+  "segments": [
+    {
+      "id": "en-01",
+      "text": "Quarterly Test Report",
+      "box": { "wPt": 320, "hPt": 40 },
+      "font": { "family": "Noto Sans", "sizePt": 28 },
+      "context": "slide title",
+      "kind": "shape"
+    },
+    {
+      "id": "en-02",
+      "text": "All samples must be conditioned at 23 degrees Celsius and 50 percent relative humidity for at least 24 hours before testing begins.",
+      "box": { "wPt": 260, "hPt": 80 },
+      "font": { "family": "Noto Sans", "sizePt": 14 },
+      "context": "body paragraph",
+      "kind": "shape"
+    },
+    {
+      "id": "en-03",
+      "text": "3500 / 48.5% / 2026-03-14",
+      "box": { "wPt": 180, "hPt": 24 },
+      "font": { "family": "Noto Sans", "sizePt": 12 },
+      "context": "spec line",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-01",
+      "text": "被测设备在热循环过程中出现间歇性连接故障，工程团队将其归因于主板焊点疲劳。",
+      "box": { "wPt": 300, "hPt": 60 },
+      "font": { "family": "Noto Sans CJK SC", "sizePt": 12 },
+      "context": "body paragraph",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-02",
+      "text": "机密文件，仅供内部使用",
+      "box": { "wPt": 220, "hPt": 24 },
+      "font": { "family": "Noto Sans CJK SC", "sizePt": 12 },
+      "context": "footer disclaimer",
+      "kind": "shape"
+    }
+  ]
+}

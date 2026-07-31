@@ -1,0 +1,102 @@
+{
+  "segments": [
+    {
+      "id": "en-01",
+      "text": "Quarterly Test Report",
+      "box": {
+        "wPt": 320,
+        "hPt": 40
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 28
+      },
+      "context": "slide title",
+      "kind": "shape",
+      "translation": "季度测试报告",
+      "fittedSizePt": 28,
+      "fittedLines": [
+        "季度测试报告"
+      ]
+    },
+    {
+      "id": "en-02",
+      "text": "All samples must be conditioned at 23 degrees Celsius and 50 percent relative humidity for at least 24 hours before testing begins.",
+      "box": {
+        "wPt": 260,
+        "hPt": 80
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 14
+      },
+      "context": "body paragraph",
+      "kind": "shape",
+      "translation": "所有样本必须在 23 度เซル西度和 50% 相对湿度的环境中，保持至少 24 小时后才可以进行检测。",
+      "fittedSizePt": 14,
+      "fittedLines": [
+        "所有样本必须在 23 度เซル西度和 50% 相",
+        "对湿度的环境中，保持至少 24 小时后才",
+        "可以进行检测。"
+      ]
+    },
+    {
+      "id": "en-03",
+      "text": "3500 / 48.5% / 2026-03-14",
+      "box": {
+        "wPt": 180,
+        "hPt": 24
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 12
+      },
+      "context": "spec line",
+      "kind": "shape",
+      "translation": "3500 / 48.5% / 2026-03-14",
+      "fittedSizePt": 12,
+      "fittedLines": [
+        "3500 / 48.5% / 2026-03-14"
+      ]
+    },
+    {
+      "id": "zh-01",
+      "text": "被测设备在热循环过程中出现间歇性连接故障，工程团队将其归因于主板焊点疲劳。",
+      "box": {
+        "wPt": 300,
+        "hPt": 60
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 12
+      },
+      "context": "body paragraph",
+      "kind": "shape",
+      "translation": "检测仪在热循环过程中出现间歇性的接触故障，工程团队认为这是主板焊接处疲劳的原因。",
+      "fittedSizePt": 12,
+      "fittedLines": [
+        "检测仪在热循环过程中出现间歇性的接触故障，工程团队",
+        "认为这是主板焊接处疲劳的原因。"
+      ]
+    },
+    {
+      "id": "zh-02",
+      "text": "机密文件，仅供内部使用",
+      "box": {
+        "wPt": 220,
+        "hPt": 24
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 12
+      },
+      "context": "footer disclaimer",
+      "kind": "shape",
+      "translation": "保密文件，仅供内部使用",
+      "fittedSizePt": 12,
+      "fittedLines": [
+        "保密文件，仅供内部使用"
+      ]
+    }
+  ]
+}

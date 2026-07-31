@@ -3,7 +3,7 @@
 // EVIDENCE/<phase>/, plus a minimal README recording when/how they were made.
 // Regenerate any time with: node scripts/capture-evidence.mjs <phase>
 import { execSync } from 'node:child_process'
-import { copyFileSync, mkdirSync, writeFileSync } from 'node:fs'
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -46,13 +46,44 @@ const stamp = new Date().toISOString()
 const originalName = `original-${path.basename(def.original)}`
 copyFileSync(path.join(root, def.original), path.join(outDir, originalName))
 
+// --report-only rebuilds the README (incl. fit tables) from artifacts already
+// on disk, without re-running any translations (no model, no GPU).
+const reportOnly = process.argv.includes('--report-only')
+
 const rows = []
 for (const run of def.runs) {
   const outFile = path.join('EVIDENCE', phase, run.name)
-  const cmd = `npx tsx src/core/cli.ts ${def.original} "${run.source}" "${run.target}" --model ${def.model} --out ${outFile}`
-  process.stdout.write(`[evidence] ${cmd}\n`)
-  execSync(`${cmd} 2>&1`, { cwd: root, stdio: ['ignore', 'inherit', 'inherit'], timeout: 900_000 })
+  if (!reportOnly) {
+    const cmd = `npx tsx src/core/cli.ts ${def.original} "${run.source}" "${run.target}" --model ${def.model} --out ${outFile}`
+    process.stdout.write(`[evidence] ${cmd}\n`)
+    execSync(`${cmd} 2>&1`, {
+      cwd: root,
+      stdio: ['ignore', 'inherit', 'inherit'],
+      timeout: 900_000
+    })
+  }
   rows.push({ name: run.name, source: run.source, target: run.target })
+}
+
+// Fit-proof table: shows per segment that the translated text fits its box
+// (fitted size, wrapped line count, share of box height used). Width fitting
+// was verified with real glyph measurement inside the fit engine at run time;
+// height math here is recomputed from the artifact itself (lineH = 1.2 x pt).
+function fitTable(fileName) {
+  const data = JSON.parse(readFileSync(path.join(outDir, fileName), 'utf8'))
+  const lines = [
+    '| id | box (pt) | font pt orig -> fitted | lines | box height used |',
+    '|---|---|---|---|---|'
+  ]
+  for (const s of data.segments) {
+    const usedH = (s.fittedLines?.length ?? 0) * s.fittedSizePt * 1.2
+    const pct = s.box?.hPt ? Math.round((usedH / s.box.hPt) * 100) : 0
+    lines.push(
+      `| ${s.id} | ${s.box.wPt}x${s.box.hPt} | ${s.font.sizePt} -> ${s.fittedSizePt} | ` +
+        `${s.fittedLines?.length ?? 0} | ${pct}% |`
+    )
+  }
+  return lines
 }
 
 writeFileSync(
@@ -65,7 +96,8 @@ writeFileSync(
     '',
     ...rows.map((r) => `- [${r.name}](${r.name}) - ${r.source} -> ${r.target}, translated locally`),
     '',
-    `Regenerate: \`node scripts/capture-evidence.mjs ${phase}\``,
+    ...rows.flatMap((r) => [`## Fit proof: ${r.name}`, '', ...fitTable(r.name), '']),
+    `Regenerate: \`node scripts/capture-evidence.mjs ${phase}\` (or \`--report-only\` to rebuild this README without re-translating).`,
     ''
   ].join('\n')
 )

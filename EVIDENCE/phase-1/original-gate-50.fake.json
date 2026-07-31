@@ -1,0 +1,704 @@
+{
+  "segments": [
+    {
+      "id": "en-01",
+      "text": "Quarterly Test Report",
+      "box": {
+        "wPt": 320,
+        "hPt": 40
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 28
+      },
+      "context": "slide title",
+      "kind": "shape"
+    },
+    {
+      "id": "en-02",
+      "text": "Sample Requirements",
+      "box": {
+        "wPt": 200,
+        "hPt": 30
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 20
+      },
+      "context": "section header",
+      "kind": "shape"
+    },
+    {
+      "id": "en-03",
+      "text": "All samples must be conditioned at 23 degrees Celsius and 50 percent relative humidity for at least 24 hours before testing begins.",
+      "box": {
+        "wPt": 260,
+        "hPt": 80
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 14
+      },
+      "context": "body paragraph",
+      "kind": "shape"
+    },
+    {
+      "id": "en-04",
+      "text": "Pass",
+      "box": {
+        "wPt": 60,
+        "hPt": 22
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 12
+      },
+      "context": "table cell",
+      "kind": "table-cell"
+    },
+    {
+      "id": "en-05",
+      "text": "Fail",
+      "box": {
+        "wPt": 60,
+        "hPt": 22
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 12
+      },
+      "context": "table cell",
+      "kind": "table-cell"
+    },
+    {
+      "id": "en-06",
+      "text": "Pending review",
+      "box": {
+        "wPt": 90,
+        "hPt": 22
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 12
+      },
+      "context": "table cell",
+      "kind": "table-cell"
+    },
+    {
+      "id": "en-07",
+      "text": "The device under test exhibited intermittent connectivity failures during thermal cycling between negative twenty and sixty degrees Celsius, which the engineering team attributes to solder joint fatigue on the main board. A follow-up vibration analysis is scheduled for next week and results will be shared with the quality department before the release decision.",
+      "box": {
+        "wPt": 300,
+        "hPt": 120
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 12
+      },
+      "context": "long body paragraph",
+      "kind": "shape"
+    },
+    {
+      "id": "en-08",
+      "text": "3500 / 48.5% / 2026-03-14",
+      "box": {
+        "wPt": 180,
+        "hPt": 24
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 12
+      },
+      "context": "spec line",
+      "kind": "shape"
+    },
+    {
+      "id": "en-09",
+      "text": "Revision 4.2 draft",
+      "box": {
+        "wPt": 140,
+        "hPt": 22
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 11
+      },
+      "context": "footer",
+      "kind": "shape"
+    },
+    {
+      "id": "en-10",
+      "text": "Confidential - Internal Use Only",
+      "box": {
+        "wPt": 220,
+        "hPt": 24
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 12
+      },
+      "context": "footer disclaimer",
+      "kind": "shape"
+    },
+    {
+      "id": "en-11",
+      "text": "Test procedure follows SDR guideline TP-114 as amended in March.",
+      "box": {
+        "wPt": 240,
+        "hPt": 40
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 12
+      },
+      "context": "procedure note",
+      "kind": "shape"
+    },
+    {
+      "id": "en-12",
+      "text": "Approved by HC engineering leadership",
+      "box": {
+        "wPt": 200,
+        "hPt": 30
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 12
+      },
+      "context": "signature line",
+      "kind": "shape"
+    },
+    {
+      "id": "en-13",
+      "text": "Humidity resistance",
+      "box": {
+        "wPt": 130,
+        "hPt": 26
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 14
+      },
+      "context": "row label",
+      "kind": "shape"
+    },
+    {
+      "id": "en-14",
+      "text": "Drop test from 1.5 meters onto concrete",
+      "box": {
+        "wPt": 200,
+        "hPt": 36
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 12
+      },
+      "context": "row label",
+      "kind": "shape"
+    },
+    {
+      "id": "en-15",
+      "text": "Salt spray exposure 48 hours",
+      "box": {
+        "wPt": 170,
+        "hPt": 30
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 12
+      },
+      "context": "row label",
+      "kind": "shape"
+    },
+    {
+      "id": "en-16",
+      "text": "Results Summary",
+      "box": {
+        "wPt": 240,
+        "hPt": 34
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 24
+      },
+      "context": "slide title",
+      "kind": "shape"
+    },
+    {
+      "id": "en-17",
+      "text": "Sixteen of twenty units passed all acceptance criteria.",
+      "box": {
+        "wPt": 250,
+        "hPt": 40
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 14
+      },
+      "context": "summary",
+      "kind": "shape"
+    },
+    {
+      "id": "en-18",
+      "text": "Four units require rework of the charging port assembly.",
+      "box": {
+        "wPt": 250,
+        "hPt": 40
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 14
+      },
+      "context": "summary",
+      "kind": "shape"
+    },
+    {
+      "id": "en-19",
+      "text": "Next steps",
+      "box": {
+        "wPt": 120,
+        "hPt": 28
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 18
+      },
+      "context": "section header",
+      "kind": "shape"
+    },
+    {
+      "id": "en-20",
+      "text": "Schedule design review meeting with the supplier quality team",
+      "box": {
+        "wPt": 230,
+        "hPt": 44
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 13
+      },
+      "context": "action item",
+      "kind": "shape"
+    },
+    {
+      "id": "en-21",
+      "text": "Update the risk register before Friday",
+      "box": {
+        "wPt": 200,
+        "hPt": 30
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 12
+      },
+      "context": "action item",
+      "kind": "shape"
+    },
+    {
+      "id": "en-22",
+      "text": "Owner: quality engineering",
+      "box": {
+        "wPt": 160,
+        "hPt": 22
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 11
+      },
+      "context": "assignment",
+      "kind": "shape"
+    },
+    {
+      "id": "en-23",
+      "text": "Due date: end of month",
+      "box": {
+        "wPt": 150,
+        "hPt": 22
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 11
+      },
+      "context": "assignment",
+      "kind": "shape"
+    },
+    {
+      "id": "en-24",
+      "text": "Appendix A: Measurement Uncertainty",
+      "box": {
+        "wPt": 240,
+        "hPt": 30
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 16
+      },
+      "context": "appendix header",
+      "kind": "shape"
+    },
+    {
+      "id": "en-25",
+      "text": "Contact the SDR laboratory for raw data access.",
+      "box": {
+        "wPt": 220,
+        "hPt": 30
+      },
+      "font": {
+        "family": "Noto Sans",
+        "sizePt": 12
+      },
+      "context": "contact note",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-01",
+      "text": "季度测试报告",
+      "box": {
+        "wPt": 320,
+        "hPt": 40
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 28
+      },
+      "context": "slide title",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-02",
+      "text": "样品要求",
+      "box": {
+        "wPt": 200,
+        "hPt": 30
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 20
+      },
+      "context": "section header",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-03",
+      "text": "所有样品在测试开始前必须在23摄氏度和50%相对湿度条件下调节至少24小时。",
+      "box": {
+        "wPt": 260,
+        "hPt": 80
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 14
+      },
+      "context": "body paragraph",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-04",
+      "text": "合格",
+      "box": {
+        "wPt": 60,
+        "hPt": 22
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 12
+      },
+      "context": "table cell",
+      "kind": "table-cell"
+    },
+    {
+      "id": "zh-05",
+      "text": "不合格",
+      "box": {
+        "wPt": 60,
+        "hPt": 22
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 12
+      },
+      "context": "table cell",
+      "kind": "table-cell"
+    },
+    {
+      "id": "zh-06",
+      "text": "待审核",
+      "box": {
+        "wPt": 90,
+        "hPt": 22
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 12
+      },
+      "context": "table cell",
+      "kind": "table-cell"
+    },
+    {
+      "id": "zh-07",
+      "text": "被测设备在零下二十至六十摄氏度热循环过程中出现间歇性连接故障，工程团队将其归因于主板焊点疲劳。后续振动分析定于下周进行，结果将在发布决定之前与质量部门共享。",
+      "box": {
+        "wPt": 300,
+        "hPt": 120
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 12
+      },
+      "context": "long body paragraph",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-08",
+      "text": "电池容量：3500毫安时",
+      "box": {
+        "wPt": 180,
+        "hPt": 24
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 12
+      },
+      "context": "spec line",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-09",
+      "text": "修订版4.2草案",
+      "box": {
+        "wPt": 140,
+        "hPt": 22
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 11
+      },
+      "context": "footer",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-10",
+      "text": "机密文件，仅供内部使用",
+      "box": {
+        "wPt": 220,
+        "hPt": 24
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 12
+      },
+      "context": "footer disclaimer",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-11",
+      "text": "测试程序遵循三月修订的SDR指南TP-114。",
+      "box": {
+        "wPt": 240,
+        "hPt": 40
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 12
+      },
+      "context": "procedure note",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-12",
+      "text": "经HC工程领导层批准",
+      "box": {
+        "wPt": 200,
+        "hPt": 30
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 12
+      },
+      "context": "signature line",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-13",
+      "text": "耐湿性",
+      "box": {
+        "wPt": 130,
+        "hPt": 26
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 14
+      },
+      "context": "row label",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-14",
+      "text": "从1.5米高度跌落至混凝土地面测试",
+      "box": {
+        "wPt": 200,
+        "hPt": 36
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 12
+      },
+      "context": "row label",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-15",
+      "text": "盐雾暴露48小时",
+      "box": {
+        "wPt": 170,
+        "hPt": 30
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 12
+      },
+      "context": "row label",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-16",
+      "text": "结果摘要",
+      "box": {
+        "wPt": 240,
+        "hPt": 34
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 24
+      },
+      "context": "slide title",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-17",
+      "text": "二十台设备中有十六台通过了所有验收标准。",
+      "box": {
+        "wPt": 250,
+        "hPt": 40
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 14
+      },
+      "context": "summary",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-18",
+      "text": "四台设备的充电端口组件需要返工。",
+      "box": {
+        "wPt": 250,
+        "hPt": 40
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 14
+      },
+      "context": "summary",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-19",
+      "text": "后续步骤",
+      "box": {
+        "wPt": 120,
+        "hPt": 28
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 18
+      },
+      "context": "section header",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-20",
+      "text": "安排与供应商质量团队的设计评审会议",
+      "box": {
+        "wPt": 230,
+        "hPt": 44
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 13
+      },
+      "context": "action item",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-21",
+      "text": "在周五之前更新风险登记表",
+      "box": {
+        "wPt": 200,
+        "hPt": 30
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 12
+      },
+      "context": "action item",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-22",
+      "text": "负责人：质量工程部",
+      "box": {
+        "wPt": 160,
+        "hPt": 22
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 11
+      },
+      "context": "assignment",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-23",
+      "text": "截止日期：月底",
+      "box": {
+        "wPt": 150,
+        "hPt": 22
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 11
+      },
+      "context": "assignment",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-24",
+      "text": "附录A：测量不确定度",
+      "box": {
+        "wPt": 240,
+        "hPt": 30
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 16
+      },
+      "context": "appendix header",
+      "kind": "shape"
+    },
+    {
+      "id": "zh-25",
+      "text": "如需获取原始数据，请联系SDR实验室。",
+      "box": {
+        "wPt": 220,
+        "hPt": 30
+      },
+      "font": {
+        "family": "Noto Sans CJK SC",
+        "sizePt": 12
+      },
+      "context": "contact note",
+      "kind": "shape"
+    }
+  ]
+}
