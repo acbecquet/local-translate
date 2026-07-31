@@ -31,6 +31,23 @@ function assertPath(value: unknown, channel: string): asserts value is string {
   }
 }
 
+/**
+ * Scopes app:openPath/app:showInFolder to files this app itself just
+ * produced this session (TranslateService.isKnownOutPath - see its own doc
+ * comment), rather than letting the renderer ask the main process to open
+ * or reveal an arbitrary filesystem path. The renderer only ever calls
+ * these with `report.outPath` verbatim, so this should never actually
+ * reject in normal use - it's a hardening boundary, not a workflow the UI
+ * is expected to hit.
+ */
+function assertKnownOutPath(service: TranslateService, filePath: string, channel: string): void {
+  if (!service.isKnownOutPath(filePath)) {
+    throw new Error(
+      `${channel}: "${filePath}" was not produced by a completed translation this session`
+    )
+  }
+}
+
 export function registerIpc(service: TranslateService): void {
   ipcMain.handle(IPC_CHANNELS.translateRun, (_event, req: unknown) => {
     assertRunRequest(req)
@@ -43,6 +60,7 @@ export function registerIpc(service: TranslateService): void {
 
   ipcMain.handle(IPC_CHANNELS.appOpenPath, async (_event, filePath: unknown) => {
     assertPath(filePath, IPC_CHANNELS.appOpenPath)
+    assertKnownOutPath(service, filePath, IPC_CHANNELS.appOpenPath)
     // shell.openPath resolves to an empty string on success, or a
     // human-readable failure reason (e.g. "No application registered") -
     // never rejects on its own, so a failure has to be surfaced explicitly.
@@ -52,6 +70,7 @@ export function registerIpc(service: TranslateService): void {
 
   ipcMain.handle(IPC_CHANNELS.appShowInFolder, (_event, filePath: unknown) => {
     assertPath(filePath, IPC_CHANNELS.appShowInFolder)
+    assertKnownOutPath(service, filePath, IPC_CHANNELS.appShowInFolder)
     shell.showItemInFolder(filePath)
   })
 }

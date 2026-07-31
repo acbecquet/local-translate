@@ -22,17 +22,23 @@ function createWindow(): void {
   })
 
   // Test-only seam (never set in production): swaps ensureOllama/the
-  // backend for deterministic, network-free fakes so Playwright can drive
-  // this exact built app through the runner UI's error path and a mocked
-  // translate run without ever touching a real Ollama install or model -
-  // see e2e-fakes.ts's module doc comment.
+  // backend (and, for 'dead-silent', onState too) for deterministic,
+  // network-free fakes so Playwright can drive this exact built app
+  // through the runner UI's error path and a mocked translate run without
+  // ever touching a real Ollama install or model - see e2e-fakes.ts's
+  // module doc comment. Spread AFTER the real onProgress/onState so a fake
+  // mode's override (only 'dead-silent' provides one) wins over the real
+  // webContents.send wiring, rather than the other way around.
   const fakeMode = process.env.LT_E2E_FAKE_BACKEND
-  const depsOverrides = fakeMode === 'dead' || fakeMode === 'ok' ? e2eFakeDeps(fakeMode) : {}
+  const depsOverrides =
+    fakeMode === 'dead' || fakeMode === 'ok' || fakeMode === 'dead-silent'
+      ? e2eFakeDeps(fakeMode)
+      : {}
 
   translateService = new TranslateService({
-    ...depsOverrides,
     onProgress: (e) => win.webContents.send(IPC_CHANNELS.translateProgress, e),
-    onState: (e) => win.webContents.send(IPC_CHANNELS.translateState, e)
+    onState: (e) => win.webContents.send(IPC_CHANNELS.translateState, e),
+    ...depsOverrides
   })
   registerIpc(translateService)
 

@@ -15,7 +15,7 @@ import type { TranslationBackend } from '../core/translate/backend'
 import { OllamaNotFoundError, type OllamaConnection } from '../core/translate/ollama/lifecycle'
 import type { TranslateServiceDeps } from './translate-service'
 
-export type E2EFakeBackendMode = 'dead' | 'ok'
+export type E2EFakeBackendMode = 'dead' | 'ok' | 'dead-silent'
 
 /** Small delay so the runner UI's progress panel has a moment to render before the mocked run completes - not a stand-in for real model latency, just enough padding for Playwright's assertions to observe the transient 'translating' state reliably. */
 const FAKE_TRANSLATE_DELAY_MS = 200
@@ -25,6 +25,13 @@ const FAKE_TRANSLATE_DELAY_MS = 200
  * as it would on a machine with no Ollama install, for exercising the
  * runner's actionable error panel.
  *
+ * `'dead-silent'` - identical to `'dead'`, but also drops every
+ * `translate:state` event on the floor instead of sending it. Used by
+ * tests/e2e/runner.spec.ts's race-coherence test to prove the runner UI's
+ * error panel doesn't depend on a state event ever arriving - only on the
+ * rejected `translate:run` invoke() call, which is the only signal this
+ * mode still delivers.
+ *
  * `'ok'` - ensureOllama resolves instantly to a fake connection, and the
  * backend echoes back canned translations (prefixed with the target
  * language) for every segment it's asked to translate, for exercising the
@@ -32,13 +39,17 @@ const FAKE_TRANSLATE_DELAY_MS = 200
  */
 export function e2eFakeDeps(
   mode: E2EFakeBackendMode
-): Partial<Pick<TranslateServiceDeps, 'ensureOllama' | 'createBackend'>> {
-  if (mode === 'dead') {
-    return {
+): Partial<Pick<TranslateServiceDeps, 'ensureOllama' | 'createBackend' | 'onState'>> {
+  if (mode === 'dead' || mode === 'dead-silent') {
+    const overrides: Partial<Pick<TranslateServiceDeps, 'ensureOllama' | 'onState'>> = {
       ensureOllama: (): Promise<OllamaConnection> => {
         throw new OllamaNotFoundError('https://ollama.com/download')
       }
     }
+    if (mode === 'dead-silent') {
+      overrides.onState = () => {}
+    }
+    return overrides
   }
 
   return {

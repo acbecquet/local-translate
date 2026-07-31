@@ -1,10 +1,29 @@
+import { useCallback } from 'react'
 import type { RunReport } from '../../../shared/ipc-contract'
 
 export interface ResultPanelProps {
   report: RunReport
+  /** Reports a secondary failure (e.g. Open result/Show in folder rejecting) into the shared error area, alongside - not instead of - this still-valid result. */
+  onError: (message: string) => void
 }
 
-export function ResultPanel({ report }: ResultPanelProps): React.JSX.Element {
+function describeCatch(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+export function ResultPanel({ report, onError }: ResultPanelProps): React.JSX.Element {
+  const handleOpen = useCallback(() => {
+    window.localTranslate
+      .openPath(report.outPath)
+      .catch((err: unknown) => onError(`could not open file: ${describeCatch(err)}`))
+  }, [report.outPath, onError])
+
+  const handleShowInFolder = useCallback(() => {
+    window.localTranslate
+      .showInFolder(report.outPath)
+      .catch((err: unknown) => onError(`could not show file in folder: ${describeCatch(err)}`))
+  }, [report.outPath, onError])
+
   return (
     <div className="result-panel" data-testid="result-panel">
       <p>
@@ -12,13 +31,10 @@ export function ResultPanel({ report }: ResultPanelProps): React.JSX.Element {
       </p>
       <p className="result-path">{report.outPath}</p>
       <div className="result-actions">
-        <button type="button" onClick={() => void window.localTranslate.openPath(report.outPath)}>
+        <button type="button" onClick={handleOpen}>
           Open result
         </button>
-        <button
-          type="button"
-          onClick={() => void window.localTranslate.showInFolder(report.outPath)}
-        >
+        <button type="button" onClick={handleShowInFolder}>
           Show in folder
         </button>
       </div>

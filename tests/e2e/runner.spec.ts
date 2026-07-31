@@ -14,10 +14,11 @@ import path from 'node:path'
 // LT_E2E_FAKE_BACKEND set, which swaps ensureOllama/the translation backend
 // for deterministic, network-free fakes (see src/main/e2e-fakes.ts) -
 // 'dead' always fails like a machine with no Ollama install (for the
-// actionable-error-panel path), 'ok' completes instantly with canned
-// translations (for the progress/result-panel path). Live-model E2E
-// (LT_E2E_LIVE=1) is a separate, explicitly out-of-scope gate this suite
-// never sets.
+// actionable-error-panel path), 'dead-silent' is the same but additionally
+// drops every translate:state event (for the error-panel race-coherence
+// path), 'ok' completes instantly with canned translations (for the
+// progress/result-panel path). Live-model E2E (LT_E2E_LIVE=1) is a
+// separate, explicitly out-of-scope gate this suite never sets.
 
 const MINI_FIXTURE = {
   segments: [
@@ -40,7 +41,7 @@ function writeMiniFixture(): { dir: string; file: string } {
 }
 
 async function launchApp(
-  fakeBackend: 'dead' | 'ok',
+  fakeBackend: 'dead' | 'ok' | 'dead-silent',
   userDataDir?: string
 ): Promise<{ app: ElectronApplication; window: Page }> {
   const args = ['out/main/index.js']
@@ -97,6 +98,33 @@ test.describe('runner UI', () => {
 
       // The run must have failed before any result appeared.
       await expect(window.locator('[data-testid="result-panel"]')).toHaveCount(0)
+    } finally {
+      await app.close()
+    }
+  })
+
+  test('shows the error panel from the invoke-rejection alone, even when translate:state never arrives (race coherence)', async () => {
+    // Reviewer-flagged bug: the error panel used to render only when
+    // state==='error', but a rejected translate:run invoke() and the
+    // separately-dispatched translate:state 'error' event have no
+    // ordering guarantee - a rejection landing first used to leave the
+    // error silently hidden. 'dead-silent' drops every state event on the
+    // floor (see e2e-fakes.ts), so this test can ONLY pass if the panel
+    // renders purely off the rejected invoke() promise.
+    const { file, dir } = writeMiniFixture()
+    tmpDir = dir
+    const { app, window } = await launchApp('dead-silent')
+    try {
+      await window.locator('[data-testid="file-input"]').setInputFiles(file)
+      await window.getByRole('button', { name: 'Translate' }).click()
+
+      const errorPanel = window.locator('[data-testid="error-panel"]')
+      await expect(errorPanel).toBeVisible()
+      await expect(errorPanel).toContainText('Ollama was not found')
+
+      // Never having received a 'translating'/'starting-ollama' state event
+      // means the progress panel must never have appeared either.
+      await expect(window.locator('[data-testid="progress-panel"]')).toHaveCount(0)
     } finally {
       await app.close()
     }

@@ -64,6 +64,18 @@ export function Runner(): React.JSX.Element {
   const running = isRunning(state)
   const canRun = filePath !== null && !running
 
+  const handleFileSelected = useCallback((path: string) => {
+    setFilePath(path)
+    // A newly selected file starts a clean slate - otherwise the previous
+    // run's result/error panel would keep showing (state stays 'done'/
+    // 'error' until a new run actually starts) even though it no longer
+    // describes the file now in the drop zone.
+    setState('idle')
+    setResult(null)
+    setError(null)
+    setProgress(null)
+  }, [])
+
   const handleRun = useCallback(async () => {
     if (!filePath) return
     setError(null)
@@ -86,7 +98,7 @@ export function Runner(): React.JSX.Element {
 
   return (
     <div className="runner">
-      <DropZone filePath={filePath} disabled={running} onFileSelected={setFilePath} />
+      <DropZone filePath={filePath} disabled={running} onFileSelected={handleFileSelected} />
 
       <div className="runner-languages">
         <LanguageSelect
@@ -120,9 +132,18 @@ export function Runner(): React.JSX.Element {
         <ProgressPanel state={state as 'starting-ollama' | 'translating'} progress={progress} />
       )}
 
-      {state === 'error' && error && <ErrorPanel message={error} />}
+      {/* Gated on `error` alone, NOT `state === 'error'`: the invoke-rejection
+          backstop in handleRun's catch block can set `error` in a race where
+          the 'translate:state' error event never lands first (Electron
+          gives no ordering guarantee between an invoke() reply and a
+          separately-dispatched webContents.send() around the same time) -
+          gating on state as well as error would then hide a real error
+          forever. It also means a secondary failure after a successful run
+          (e.g. ResultPanel's Open/Show-in-folder failing) can surface here
+          too, alongside the still-valid result below. */}
+      {error && <ErrorPanel message={error} />}
 
-      {state === 'done' && result && <ResultPanel report={result} />}
+      {state === 'done' && result && <ResultPanel report={result} onError={setError} />}
     </div>
   )
 }

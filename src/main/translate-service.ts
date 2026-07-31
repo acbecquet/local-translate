@@ -111,11 +111,31 @@ function describeError(err: unknown): string {
  * constructed once in main/index.ts, stopped from its 'before-quit' hook -
  * see the module doc comment above for why it never imports electron
  * directly.
+ *
+ * Single-flight, two layers deep (reviewer-flagged: concurrent run() calls
+ * could otherwise race ensureOllama and orphan a spawned connection past
+ * quit):
+ *   1. run() itself rejects a second concurrent call outright (`running`
+ *      flag, checked and set synchronously before any await - see run()).
+ *      This is what makes two overlapping run() calls impossible today.
+ *   2. acquireConnection() ALSO dedupes concurrent callers onto one
+ *      in-flight ensureOllama() call (`connectionPromise`), and stop()
+ *      waits for that in-flight acquisition rather than only checking the
+ *      (still-null-until-resolved) `connection` field. Layer 1 makes layer
+ *      2 currently unreachable via two run() calls, but it's kept as
+ *      defense in depth - and it's what actually fixes the "orphaned
+ *      connection past quit" report: quit can land while ensureOllama is
+ *      still in flight (stop() called mid-acquisition), which is a single
+ *      run(), not a concurrency race between two.
  */
 export class TranslateService {
   private readonly deps: TranslateServiceDeps
   private connection: OllamaConnection | null = null
+  private connectionPromise: Promise<OllamaConnection> | null = null
   private cancelRequested = false
+  private running = false
+  /** outPaths of runs that completed successfully this session (path.resolve()-normalized) - see isKnownOutPath(). */
+  private readonly knownOutPaths = new Set<string>()
 
   constructor(overrides: Partial<TranslateServiceDeps> = {}) {
     this.deps = { ...defaultDeps(), ...overrides }
@@ -134,13 +154,33 @@ export class TranslateService {
   }
 
   /**
+   * Whether `filePath` (normalized via path.resolve, so a redundant "./" or
+   * ".." segment doesn't cause a false miss) is the outPath of some run
+   * that completed successfully this session. Used by ipc.ts to scope
+   * app:openPath/app:showInFolder to files this app itself just produced,
+   * rather than letting the renderer ask the main process to open or
+   * reveal an arbitrary filesystem path.
+   */
+  isKnownOutPath(filePath: string): boolean {
+    return this.knownOutPaths.has(path.resolve(filePath))
+  }
+
+  /**
    * Runs one translate job end to end: resolves the adapter, establishes
    * (or reuses) the Ollama connection, runs the pipeline, and reports
    * state/progress via the injected callbacks throughout. Resolves with the
    * RunReport on success; rejects - after emitting a final 'error' state
    * carrying the same message - on any failure, including cancellation.
+   *
+   * Rejects IMMEDIATELY, before doing anything else (no state event, so it
+   * never clobbers whatever run is actually in flight's own state stream),
+   * if another run() call hasn't finished yet - see the class doc comment.
    */
   async run(req: TranslateRunRequest): Promise<RunReport> {
+    if (this.running) {
+      throw new Error('a translation is already running')
+    }
+    this.running = true
     this.cancelRequested = false
 
     try {
@@ -152,15 +192,12 @@ export class TranslateService {
         )
       }
 
-      if (!this.connection) {
-        this.deps.onState({ state: 'starting-ollama' })
-        this.connection = await this.deps.ensureOllama({ appDataDir: this.deps.appDataDir })
-      }
+      const connection = await this.acquireConnection()
 
       this.deps.onState({ state: 'translating' })
 
       const backend = this.deps.createBackend({
-        baseUrl: this.connection.baseUrl,
+        baseUrl: connection.baseUrl,
         appDataDir: this.deps.appDataDir
       })
 
@@ -177,13 +214,46 @@ export class TranslateService {
         }
       })
 
+      this.knownOutPaths.add(path.resolve(report.outPath))
       this.deps.onState({ state: 'done' })
       return report
     } catch (err) {
       const message = describeError(err)
       this.deps.onState({ state: 'error', message })
       throw err instanceof CancelledError ? new Error(message) : err
+    } finally {
+      this.running = false
     }
+  }
+
+  /**
+   * Resolves the held OllamaConnection, establishing one if none exists
+   * yet. Concurrent callers share the SAME in-flight ensureOllama() call
+   * via `connectionPromise` rather than each racing their own - without
+   * this, two overlapping callers could both observe `connection === null`,
+   * both call ensureOllama(), and stop() running in between could stop one
+   * spawned server while the other keeps running, orphaned, past quit (see
+   * the class doc comment for why run()'s own single-flight guard makes
+   * this unreachable via two run() calls today, and why this layer is kept
+   * anyway). `connectionPromise` is cleared once settled (success OR
+   * failure) so a failed attempt doesn't permanently block retrying on the
+   * next call.
+   */
+  private async acquireConnection(): Promise<OllamaConnection> {
+    if (this.connection) return this.connection
+    if (!this.connectionPromise) {
+      this.deps.onState({ state: 'starting-ollama' })
+      this.connectionPromise = this.deps
+        .ensureOllama({ appDataDir: this.deps.appDataDir })
+        .then((connection) => {
+          this.connection = connection
+          return connection
+        })
+        .finally(() => {
+          this.connectionPromise = null
+        })
+    }
+    return this.connectionPromise
   }
 
   /**
@@ -192,8 +262,17 @@ export class TranslateService {
    * and forgets it, so the next run() re-establishes a fresh one. Safe to
    * call with no run ever having happened. Called once, from
    * main/index.ts's 'before-quit' hook.
+   *
+   * Waits out any in-flight connection acquisition FIRST: stopping only
+   * `this.connection` (still null while ensureOllama is in flight) would
+   * otherwise let a just-spawned server outlive quit, orphaned with nothing
+   * left holding a reference to stop it - the exact bug this method exists
+   * to close.
    */
   async stop(): Promise<void> {
+    if (this.connectionPromise) {
+      await this.connectionPromise.catch(() => {})
+    }
     const connection = this.connection
     this.connection = null
     if (connection) await connection.stop()

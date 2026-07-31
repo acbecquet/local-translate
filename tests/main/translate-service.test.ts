@@ -288,3 +288,150 @@ describe('DEFAULT_MODEL', () => {
     expect(opts.model).toBe(DEFAULT_MODEL)
   })
 })
+
+/** Reflection escape hatch onto TranslateService's private acquireConnection() - TypeScript's `private` is compile-time only, so this cast lets tests exercise the connection-acquisition layer directly, independent of run()'s own single-flight guard (which today makes it unreachable to call concurrently via the public API - see the class doc comment in translate-service.ts). */
+function accessAcquireConnection(service: TranslateService): () => Promise<OllamaConnection> {
+  const withPrivate = service as unknown as { acquireConnection: () => Promise<OllamaConnection> }
+  return withPrivate.acquireConnection.bind(withPrivate)
+}
+
+describe('TranslateService.run: single-flight (rejects overlapping runs)', () => {
+  it("rejects a second run() call while one is already in flight, without touching ensureOllama or the first run's state stream", async () => {
+    let resolvePipeline!: (r: RunReport) => void
+    const runPipeline = vi.fn().mockImplementation(
+      () =>
+        new Promise<RunReport>((resolve) => {
+          resolvePipeline = resolve
+        })
+    )
+    const ensureOllama = vi.fn().mockResolvedValue(fakeConnection())
+    const { service, states } = harness({ runPipeline, ensureOllama })
+    const req = { filePath: 'doc.fake.json', sourceLang: 'English', targetLang: 'French' }
+
+    const first = service.run(req)
+    await expect(service.run(req)).rejects.toThrow('a translation is already running')
+
+    resolvePipeline(FAKE_REPORT)
+    await expect(first).resolves.toBe(FAKE_REPORT)
+
+    expect(ensureOllama).toHaveBeenCalledTimes(1)
+    expect(states).toEqual([
+      { state: 'starting-ollama' },
+      { state: 'translating' },
+      { state: 'done' }
+    ])
+  })
+
+  it('allows a fresh run() once the previous one has finished', async () => {
+    const { service } = harness()
+    const req = { filePath: 'doc.fake.json', sourceLang: 'English', targetLang: 'French' }
+
+    await expect(service.run(req)).resolves.toBe(FAKE_REPORT)
+    await expect(service.run(req)).resolves.toBe(FAKE_REPORT)
+  })
+
+  it('allows a fresh run() after a previous run failed', async () => {
+    const ensureOllama = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('boom'))
+      .mockResolvedValue(fakeConnection())
+    const { service } = harness({ ensureOllama })
+    const req = { filePath: 'doc.fake.json', sourceLang: 'English', targetLang: 'French' }
+
+    await expect(service.run(req)).rejects.toThrow('boom')
+    await expect(service.run(req)).resolves.toBe(FAKE_REPORT)
+  })
+})
+
+describe('TranslateService: connection acquisition (defense in depth beyond the run() single-flight guard)', () => {
+  it('concurrent acquireConnection() callers share one ensureOllama call and resolve to the same connection', async () => {
+    let resolveEnsure!: (c: OllamaConnection) => void
+    const connection = fakeConnection()
+    const ensureOllama = vi.fn().mockImplementation(
+      () =>
+        new Promise<OllamaConnection>((resolve) => {
+          resolveEnsure = resolve
+        })
+    )
+    const { service } = harness({ ensureOllama })
+    const acquireConnection = accessAcquireConnection(service)
+
+    const p1 = acquireConnection()
+    const p2 = acquireConnection()
+    resolveEnsure(connection)
+
+    const [c1, c2] = await Promise.all([p1, p2])
+    expect(c1).toBe(connection)
+    expect(c2).toBe(connection)
+    expect(ensureOllama).toHaveBeenCalledTimes(1)
+  })
+
+  it('stop() called mid-acquisition waits for the in-flight connection and stops it - no orphan', async () => {
+    let resolveEnsure!: (c: OllamaConnection) => void
+    const connStop = vi.fn().mockResolvedValue(undefined)
+    const connection = fakeConnection(connStop)
+    const ensureOllama = vi.fn().mockImplementation(
+      () =>
+        new Promise<OllamaConnection>((resolve) => {
+          resolveEnsure = resolve
+        })
+    )
+    const { service } = harness({ ensureOllama })
+    const acquireConnection = accessAcquireConnection(service)
+
+    const acquiring = acquireConnection() // in flight - ensureOllama has not resolved yet
+    const stopping = service.stop() // quit lands right now, mid-acquisition
+
+    // Against the old code (stop() only checking the still-null `connection`
+    // field), `stopping` would already have resolved as a no-op here,
+    // before ensureOllama even settles - orphaning the connection about to
+    // be established.
+    resolveEnsure(connection)
+
+    await acquiring
+    await stopping
+
+    expect(connStop).toHaveBeenCalledTimes(1)
+  })
+
+  it('a failed acquisition clears connectionPromise so the next attempt retries instead of hanging forever', async () => {
+    const ensureOllama = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('boom'))
+      .mockResolvedValue(fakeConnection())
+    const { service } = harness({ ensureOllama })
+    const acquireConnection = accessAcquireConnection(service)
+
+    await expect(acquireConnection()).rejects.toThrow('boom')
+    const retried = await acquireConnection()
+    expect(retried.baseUrl).toBe('http://127.0.0.1:1')
+    expect(ensureOllama).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('TranslateService.isKnownOutPath (app:openPath/app:showInFolder scoping)', () => {
+  it("recognizes a completed run's outPath, including through a path.resolve()-normalized alias", async () => {
+    const { service } = harness()
+    const req = { filePath: 'doc.fake.json', sourceLang: 'English', targetLang: 'French' }
+
+    await service.run(req)
+
+    expect(service.isKnownOutPath(FAKE_REPORT.outPath)).toBe(true)
+    expect(service.isKnownOutPath(`./${FAKE_REPORT.outPath}`)).toBe(true) // same file, redundant "./" segment
+  })
+
+  it('does not recognize a path that was never produced by a completed run', () => {
+    const { service } = harness()
+    expect(service.isKnownOutPath('C:\\Users\\someone\\AppData\\anything.pptx')).toBe(false)
+  })
+
+  it('does not record an outPath for a run that fails before completing', async () => {
+    const runPipeline = vi.fn().mockRejectedValue(new Error('boom'))
+    const { service } = harness({ runPipeline })
+    const req = { filePath: 'doc.fake.json', sourceLang: 'English', targetLang: 'French' }
+
+    await expect(service.run(req)).rejects.toThrow('boom')
+
+    expect(service.isKnownOutPath(FAKE_REPORT.outPath)).toBe(false)
+  })
+})
