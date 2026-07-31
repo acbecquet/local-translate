@@ -60,19 +60,27 @@ const { OllamaBackend } = await import('../../../src/core/translate/ollama/ollam
  */
 function chatResponse(
   content: string,
-  usage?: { promptEvalCount: number; evalCount: number; totalDurationNs: number }
+  usage?: {
+    promptEvalCount: number
+    evalCount: number
+    totalDurationNs: number
+    /** Defaults to `totalDurationNs` when omitted - most tests don't care about the total-vs-eval split and can just supply one number; the usage-aggregation tests that DO care about the split (evalDurationMs is the tokensPerSec basis, not modelDurationMs) pass this explicitly and distinct from totalDurationNs. */
+    evalDurationNs?: number
+  }
 ): {
   message: { content: string }
   prompt_eval_count?: number
   eval_count?: number
   total_duration?: number
+  eval_duration?: number
 } {
   if (!usage) return { message: { content } }
   return {
     message: { content },
     prompt_eval_count: usage.promptEvalCount,
     eval_count: usage.evalCount,
-    total_duration: usage.totalDurationNs
+    total_duration: usage.totalDurationNs,
+    eval_duration: usage.evalDurationNs ?? usage.totalDurationNs
   }
 }
 
@@ -373,13 +381,14 @@ describe('OllamaBackend.translateBatch', () => {
 // --- translateBatch: BatchResponse.usage aggregation ----------------------
 
 describe('OllamaBackend.translateBatch usage aggregation', () => {
-  it('happy path: usage reflects exactly the one group call, with no retries or fallbacks', async () => {
+  it('happy path: usage reflects exactly the one group call, with no retries or fallbacks - modelDurationMs (whole-call) and evalDurationMs (pure generation) tracked independently', async () => {
     await seedCaps(appDataDir, 'test-model', { structuredWithThinkOff: true })
     mocks.chat.mockResolvedValueOnce(
       chatResponse(JSON.stringify({ translations: [{ id: 's1', translation: 'Bonjour' }] }), {
         promptEvalCount: 10,
         evalCount: 4,
-        totalDurationNs: 2_000_000 // 2 ms
+        totalDurationNs: 2_000_000, // 2 ms whole-call latency (incl. model load + prompt eval)
+        evalDurationNs: 1_500_000 // 1.5 ms pure generation - deliberately less than total, to prove the two are read from separate response fields, not derived from one another.
       })
     )
 
@@ -395,6 +404,7 @@ describe('OllamaBackend.translateBatch usage aggregation', () => {
       promptTokens: 10,
       completionTokens: 4,
       modelDurationMs: 2,
+      evalDurationMs: 1.5,
       calls: 1,
       retries: 0,
       perSegmentFallbacks: 0
@@ -459,6 +469,7 @@ describe('OllamaBackend.translateBatch usage aggregation', () => {
       promptTokens: 20 + 20 + 6 + 6,
       completionTokens: 5 + 5 + 2 + 1,
       modelDurationMs: 1 + 1 + 0.5 + 0.5,
+      evalDurationMs: 1 + 1 + 0.5 + 0.5, // evalDurationNs omitted -> defaults to totalDurationNs per call
       calls: 4,
       retries: 1,
       perSegmentFallbacks: 2
@@ -484,6 +495,7 @@ describe('OllamaBackend.translateBatch usage aggregation', () => {
       promptTokens: 0,
       completionTokens: 0,
       modelDurationMs: 0,
+      evalDurationMs: 0,
       calls: 0, // no response ever came back on any attempt
       retries: 1,
       perSegmentFallbacks: 1
@@ -519,6 +531,7 @@ describe('OllamaBackend.translateBatch usage aggregation', () => {
       promptTokens: 3 + 10,
       completionTokens: 1 + 4,
       modelDurationMs: 0.3 + 2,
+      evalDurationMs: 0.3 + 2,
       calls: 2, // probe counts as a call too
       retries: 0,
       perSegmentFallbacks: 0
@@ -552,6 +565,7 @@ describe('OllamaBackend.translateBatch usage aggregation', () => {
       promptTokens: 8,
       completionTokens: 3,
       modelDurationMs: 1,
+      evalDurationMs: 1,
       calls: 1,
       retries: 0,
       perSegmentFallbacks: 0

@@ -13,15 +13,17 @@ function describeCatch(err: unknown): string {
 
 /**
  * One compact line: duration, segments/min always, tok/s only when the
- * backend actually reported token usage (a "0.0 tok/s" for every backend
- * that never tracks it would just be noise - mirrors cli.ts's printStats
- * doing the same gating on the terminal side).
+ * backend actually reported token usage. Gated on the same condition as
+ * cli.ts's printStats ("promptTokens > 0 || completionTokens > 0") so the
+ * two surfaces agree on when a backend has token telemetry to show - a
+ * "0.0 tok/s" for every backend that never tracks it would just be noise.
  */
 function describeStats(report: RunReport): string {
+  const hasTokenUsage = report.stats.promptTokens > 0 || report.stats.completionTokens > 0
   const parts = [
     `${report.durationMs} ms`,
     `${report.stats.segmentsPerMin.toFixed(1)} segments/min`,
-    ...(report.stats.completionTokens > 0 ? [`${report.stats.tokensPerSec.toFixed(1)} tok/s`] : [])
+    ...(hasTokenUsage ? [`${report.stats.tokensPerSec.toFixed(1)} tok/s`] : [])
   ]
   return parts.join(' | ')
 }

@@ -19,26 +19,34 @@ const NS_PER_MS = 1_000_000
 type TranslatedEntry = { id: string; translation: string }
 
 /** Per-call usage telemetry, already unit-converted (ns -> ms) and defaulted, extracted from one ollama.chat() response. */
-type CallUsage = { promptTokens: number; completionTokens: number; modelDurationMs: number }
+type CallUsage = {
+  promptTokens: number
+  completionTokens: number
+  modelDurationMs: number
+  evalDurationMs: number
+}
 
 /**
  * Pulls usage telemetry off a raw ollama ChatResponse. The ollama npm
  * client's ChatResponse type (v0.6.x) declares prompt_eval_count,
- * eval_count, and total_duration (nanoseconds) as required fields, but
- * this project's own test mocks (and conceivably a real server on an older
- * protocol version) commonly hand back a bare `{ message: { content } }`
- * with none of them - so every field is read defensively and defaulted to
- * 0 rather than trusted as present, keeping aggregation NaN-free.
+ * eval_count, total_duration, and eval_duration (nanoseconds) as required
+ * fields, but this project's own test mocks (and conceivably a real server
+ * on an older protocol version) commonly hand back a bare
+ * `{ message: { content } }` with none of them - so every field is read
+ * defensively and defaulted to 0 rather than trusted as present, keeping
+ * aggregation NaN-free.
  */
 function extractUsage(res: {
   prompt_eval_count?: number
   eval_count?: number
   total_duration?: number
+  eval_duration?: number
 }): CallUsage {
   return {
     promptTokens: res.prompt_eval_count ?? 0,
     completionTokens: res.eval_count ?? 0,
-    modelDurationMs: (res.total_duration ?? 0) / NS_PER_MS
+    modelDurationMs: (res.total_duration ?? 0) / NS_PER_MS,
+    evalDurationMs: (res.eval_duration ?? 0) / NS_PER_MS
   }
 }
 
@@ -156,6 +164,7 @@ export class OllamaBackend implements TranslationBackend {
       promptTokens: 0,
       completionTokens: 0,
       modelDurationMs: 0,
+      evalDurationMs: 0,
       calls: 0,
       retries: 0,
       perSegmentFallbacks: 0
@@ -169,6 +178,7 @@ export class OllamaBackend implements TranslationBackend {
       usage.promptTokens += call.promptTokens
       usage.completionTokens += call.completionTokens
       usage.modelDurationMs += call.modelDurationMs
+      usage.evalDurationMs += call.evalDurationMs
       usage.calls += 1
     }
 

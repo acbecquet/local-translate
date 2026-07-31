@@ -568,7 +568,8 @@ describe('runPipeline: RunReport.stats', () => {
       usage: {
         promptTokens: 10,
         completionTokens: 4,
-        modelDurationMs: 100,
+        modelDurationMs: 100, // whole-call latency (incl. load) - deliberately NOT what tokensPerSec is based on
+        evalDurationMs: 50, // pure generation time - distinct from modelDurationMs, on purpose
         calls: 1,
         retries: req.groupContext === 'doc-a' ? 1 : 0,
         perSegmentFallbacks: req.groupContext === 'doc-a' ? 1 : 0
@@ -596,9 +597,41 @@ describe('runPipeline: RunReport.stats', () => {
     expect(report.stats.perSegmentFallbacks).toBe(1)
     expect(report.stats.promptTokens).toBe(20)
     expect(report.stats.completionTokens).toBe(8)
-    // tokensPerSec = completionTokens / (summed modelDurationMs / 1000)
-    // = 8 / (200 / 1000) = 40
-    expect(report.stats.tokensPerSec).toBe(40)
+    // tokensPerSec = completionTokens / (summed evalDurationMs / 1000)
+    // = 8 / (100 / 1000) = 80 - NOT 8 / (summed modelDurationMs / 1000) = 40,
+    // which would be the answer if this were wrongly based on whole-call
+    // latency instead of pure generation time.
+    expect(report.stats.tokensPerSec).toBe(80)
+  })
+
+  it('tokensPerSec is based on evalDurationMs (pure generation time), not modelDurationMs (whole-call latency incl. load) - a slow-loading, fast-generating call must not be reported as slow throughput', async () => {
+    const s1 = seg({ id: 's1', text: 'Hello', context: 'doc' })
+    const { file } = writeFixture([s1])
+
+    const backend = makeBackend(() => ({
+      translations: [{ id: 's1', translation: 'Bonjour' }],
+      usage: {
+        promptTokens: 5,
+        completionTokens: 10,
+        modelDurationMs: 1000, // e.g. a slow cold model load dominates whole-call latency
+        evalDurationMs: 200, // but generation itself was fast
+        calls: 1,
+        retries: 0,
+        perSegmentFallbacks: 0
+      }
+    }))
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    // 10 / (200 / 1000) = 50, not 10 / (1000 / 1000) = 10.
+    expect(report.stats.tokensPerSec).toBe(50)
   })
 
   it('is 0-safe throughout when the backend never reports usage at all', async () => {

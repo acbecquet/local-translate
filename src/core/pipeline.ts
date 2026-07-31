@@ -46,7 +46,7 @@ export interface RunReport {
     promptTokens: number
     /** Sum of BatchResponse.usage.completionTokens across every group; 0 when the backend never reports usage. */
     completionTokens: number
-    /** completionTokens / (summed BatchResponse.usage.modelDurationMs / 1000); 0 when either side of that ratio is 0 (no usage reported, or a 0 ms duration). */
+    /** completionTokens / (summed BatchResponse.usage.evalDurationMs / 1000) - pure generation throughput, NOT divided by whole-call latency (which includes model load + prompt eval), matching ollama's own eval-rate convention. 0 when either side of that ratio is 0 (no usage reported, or a 0 ms eval duration). */
     tokensPerSec: number
     /** Sum of `.text.length` across every extracted segment, translated or not - the total amount of source text this run processed. */
     charsSource: number
@@ -158,7 +158,7 @@ export async function runPipeline(opts: PipelineOpts): Promise<RunReport> {
       perSegmentFallbacks: usage.perSegmentFallbacks,
       promptTokens: usage.promptTokens,
       completionTokens: usage.completionTokens,
-      tokensPerSec: safeRate(usage.completionTokens, usage.modelDurationMs / 1000),
+      tokensPerSec: safeRate(usage.completionTokens, usage.evalDurationMs / 1000),
       charsSource,
       charsTranslated,
       segmentsPerMin: safeRate(translated, durationMs / 60000)
@@ -234,7 +234,7 @@ function deriveGroupContext(group: TextSegment[]): string {
   return `${groupKey}: ${roles.join(', ')}`
 }
 
-/** Aggregate of BatchResponse.usage summed across every group this pipeline run sent to the backend - see RunReport.stats's doc comment (pipeline.ts) for how each field maps into the final report. Kept separate from RunReport.stats itself since this also carries `modelDurationMs`, an intermediate the report never exposes directly (only tokensPerSec, derived from it). */
+/** Aggregate of BatchResponse.usage summed across every group this pipeline run sent to the backend - see RunReport.stats's doc comment (pipeline.ts) for how each field maps into the final report. Kept separate from RunReport.stats itself since this also carries `modelDurationMs`/`evalDurationMs`, intermediates the report never exposes directly (only tokensPerSec, derived from `evalDurationMs` - see its own doc comment on backend.ts's BatchResponse.usage for why that field, not `modelDurationMs`, is the tokensPerSec basis). */
 interface UsageTotals {
   groups: number
   modelCalls: number
@@ -243,6 +243,7 @@ interface UsageTotals {
   promptTokens: number
   completionTokens: number
   modelDurationMs: number
+  evalDurationMs: number
 }
 
 /**
@@ -272,7 +273,8 @@ async function translateSegments(
     perSegmentFallbacks: 0,
     promptTokens: 0,
     completionTokens: 0,
-    modelDurationMs: 0
+    modelDurationMs: 0,
+    evalDurationMs: 0
   }
 
   for (const seg of segments) {
@@ -308,6 +310,7 @@ async function translateSegments(
       usage.promptTokens += response.usage.promptTokens
       usage.completionTokens += response.usage.completionTokens
       usage.modelDurationMs += response.usage.modelDurationMs
+      usage.evalDurationMs += response.usage.evalDurationMs
     }
 
     for (const t of response.translations) {

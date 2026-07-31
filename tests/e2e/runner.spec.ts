@@ -146,6 +146,15 @@ test.describe('runner UI', () => {
 
       // Progress panel is replaced by the result panel once the run is done.
       await expect(window.locator('[data-testid="progress-panel"]')).toHaveCount(0)
+
+      // The compact stats line always shows segments/min; the 'ok' fake
+      // backend's translateBatch (e2e-fakes.ts) never sets BatchResponse.usage,
+      // so tok/s must be absent - ResultPanel's describeStats() gates it on
+      // promptTokens > 0 || completionTokens > 0, matching cli.ts's printStats.
+      const statsLine = window.locator('[data-testid="result-stats"]')
+      await expect(statsLine).toBeVisible()
+      await expect(statsLine).toContainText('segments/min')
+      await expect(statsLine).not.toContainText('tok/s')
     } finally {
       await app.close()
     }

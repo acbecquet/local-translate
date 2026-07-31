@@ -288,6 +288,7 @@ describe('runCli: exit codes and dependency injection', () => {
           promptTokens: 12,
           completionTokens: 5,
           modelDurationMs: 250,
+          evalDurationMs: 250,
           calls: 1,
           retries: 0,
           perSegmentFallbacks: 0

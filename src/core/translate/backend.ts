@@ -51,8 +51,25 @@ export interface BatchResponse {
     promptTokens: number
     /** Sum of completion tokens (ollama's `eval_count`) across every call counted below. */
     completionTokens: number
-    /** Sum of per-call model duration, converted from ollama's nanosecond `total_duration` to milliseconds. */
+    /**
+     * Sum of per-call WHOLE-CALL wall latency, converted from ollama's
+     * nanosecond `total_duration` to milliseconds - includes model load
+     * time and prompt evaluation, not just generation. Useful as an
+     * end-to-end "how long did this call take" figure, but NOT what
+     * tokensPerSec is based on (see `evalDurationMs` below) - load time in
+     * particular can vary wildly call to call for reasons that have nothing
+     * to do with generation throughput.
+     */
     modelDurationMs: number
+    /**
+     * Sum of per-call PURE GENERATION time, converted from ollama's
+     * nanosecond `eval_duration` to milliseconds - excludes model load and
+     * prompt evaluation. This is what RunReport.stats.tokensPerSec divides
+     * completionTokens by, matching ollama's own eval-rate convention (the
+     * same basis `ollama run --verbose` reports its tokens/s against), so
+     * this project's tok/s numbers are directly comparable to those.
+     */
+    evalDurationMs: number
     /**
      * Number of model calls that actually returned a response and
      * contributed to the sums above - a transport-level failure (the
