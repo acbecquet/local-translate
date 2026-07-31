@@ -8,3 +8,4 @@ playwright-report/
 *.local
 .remember/
 *.tsbuildinfo
+fixtures/gate-decks/
