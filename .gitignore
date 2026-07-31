@@ -9,3 +9,4 @@ playwright-report/
 .remember/
 *.tsbuildinfo
 fixtures/gate-decks/
+~$*
