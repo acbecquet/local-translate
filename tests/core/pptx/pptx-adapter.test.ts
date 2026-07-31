@@ -936,7 +936,7 @@ describe('PptxAdapter.apply', () => {
     expect(elems(runs[1], A_NS, 'rPr')[0].getAttribute('b')).toBe('1') // sibling's rPr retained, not deleted
   })
 
-  it('writes sz (hundredths, rounded to the nearest quarter point) on every non-empty run only when the fitted size differs, and drops a:normAutofit', async () => {
+  it('writes sz (hundredths, rounded to the nearest quarter point) on every non-empty run only when the fitted size differs, and resets a stale a:normAutofit to a bare one', async () => {
     const buffer = await buildPptx({
       slides: [
         {
@@ -955,6 +955,10 @@ describe('PptxAdapter.apply', () => {
     const slidePath = 'ppt/slides/slide1.xml'
     let xml = await zip.file(slidePath)!.async('string')
     expect(xml).toContain('<a:bodyPr/>')
+    // Simulates a deck PowerPoint had already autofit-shrunk the ORIGINAL
+    // text at the ORIGINAL size - those scale numbers are meaningless for
+    // the translated text/fitted size we're about to write, so they must
+    // not survive into the output.
     xml = xml.replace(
       '<a:bodyPr/>',
       '<a:bodyPr><a:normAutofit fontScale="90000" lnSpcReduction="10000"/></a:bodyPr>'
@@ -979,7 +983,49 @@ describe('PptxAdapter.apply', () => {
     const rPr = elems(doc, A_NS, 'rPr')[0]
     expect(rPr.getAttribute('sz')).toBe('1350') // 13.4pt -> 1340 hundredths -> nearest 25 -> 1350
     const bodyPr = elems(doc, A_NS, 'bodyPr')[0]
-    expect(elems(bodyPr, A_NS, 'normAutofit')).toHaveLength(0)
+    const normAutofit = elems(bodyPr, A_NS, 'normAutofit')
+    expect(normAutofit).toHaveLength(1) // belt-and-suspenders: PowerPoint may still autofit further
+    expect(normAutofit[0].hasAttribute('fontScale')).toBe(false) // stale scale numbers dropped, not carried forward
+    expect(normAutofit[0].hasAttribute('lnSpcReduction')).toBe(false)
+  })
+
+  it('replaces a:spAutoFit with a bare a:normAutofit when writing a fitted size', async () => {
+    const buffer = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Hello'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT },
+              fontPt: 18
+            }
+          ]
+        }
+      ]
+    })
+    const zip = await JSZip.loadAsync(buffer)
+    const slidePath = 'ppt/slides/slide1.xml'
+    let xml = await zip.file(slidePath)!.async('string')
+    xml = xml.replace('<a:bodyPr/>', '<a:bodyPr><a:spAutoFit/></a:bodyPr>')
+    zip.file(slidePath, xml)
+    const patchedBuffer = await zip.generateAsync({ type: 'nodebuffer' })
+
+    const dir = await tmpDir('lt-pptx-adapter-')
+    const srcPath = path.join(dir, 'src.pptx')
+    await writeFile(srcPath, patchedBuffer)
+
+    const adapter = new PptxAdapter()
+    const [seg] = await adapter.extract(srcPath)
+    const translated = makeTranslated(seg, { translation: 'Bonjour', fittedSizePt: 13.4 })
+    const outPath = path.join(dir, 'out.pptx')
+    await adapter.apply(srcPath, outPath, [translated])
+
+    const archive = await openPptx(outPath)
+    const doc = archive.readXml(slidePath)
+    const bodyPr = elems(doc, A_NS, 'bodyPr')[0]
+    expect(elems(bodyPr, A_NS, 'spAutoFit')).toHaveLength(0)
+    expect(elems(bodyPr, A_NS, 'normAutofit')).toHaveLength(1)
   })
 
   it('never touches sz when the fitted size equals the segment font size, even though the text did change', async () => {
@@ -1050,6 +1096,8 @@ describe('PptxAdapter.apply', () => {
     const doc = archive.readXml(notesPath)
     const run = elems(doc, A_NS, 'r')[0]
     expect(elems(run, A_NS, 'rPr')[0].hasAttribute('sz')).toBe(false) // no sz was ever written for notes
+    const bodyPr = elems(doc, A_NS, 'bodyPr')[0]
+    expect(elems(bodyPr, A_NS, 'normAutofit')).toHaveLength(0) // bodyPr itself untouched for notes too
   })
 
   it('zero-diff guarantee: a segment whose translation equals its source text is left completely untouched - output is byte-identical to source', async () => {

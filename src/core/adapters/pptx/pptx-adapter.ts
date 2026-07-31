@@ -611,12 +611,12 @@ function appendBreakLine(paragraph: Element, text: string): void {
 
 /**
  * Sets `sz` (hundredths of a point, rounded to the nearest quarter point)
- * on every run in `bodyEl` whose current text is non-empty, and drops any
- * `a:normAutofit` on `bodyEl`'s `a:bodyPr` - we're setting an explicit size
- * now, so PowerPoint's own autofit shrinkage must not also apply on top of
- * it. Must run AFTER writeTranslation so "non-empty run" reflects the
- * post-translation state (runs writeTranslation just emptied are correctly
- * left untouched here).
+ * on every run in `bodyEl` whose current text is non-empty, and marks
+ * `bodyEl`'s `a:bodyPr` with a bare `<a:normAutofit/>` (see
+ * ensureNormAutofit's own doc comment for why) as a belt-and-suspenders
+ * safety net on top of our explicit size. Must run AFTER writeTranslation
+ * so "non-empty run" reflects the post-translation state (runs
+ * writeTranslation just emptied are correctly left untouched here).
  */
 function writeSize(bodyEl: Element, sizePt: number): void {
   const QUARTER_POINT = 25
@@ -627,12 +627,86 @@ function writeSize(bodyEl: Element, sizePt: number): void {
     ensureRPr(run).setAttribute('sz', String(hundredths))
   }
 
-  const bodyPr = childElems(bodyEl, A_NS, 'bodyPr')[0]
-  if (bodyPr) {
-    for (const normAutofit of childElems(bodyPr, A_NS, 'normAutofit')) {
-      bodyPr.removeChild(normAutofit)
-    }
+  ensureNormAutofit(bodyEl)
+}
+
+/**
+ * Research-adopted belt-and-suspenders (credit: LinguaHaru's approach to
+ * the same problem, per the Phase 2 research/knowledge-base adoption).
+ * writeSize() above already writes an explicit fitted `sz` computed from
+ * our own skia-canvas-based wrap measurement (with the WRAP_SAFETY margin
+ * on top - see its doc comment), but that measurement can still diverge
+ * slightly from PowerPoint's real text layout engine on some fonts/scripts
+ * - and unlike our earlier "explicit size means autofit must not ALSO
+ * apply on top of it" stance, a residual mismatch there would silently
+ * clip text with no recourse. So instead: ensure `bodyEl`'s `a:bodyPr`
+ * carries a bare `<a:normAutofit/>` (no `fontScale`/`lnSpcReduction`
+ * attributes - those would be PowerPoint's own record of a PREVIOUS
+ * autofit computed for different text/size, so carrying stale values
+ * forward here would be actively wrong for what we just wrote). This asks
+ * PowerPoint to keep autofitting on top of our size if it still doesn't
+ * fit once opened/edited, rather than leaving an uncorrectable overflow.
+ *
+ * Replaces whichever EG_TextAutofit choice element (`a:noAutofit`,
+ * `a:spAutoFit`, or a stale `a:normAutofit`) was already there, and
+ * creates `a:bodyPr` itself in the (schema-invalid on any real deck, so
+ * normally unreachable) case a body somehow lacks one - `a:bodyPr` is
+ * `CT_TextBody`'s first required child, so every body this codebase can
+ * actually extract a segment from will already have one.
+ */
+function ensureNormAutofit(bodyEl: Element): void {
+  const doc = bodyEl.ownerDocument
+  if (!doc) return
+
+  const qualified = (el: Element, local: string): string => {
+    const prefix = el.lookupPrefix(A_NS)
+    return prefix === null ? `a:${local}` : prefix === '' ? local : `${prefix}:${local}`
   }
+
+  let bodyPr = childElems(bodyEl, A_NS, 'bodyPr')[0]
+  if (!bodyPr) {
+    bodyPr = doc.createElementNS(A_NS, qualified(bodyEl, 'bodyPr'))
+    bodyEl.insertBefore(bodyPr, bodyEl.firstChild)
+  }
+
+  for (const stale of [
+    ...childElems(bodyPr, A_NS, 'noAutofit'),
+    ...childElems(bodyPr, A_NS, 'normAutofit'),
+    ...childElems(bodyPr, A_NS, 'spAutoFit')
+  ]) {
+    bodyPr.removeChild(stale)
+  }
+
+  const normAutofit = doc.createElementNS(A_NS, qualified(bodyPr, 'normAutofit'))
+  const insertBefore = firstAutofitSuccessorSibling(bodyPr)
+  if (insertBefore) bodyPr.insertBefore(normAutofit, insertBefore)
+  else bodyPr.appendChild(normAutofit)
+}
+
+/**
+ * The first of `a:scene3d`/`a:sp3d`/`a:flatTx`/`a:extLst` among `bodyPr`'s
+ * direct children, in document order. CT_TextBodyProperties's schema
+ * places the EG_TextAutofit choice (`noAutofit`|`normAutofit`|`spAutoFit`)
+ * immediately before these, after an optional `a:prstTxWarp` - which this
+ * function deliberately does NOT match against, so it never returns a
+ * position before that warp shape (WordArt bodies never actually reach
+ * ensureNormAutofit() in practice - isWordArt() skips them entirely in
+ * handleSp() - but stay schema-correct regardless of that). Returns null
+ * when none of those trailing elements exist, meaning the new
+ * `a:normAutofit` can simply be appended as bodyPr's last child - the
+ * common case for every body this adapter actually writes to.
+ */
+function firstAutofitSuccessorSibling(bodyPr: Element): Element | null {
+  const TRAILING_LOCAL_NAMES = new Set(['scene3d', 'sp3d', 'flatTx', 'extLst'])
+  const children = bodyPr.childNodes
+  for (let i = 0; i < children.length; i++) {
+    const child = children.item(i)
+    if (!child || child.nodeType !== ELEMENT_NODE) continue
+    const el = child as Element
+    if (el.namespaceURI !== A_NS) continue
+    if (el.localName && TRAILING_LOCAL_NAMES.has(el.localName)) return el
+  }
+  return null
 }
 
 /** Finds (or creates, matching the run's own bound DrawingML prefix - mirrors setRunText's approach) a run's `a:rPr`, inserted as its first child per CT_TextRun's schema order. */
