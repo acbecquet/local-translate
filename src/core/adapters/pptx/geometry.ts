@@ -14,8 +14,10 @@
  * (`box.wPt + insetsPt.l + insetsPt.r` == the shape's usable-width source
  * size in the same coordinate space as `box`, insets and box both scaled
  * by the same `groupScale`) for positioning text within the original
- * shape's bounding rectangle. Nothing here subtracts insets a second time
- * or applies them to anything other than `box`.
+ * shape's bounding rectangle. `box` already excludes insets, permanently -
+ * a caller must never subtract `insetsPt` from `box` again (that would
+ * double-shrink the fit area). See the field doc comments on `ShapeGeom`
+ * for the normative statement of this rule.
  */
 import type { Document, Element } from '@xmldom/xmldom'
 import { A_NS, P_NS, childElems, elems } from './ooxml'
@@ -41,16 +43,58 @@ const PLACEHOLDER_DEFAULT_FONT_PT: Record<string, number> = {
 const DEFAULT_PH_TYPE = 'obj'
 const DEFAULT_PH_IDX = 0
 
+/**
+ * Placeholder type aliases applied when matching a slide's placeholder
+ * against candidate `p:ph` elements on the layout/master, and when looking
+ * up the default font size below. Real decks routinely give a title
+ * slide's centered title/subtitle the specialized types "ctrTitle"/
+ * "subTitle" on the slide (and often the layout), while the master
+ * frequently only defines the generic "title"/"body" placeholders these
+ * conceptually inherit from - without this alias, a slide-level ctrTitle
+ * placeholder could never fall back to a master-level title placeholder.
+ * Both sides of any comparison are normalized through this table, so a
+ * literal "title" vs "title" match (no alias involved) is unaffected.
+ */
+const PH_TYPE_ALIASES: Record<string, string> = {
+  ctrTitle: 'title',
+  subTitle: 'body'
+}
+
+function normalizePhType(type: string): string {
+  return PH_TYPE_ALIASES[type] ?? type
+}
+
 export interface ResolvedBox {
   wPt: number
   hPt: number
 }
 
 export interface ShapeGeom {
-  /** null = no constraint resolvable (fit engine skipped, size preserved). */
+  /**
+   * null = no constraint resolvable (fit engine skipped, size preserved).
+   * When non-null, `box` ALREADY EXCLUDES bodyPr insets on every side - it
+   * is the ready-to-measure usable text area, not the shape's raw bounding
+   * box. Do NOT subtract `insetsPt` from `box`: insets have already been
+   * removed exactly once to produce this value, and subtracting them again
+   * double-shrinks the fit area. `insetsPt` exists for positioning and
+   * diagnostics only (see below) - it is not a further input to `box`.
+   */
   box: ResolvedBox | null
-  /** Explicit run size if present, else placeholder default, else null. */
+  /**
+   * Explicit run size if present, else placeholder default, else null;
+   * scaled by `min(groupScale.sx, groupScale.sy)` when the shape sits
+   * inside a group (see `resolveFontPt`'s doc comment for why the smaller
+   * axis is used).
+   */
   fontPt: number | null
+  /**
+   * bodyPr inset amounts in pt (explicit or the OOXML default), scaled by
+   * the same `groupScale` as `box`. Reported for the adapter's own
+   * positioning/diagnostic use - e.g. recovering the shape's pre-inset
+   * source size via `box.wPt + insetsPt.l + insetsPt.r` - NEVER meant to
+   * be subtracted from `box`, which already reflects insets having been
+   * removed (see `box`'s doc comment above).
+   */
   insetsPt: { l: number; r: number; t: number; b: number }
 }
 
@@ -68,7 +112,7 @@ export function resolveShapeGeom(opts: ResolveShapeGeomOptions): ShapeGeom {
   const { shape, layoutDoc, masterDoc } = opts
   const groupScale = opts.groupScale ?? { sx: 1, sy: 1 }
 
-  const fontPt = resolveFontPt(shape)
+  const fontPt = resolveFontPt(shape, groupScale)
   const insetsPt = readInsetsPt(shape, groupScale)
 
   const ownExt = getOwnExtEmu(shape)
@@ -107,44 +151,39 @@ export function tableCellBoxes(graphicFrame: Element): ResolvedBox[][] {
 
   const tcAt = (r: number, c: number): Element | undefined => rowsTcs[r]?.[c]
 
-  // Pass 1: horizontal spans. Every grid column slot has its own <a:tc> in
-  // OOXML (continuation cells are placeholders, not omitted), so a
-  // master's gridSpan tells us exactly how many upcoming column indices in
-  // THIS row to union and how far to jump the scan - continuation cells
-  // are only ever reached by being jumped over, never as a loop head.
-  const widthPt: number[][] = Array.from({ length: numRows }, () => new Array(numCols).fill(0))
+  // Resolves any grid cell to the top-left "anchor" of whatever merge
+  // region it belongs to (itself, if unmerged). Per OOXML, only the true
+  // anchor carries gridSpan/rowSpan; every other cell covered by a merge
+  // carries just hMerge and/or vMerge with no repeated span info - so a
+  // combined horizontal+vertical merge cannot be resolved by scanning rows
+  // and columns independently (a continuation cell in row anchor+1 has no
+  // gridSpan of its own to read, even though it's still part of the
+  // horizontal span too). Walking up through vMerge first, then left
+  // through hMerge at whatever row that lands on, threads both axes
+  // correctly for pure-horizontal, pure-vertical, and combined merges
+  // alike.
+  const anchorOf = (r: number, c: number): [number, number] => {
+    let ar = r
+    while (ar > 0 && tcAt(ar, c)?.hasAttribute('vMerge')) ar -= 1
+    let ac = c
+    while (ac > 0 && tcAt(ar, ac)?.hasAttribute('hMerge')) ac -= 1
+    return [ar, ac]
+  }
+
+  const boxes: ResolvedBox[][] = Array.from({ length: numRows }, () => new Array(numCols))
   for (let r = 0; r < numRows; r++) {
-    let c = 0
-    while (c < numCols) {
-      const tc = tcAt(r, c)
-      const span = clampSpan(tc?.getAttribute('gridSpan'))
-      const unionEmu = sumRange(colWidthsEmu, c, span)
-      for (let k = 0; k < span && c + k < numCols; k++) {
-        widthPt[r][c + k] = unionEmu / EMU_PER_PT
+    for (let c = 0; c < numCols; c++) {
+      const [ar, ac] = anchorOf(r, c)
+      const anchor = tcAt(ar, ac)
+      const colSpan = clampSpan(anchor?.getAttribute('gridSpan'))
+      const rowSpan = clampSpan(anchor?.getAttribute('rowSpan'))
+      boxes[r][c] = {
+        wPt: sumRange(colWidthsEmu, ac, colSpan) / EMU_PER_PT,
+        hPt: sumRange(rowHeightsEmu, ar, rowSpan) / EMU_PER_PT
       }
-      c += span
     }
   }
-
-  // Pass 2: vertical spans, symmetric to pass 1 but scanning each column
-  // top-to-bottom using rowSpan on the master row's cell for that column.
-  const heightPt: number[][] = Array.from({ length: numRows }, () => new Array(numCols).fill(0))
-  for (let c = 0; c < numCols; c++) {
-    let r = 0
-    while (r < numRows) {
-      const tc = tcAt(r, c)
-      const span = clampSpan(tc?.getAttribute('rowSpan'))
-      const unionEmu = sumRange(rowHeightsEmu, r, span)
-      for (let k = 0; k < span && r + k < numRows; k++) {
-        heightPt[r + k][c] = unionEmu / EMU_PER_PT
-      }
-      r += span
-    }
-  }
-
-  return Array.from({ length: numRows }, (_, r) =>
-    Array.from({ length: numCols }, (_, c) => ({ wPt: widthPt[r][c], hPt: heightPt[r][c] }))
-  )
+  return boxes
 }
 
 /** { sx, sy } = ext / chExt (the group's own transform, not compounded with any ancestor). */
@@ -228,12 +267,12 @@ function findPlaceholderExtEmu(
   wantPh: Element
 ): { cx: number; cy: number } | null {
   if (!doc) return null
-  const wantType = phType(wantPh)
+  const wantType = normalizePhType(phType(wantPh))
   const wantIdx = phIdx(wantPh)
   for (const sp of elems(doc, P_NS, 'sp')) {
     const candidatePh = getPh(sp)
     if (!candidatePh) continue
-    if (phType(candidatePh) === wantType && phIdx(candidatePh) === wantIdx) {
+    if (normalizePhType(phType(candidatePh)) === wantType && phIdx(candidatePh) === wantIdx) {
       const ext = getOwnExtEmu(sp)
       if (ext) return ext
     }
@@ -263,8 +302,30 @@ function findTxBody(shape: Element): Element | undefined {
   return childElems(shape, P_NS, 'txBody')[0]
 }
 
-/** First explicit run size in document order; else the placeholder-type default; else null. */
-function resolveFontPt(shape: Element): number | null {
+/**
+ * First explicit run size in document order; else the placeholder-type
+ * default; else null - then, whichever source it came from, scaled by
+ * `min(groupScale.sx, groupScale.sy)`.
+ *
+ * Why the MINIMUM of the two axes rather than, say, the average or the
+ * larger one: unlike a box, a font size has only one degree of freedom -
+ * it cannot stretch non-uniformly the way a box's width and height can
+ * under an asymmetric group scale. Per an explicit controller ruling, the
+ * smaller axis is the conservative choice: it never reports a font size
+ * larger than what the MORE-constrained axis can actually accommodate.
+ * The fit engine only ever shrinks from whatever starting size it's
+ * handed, so underestimating here costs nothing (it just starts its
+ * search a little smaller than strictly necessary on the looser axis);
+ * overestimating could hand the fit engine a starting size that's already
+ * too big for the tighter axis, defeating the point of a starting hint.
+ */
+function resolveFontPt(shape: Element, groupScale: { sx: number; sy: number }): number | null {
+  const raw = resolveRawFontPt(shape)
+  if (raw === null) return null
+  return raw * Math.min(groupScale.sx, groupScale.sy)
+}
+
+function resolveRawFontPt(shape: Element): number | null {
   const txBody = findTxBody(shape)
   if (txBody) {
     for (const r of elems(txBody, A_NS, 'r')) {
@@ -277,7 +338,7 @@ function resolveFontPt(shape: Element): number | null {
 
   const ph = getPh(shape)
   if (ph) {
-    const fallback = PLACEHOLDER_DEFAULT_FONT_PT[phType(ph)]
+    const fallback = PLACEHOLDER_DEFAULT_FONT_PT[normalizePhType(phType(ph))]
     if (fallback !== undefined) return fallback
   }
 

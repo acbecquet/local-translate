@@ -187,6 +187,59 @@ describe('resolveShapeGeom', () => {
     expect(geom.fontPt).toBe(44)
   })
 
+  it('contract 2c: alias ctrTitle -> title lets a slide ctrTitle placeholder fall back to a master "title" p:ph', async () => {
+    const buffer = await buildPptx({
+      slides: [{ shapes: [{ kind: 'placeholder', phType: 'ctrTitle', text: ['centered title'] }] }],
+      // Layout has no ctrTitle (nor title) placeholder at all - forces the master fallback.
+      layoutPlaceholderBox: {
+        phType: 'body',
+        box: { xEmu: 0, yEmu: 0, wEmu: 1000 * EMU_PER_PT, hEmu: 1000 * EMU_PER_PT }
+      },
+      // Master only defines the generic "title", not "ctrTitle".
+      masterPlaceholderBox: {
+        phType: 'title',
+        box: { xEmu: 0, yEmu: 0, wEmu: 4000 * EMU_PER_PT, hEmu: 800 * EMU_PER_PT }
+      }
+    })
+    const archive = await openDeck(buffer)
+    const slidePath = archive.listSlidePaths()[0]
+    const { slideDoc, layoutDoc, masterDoc } = resolveDocs(archive, slidePath)
+    const shape = elems(slideDoc, P_NS, 'sp')[0]
+
+    const geom = resolveShapeGeom({ shape, slideDoc, layoutDoc, masterDoc })
+
+    expect(geom.box).not.toBeNull()
+    expect(geom.box!.wPt).toBeCloseTo(4000 - 7.2 - 7.2, 10)
+    expect(geom.box!.hPt).toBeCloseTo(800 - 3.6 - 3.6, 10)
+    // The alias also applies to the default-font lookup: ctrTitle -> title's 44pt.
+    expect(geom.fontPt).toBe(44)
+  })
+
+  it('contract 2d: alias subTitle -> body lets a slide subTitle placeholder fall back to a master "body" p:ph', async () => {
+    const buffer = await buildPptx({
+      slides: [{ shapes: [{ kind: 'placeholder', phType: 'subTitle', text: ['subtitle'] }] }],
+      layoutPlaceholderBox: {
+        phType: 'title',
+        box: { xEmu: 0, yEmu: 0, wEmu: 1000 * EMU_PER_PT, hEmu: 1000 * EMU_PER_PT }
+      },
+      masterPlaceholderBox: {
+        phType: 'body',
+        box: { xEmu: 0, yEmu: 0, wEmu: 3500 * EMU_PER_PT, hEmu: 600 * EMU_PER_PT }
+      }
+    })
+    const archive = await openDeck(buffer)
+    const slidePath = archive.listSlidePaths()[0]
+    const { slideDoc, layoutDoc, masterDoc } = resolveDocs(archive, slidePath)
+    const shape = elems(slideDoc, P_NS, 'sp')[0]
+
+    const geom = resolveShapeGeom({ shape, slideDoc, layoutDoc, masterDoc })
+
+    expect(geom.box).not.toBeNull()
+    expect(geom.box!.wPt).toBeCloseTo(3500 - 7.2 - 7.2, 10)
+    expect(geom.box!.hPt).toBeCloseTo(600 - 3.6 - 3.6, 10)
+    expect(geom.fontPt).toBe(18)
+  })
+
   it('contract 3: nested group scaling compounds across two levels', async () => {
     // Outer group: ext 400x400 over chExt 200x200 -> sx=sy=2.
     // Inner group (in outer's child space): ext 100x100 over chExt 50x50 -> sx=sy=2.
@@ -303,6 +356,121 @@ describe('resolveShapeGeom', () => {
     expect(geom.box!.hPt + geom.insetsPt.t + geom.insetsPt.b).toBeCloseTo(20 * 2, 10)
   })
 
+  it('asymmetric group scale applies sx to width and sy to height independently (catches axis transposition)', async () => {
+    // ext 400x200 over chExt 100x100 -> sx=4, sy=2 - distinct axis ratios,
+    // and a child with distinct width/height (10x30pt) so a transposed
+    // implementation (sx applied to height, sy to width) would produce a
+    // visibly different, wrong pair of numbers rather than coincidentally
+    // matching.
+    const buffer = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'group',
+              box: { xEmu: 0, yEmu: 0, wEmu: 400 * EMU_PER_PT, hEmu: 200 * EMU_PER_PT },
+              chOff: { xEmu: 0, yEmu: 0 },
+              chExt: { wEmu: 100 * EMU_PER_PT, hEmu: 100 * EMU_PER_PT },
+              children: [
+                {
+                  kind: 'textbox',
+                  text: ['x'],
+                  box: { xEmu: 0, yEmu: 0, wEmu: 10 * EMU_PER_PT, hEmu: 30 * EMU_PER_PT },
+                  insetsEmu: { l: 0, r: 0, t: 0, b: 0 }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    })
+    const archive = await openDeck(buffer)
+    const slidePath = archive.listSlidePaths()[0]
+    const { slideDoc, layoutDoc, masterDoc } = resolveDocs(archive, slidePath)
+    const group = elems(slideDoc, P_NS, 'grpSp')[0]
+    const scale = groupChildScale(group)
+    expect(scale).toEqual({ sx: 4, sy: 2 })
+
+    const leaf = elems(slideDoc, P_NS, 'sp')[0]
+    const geom = resolveShapeGeom({
+      shape: leaf,
+      slideDoc,
+      layoutDoc,
+      masterDoc,
+      groupScale: scale
+    })
+
+    expect(geom.box).toEqual({ wPt: 10 * 4, hPt: 30 * 2 })
+  })
+
+  it('fontPt is scaled by min(groupScale.sx, groupScale.sy), not either axis alone', async () => {
+    // Asymmetric 2x-by-1x group: min(2, 1) = 1, so fontPt is unscaled.
+    const asymmetric = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'group',
+              box: { xEmu: 0, yEmu: 0, wEmu: 400 * EMU_PER_PT, hEmu: 200 * EMU_PER_PT },
+              chOff: { xEmu: 0, yEmu: 0 },
+              chExt: { wEmu: 200 * EMU_PER_PT, hEmu: 200 * EMU_PER_PT },
+              children: [
+                {
+                  kind: 'textbox',
+                  text: ['x'],
+                  box: { xEmu: 0, yEmu: 0, wEmu: 100 * EMU_PER_PT, hEmu: 100 * EMU_PER_PT },
+                  fontPt: 20
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    })
+    const asymArchive = await openDeck(asymmetric)
+    const asymSlidePath = asymArchive.listSlidePaths()[0]
+    const asymDocs = resolveDocs(asymArchive, asymSlidePath)
+    const asymGroup = elems(asymDocs.slideDoc, P_NS, 'grpSp')[0]
+    const asymScale = groupChildScale(asymGroup)
+    expect(asymScale).toEqual({ sx: 2, sy: 1 })
+    const asymLeaf = elems(asymDocs.slideDoc, P_NS, 'sp')[0]
+    const asymGeom = resolveShapeGeom({ ...asymDocs, shape: asymLeaf, groupScale: asymScale })
+    expect(asymGeom.fontPt).toBe(20 * 1)
+
+    // Uniform 2x group: min(2, 2) = 2, so fontPt scales fully.
+    const uniform = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'group',
+              box: { xEmu: 0, yEmu: 0, wEmu: 400 * EMU_PER_PT, hEmu: 400 * EMU_PER_PT },
+              chOff: { xEmu: 0, yEmu: 0 },
+              chExt: { wEmu: 200 * EMU_PER_PT, hEmu: 200 * EMU_PER_PT },
+              children: [
+                {
+                  kind: 'textbox',
+                  text: ['x'],
+                  box: { xEmu: 0, yEmu: 0, wEmu: 100 * EMU_PER_PT, hEmu: 100 * EMU_PER_PT },
+                  fontPt: 20
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    })
+    const uniArchive = await openDeck(uniform)
+    const uniSlidePath = uniArchive.listSlidePaths()[0]
+    const uniDocs = resolveDocs(uniArchive, uniSlidePath)
+    const uniGroup = elems(uniDocs.slideDoc, P_NS, 'grpSp')[0]
+    const uniScale = groupChildScale(uniGroup)
+    expect(uniScale).toEqual({ sx: 2, sy: 2 })
+    const uniLeaf = elems(uniDocs.slideDoc, P_NS, 'sp')[0]
+    const uniGeom = resolveShapeGeom({ ...uniDocs, shape: uniLeaf, groupScale: uniScale })
+    expect(uniGeom.fontPt).toBe(20 * 2)
+  })
+
   it('contract 6: a shape with no own xfrm and no p:ph is unresolvable - box: null, never a guessed box', async () => {
     const buffer = await buildPptx({
       slides: [
@@ -412,6 +580,56 @@ describe('tableCellBoxes', () => {
     expect(boxes[1][2]).toEqual({ wPt: pt(colWidthsEmu[2]), hPt: pt(rowHeightsEmu[1]) })
     expect(boxes[2][1]).toEqual({ wPt: pt(colWidthsEmu[1]), hPt: pt(rowHeightsEmu[2]) })
     expect(boxes[2][2]).toEqual({ wPt: pt(colWidthsEmu[2]), hPt: pt(rowHeightsEmu[2]) })
+  })
+
+  it('contract 4b: combined horizontal+vertical merge (2x2 anchor) - every covered cell reports the identical union box', async () => {
+    // Per real OOXML markup, only the true top-left anchor carries
+    // gridSpan/rowSpan; the other 3 cells in the 2x2 block carry just
+    // hMerge and/or vMerge with no repeated span attributes - an anchor
+    // resolved independently per axis (rather than via the true 2D anchor)
+    // would miss the horizontal extent on row 1 and the vertical extent on
+    // column 1.
+    const colWidthsEmu = [1000 * EMU_PER_PT, 2000 * EMU_PER_PT]
+    const rowHeightsEmu = [500 * EMU_PER_PT, 600 * EMU_PER_PT]
+
+    const buffer = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'table',
+              box: { xEmu: 0, yEmu: 0, wEmu: 3000 * EMU_PER_PT, hEmu: 1100 * EMU_PER_PT },
+              colWidthsEmu,
+              rowHeightsEmu,
+              rows: [
+                [
+                  { text: 'anchor', gridSpan: 2, rowSpan: 2 },
+                  { text: '', hMerge: true }
+                ],
+                [
+                  { text: '', vMerge: true },
+                  { text: '', hMerge: true, vMerge: true }
+                ]
+              ]
+            }
+          ]
+        }
+      ]
+    })
+    const archive = await openDeck(buffer)
+    const doc = archive.readXml(archive.listSlidePaths()[0])
+    const graphicFrame = elems(doc, P_NS, 'graphicFrame')[0]
+
+    const boxes = tableCellBoxes(graphicFrame)
+
+    const union = {
+      wPt: (colWidthsEmu[0] + colWidthsEmu[1]) / EMU_PER_PT,
+      hPt: (rowHeightsEmu[0] + rowHeightsEmu[1]) / EMU_PER_PT
+    }
+    expect(boxes[0][0]).toEqual(union)
+    expect(boxes[0][1]).toEqual(union)
+    expect(boxes[1][0]).toEqual(union)
+    expect(boxes[1][1]).toEqual(union)
   })
 
   it('returns [] for a graphicFrame with no a:tbl', async () => {
