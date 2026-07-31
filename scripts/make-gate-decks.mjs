@@ -44,26 +44,40 @@ async function write(name, buffer) {
 // gate reviewer can visually confirm the rendered text is genuinely bigger
 // in the 2x group and smaller in the 0.5x group, both before and after
 // translation (the group-scale font math is geometry.ts's resolveFontPt).
+// Three labeled blocks, top to bottom: an UNGROUPED 18pt reference, a group
+// whose XML transform is verifiably 2x (ext = 2 x chExt), and a group at
+// 0.5x. Every block uses 18pt nominal text and the same sample sentence, so
+// one glance answers the empirical question: if all three sentences render
+// the same height, PowerPoint ignores group scale for text (and our
+// min(sx,sy) fontPt scaling must be removed); if the middle one is twice as
+// tall and the bottom one half, PowerPoint applies it (and our model is
+// right). The sample sentence is long enough to wrap, which also reveals
+// each box's effective WIDTH without needing visible borders.
+const SAMPLE = 'The quick brown fox jumps over the lazy dog 0123456789.'
 async function buildScaledGroup() {
   return buildPptx({
     slides: [
       {
         shapes: [
           {
+            kind: 'textbox',
+            name: 'Ungrouped Reference',
+            text: ['A: UNGROUPED REFERENCE (18pt nominal)', SAMPLE],
+            box: { xEmu: pt(40), yEmu: pt(30), wEmu: pt(300), hEmu: pt(90) },
+            fontPt: 18
+          },
+          {
             kind: 'group',
             name: 'Scaled 2x Group',
-            box: { xEmu: pt(50), yEmu: pt(50), wEmu: pt(400), hEmu: pt(150) },
+            box: { xEmu: pt(40), yEmu: pt(140), wEmu: pt(600), hEmu: pt(180) },
             chOff: { xEmu: 0, yEmu: 0 },
-            chExt: { wEmu: pt(200), hEmu: pt(75) },
+            chExt: { wEmu: pt(300), hEmu: pt(90) },
             children: [
               {
                 kind: 'textbox',
                 name: 'Scaled 2x Text',
-                text: [
-                  'This text sits inside a group scaled 2x.',
-                  'It should render noticeably larger.'
-                ],
-                box: { xEmu: 0, yEmu: 0, wEmu: pt(200), hEmu: pt(75) },
+                text: ['B: GROUP SCALED 2x (18pt nominal)', SAMPLE],
+                box: { xEmu: 0, yEmu: 0, wEmu: pt(300), hEmu: pt(90) },
                 fontPt: 18
               }
             ]
@@ -71,21 +85,28 @@ async function buildScaledGroup() {
           {
             kind: 'group',
             name: 'Scaled 0.5x Group',
-            box: { xEmu: pt(50), yEmu: pt(230), wEmu: pt(200), hEmu: pt(75) },
+            box: { xEmu: pt(40), yEmu: pt(350), wEmu: pt(150), hEmu: pt(45) },
             chOff: { xEmu: 0, yEmu: 0 },
-            chExt: { wEmu: pt(400), hEmu: pt(150) },
+            chExt: { wEmu: pt(300), hEmu: pt(90) },
             children: [
               {
                 kind: 'textbox',
                 name: 'Scaled 0.5x Text',
-                text: [
-                  'This text sits inside a group scaled 0.5x.',
-                  'It should render noticeably smaller.'
-                ],
-                box: { xEmu: 0, yEmu: 0, wEmu: pt(400), hEmu: pt(150) },
+                text: ['C: GROUP SCALED 0.5x (18pt nominal)', SAMPLE],
+                box: { xEmu: 0, yEmu: 0, wEmu: pt(300), hEmu: pt(90) },
                 fontPt: 18
               }
             ]
+          },
+          {
+            kind: 'textbox',
+            name: 'Instructions',
+            text: [
+              'QUESTION: Is the sentence in B taller than A, and in C shorter than A?',
+              'Same height everywhere = PowerPoint ignores group scale for text.'
+            ],
+            box: { xEmu: pt(40), yEmu: pt(430), wEmu: pt(600), hEmu: pt(70) },
+            fontPt: 12
           }
         ]
       }
