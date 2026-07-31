@@ -5,6 +5,15 @@ directories:
 files:
   - out/**
   - package.json
+# Bundled fonts (src/core/fit/fonts.ts's registerBundledFonts): shipped as
+# loose extraResources, NOT via `files` (which would bundle them inside
+# app.asar) - resolveFontsDir() in fonts.ts checks process.resourcesPath
+# first, which is where extraResources land (a sibling of app.asar, not a
+# child of it), falling back to the dev/CLI findAppRoot()-based path when
+# packaged resources aren't present (see that function's own doc comment).
+extraResources:
+  - from: fonts
+    to: fonts
 win:
   target: nsis
 nsis:

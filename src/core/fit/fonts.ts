@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url'
  * runs from its original source path (tsx, vitest) or bundled to any other
  * depth, since it never assumes a specific starting depth.
  */
-function findAppRoot(startDir: string): string {
+export function findAppRoot(startDir: string): string {
   let dir = startDir
   for (;;) {
     if (existsSync(path.join(dir, 'package.json'))) return dir
@@ -33,7 +33,50 @@ function findAppRoot(startDir: string): string {
   }
 }
 
-const FONTS_DIR = path.join(findAppRoot(path.dirname(fileURLToPath(import.meta.url))), 'fonts')
+/**
+ * Resolves the directory holding the bundled font files, preferring the
+ * packaged app's extraResources fonts folder over the dev-mode findAppRoot()
+ * walk:
+ *
+ * 1. `<resourcesPath>/fonts` - electron-builder.yml ships repo-root fonts/**
+ *    to `resources/fonts` via extraResources, which lands as a SIBLING of
+ *    the packaged app root (app.asar or its unpacked equivalent), not a
+ *    child of it - findAppRoot's own package.json walk stops one level too
+ *    deep to ever see it, so it has to be tried explicitly. Only trusted
+ *    when it actually exists on disk: in `electron-vite dev`, Electron sets
+ *    `resourcesPath` to its OWN bundled resources folder (inside
+ *    node_modules/electron), which has no `fonts/` of ours, so this probe
+ *    correctly fails there and falls through to (2) - same for every
+ *    non-Electron run (`resourcesPath` is undefined outside Electron).
+ * 2. `findAppRoot(moduleDir)/fonts` - the repo-root fonts/ directory,
+ *    correct for dev (electron-vite dev), the CLI (always run from source
+ *    via tsx, never packaged), and tests. Unchanged from before this
+ *    function existed - this is the sole behavior for every environment
+ *    that isn't a packaged Electron build.
+ *
+ * `resourcesPath` is Electron's `process.resourcesPath` - read by the one
+ * call site below via the bare `process` global (no `electron` import), so
+ * this stays true to src/core's Electron-free rule while still resolving
+ * correctly once packaged. `exists` is injected (default `fs.existsSync`) so
+ * this is testable against a faked resources layout without touching
+ * Electron or leaving the temp fixture behind.
+ */
+export function resolveFontsDir(
+  moduleDir: string,
+  resourcesPath: string | undefined,
+  exists: (p: string) => boolean = existsSync
+): string {
+  if (resourcesPath) {
+    const packaged = path.join(resourcesPath, 'fonts')
+    if (exists(packaged)) return packaged
+  }
+  return path.join(findAppRoot(moduleDir), 'fonts')
+}
+
+const FONTS_DIR = resolveFontsDir(
+  path.dirname(fileURLToPath(import.meta.url)),
+  process.resourcesPath
+)
 let registered = false
 const knownFamilies = new Set<string>()
 

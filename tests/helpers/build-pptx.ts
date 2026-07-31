@@ -128,6 +128,22 @@ export interface ChartShapeSpec {
   name?: string
 }
 
+/**
+ * A minimal OLE object graphicFrame: `a:graphicData` with the PresentationML
+ * ole URI, wrapping a bare `p:oleObj`/`p:embed` (no real embedded binary or
+ * relationship - the adapter never reads past the graphicData `uri`, so a
+ * structurally-valid-but-empty placeholder is enough). Unlike 'chart' this
+ * owns no separate part of its own: the whole graphicFrame lives inline in
+ * the slide XML, exactly like real PowerPoint's linked/embedded OLE objects
+ * whose only OTHER part is the embedded binary itself (out of scope here -
+ * nothing in this codebase ever reads it).
+ */
+export interface OleShapeSpec {
+  kind: 'ole'
+  box: EmuBox
+  name?: string
+}
+
 /** A minimal SmartArt (DrawingML diagram) graphicFrame: a `dgm:relIds`-referenced `ppt/diagrams/dataN.xml` data model with one `dgm:pt`/`dgm:t` per entry in `points`. */
 export interface SmartArtShapeSpec {
   kind: 'smartart'
@@ -151,6 +167,7 @@ export type ShapeSpec =
   | GroupShapeSpec
   | PictureShapeSpec
   | ChartShapeSpec
+  | OleShapeSpec
   | SmartArtShapeSpec
 
 export interface SlideSpec {
@@ -419,6 +436,19 @@ function buildShapeXml(
         `<a:ext cx="${shape.box.wEmu}" cy="${shape.box.hEmu}"/></p:xfrm>` +
         '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">' +
         `<c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="${R_NS}" r:id="${rId}"/>` +
+        '</a:graphicData></a:graphic></p:graphicFrame>'
+      )
+    }
+    case 'ole': {
+      const name = shape.name ?? `OLE Object ${ordinal}`
+      return (
+        `<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="${id}" name="${escAttr(name)}"/>` +
+        '<p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr>' +
+        `<p:xfrm><a:off x="${shape.box.xEmu}" y="${shape.box.yEmu}"/>` +
+        `<a:ext cx="${shape.box.wEmu}" cy="${shape.box.hEmu}"/></p:xfrm>` +
+        '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/presentationml/2006/ole">' +
+        `<p:oleObj name="Embedded Object" showAsIcon="0" imgW="${shape.box.wEmu}" imgH="${shape.box.hEmu}">` +
+        '<p:embed/></p:oleObj>' +
         '</a:graphicData></a:graphic></p:graphicFrame>'
       )
     }

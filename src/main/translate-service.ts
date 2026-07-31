@@ -16,6 +16,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { adapterFor, type FormatAdapter } from '../core/adapters/adapter'
 import { ADAPTERS } from '../core/adapters/registry'
+import { DEFAULT_MODEL } from '../core/defaults'
 import { runPipeline as realRunPipeline, type PipelineOpts, type RunReport } from '../core/pipeline'
 import type { TranslationBackend } from '../core/translate/backend'
 import {
@@ -30,14 +31,11 @@ import type {
   TranslateStateEvent
 } from '../shared/ipc-contract'
 
-/**
- * Default translation model. Duplicated from src/core/cli.ts's own
- * DEFAULT_MODEL (rather than imported) so the Electron main process doesn't
- * pull in cli.ts - a process-entry module with its own argv parsing and
- * process.exit() branch that has no business being reachable from here.
- * Keep in sync with cli.ts's DEFAULT_MODEL if that default ever changes.
- */
-export const DEFAULT_MODEL = 'gemma4:e4b'
+// Re-exported (not just used internally) because tests/main/translate-service.test.ts
+// and other main-process callers import DEFAULT_MODEL from this module, not
+// from src/core/defaults directly - see defaults.ts for the single source of
+// truth this and src/core/cli.ts both now import instead of duplicating.
+export { DEFAULT_MODEL }
 
 /**
  * Where the app keeps its Ollama pid file, model-caps cache, and (for a

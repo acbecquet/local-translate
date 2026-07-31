@@ -208,6 +208,31 @@ describe('PptxAdapter.extract', () => {
     expect(body.groupKey).toBe('slide1')
   })
 
+  it('a placeholder shape with no box anywhere in slide/layout/master resolves geometry.box: null and gets SENTINEL_BOX (never a fabricated zero box)', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [{ kind: 'placeholder', phType: 'body', text: ['Unplaced body text'] }]
+        }
+      ]
+      // Deliberately no layoutPlaceholderBox/masterPlaceholderBox for "body":
+      // a placeholder <p:sp> never emits its own <a:xfrm> (see buildShapeXml's
+      // 'placeholder' case), so with nothing to inherit from either,
+      // resolveShapeGeom has no ext at all to compute a box from.
+    })
+
+    const segments = await new PptxAdapter().extract(srcPath)
+    expect(segments).toHaveLength(1)
+    const [s] = segments
+    expect(s.kind).toBe('shape')
+    // Sentinel: large enough that fit() will never need to shrink from
+    // whatever size this segment starts at - same convention as the notes
+    // and ragged-table-cell sentinel cases above, exercised here for the
+    // handleSp box:null branch specifically.
+    expect(s.box.wPt).toBeGreaterThan(100_000)
+    expect(s.box.hPt).toBeGreaterThan(100_000)
+  })
+
   it('a 3x3 table with a combined merge emits a segment only for the merge anchor cell, addressed r<R>c<C> (1-based)', async () => {
     const srcPath = await writeDeck({
       slides: [
@@ -579,6 +604,29 @@ describe('PptxAdapter.extract', () => {
     expect(warnMessages[0]).toMatch(/chart/)
   })
 
+  it('an OLE object graphicFrame contributes zero segments (skip path) and logs one warning', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Real text'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 1000, hEmu: 500 }
+            },
+            { kind: 'ole', box: { xEmu: 0, yEmu: 600, wEmu: 400, hEmu: 400 } }
+          ]
+        }
+      ]
+    })
+
+    const segments = await new PptxAdapter().extract(srcPath)
+    expect(segments).toHaveLength(1)
+    expect(segments[0].text).toBe('Real text')
+    expect(warnMessages).toHaveLength(1)
+    expect(warnMessages[0]).toMatch(/OLE/)
+  })
+
   it('a WordArt textbox is skipped (extract-and-report-only path) and never returned as a segment', async () => {
     const srcPath = await writeDeck({
       slides: [
@@ -853,6 +901,31 @@ describe('PptxAdapter.collectSkips', () => {
     // record a second time: extract() already reported it once.
     expect(warnMessages).toHaveLength(1)
     expect(adapter.collectSkips!()).toHaveLength(1)
+  })
+
+  it('records an OLE object skip', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Real text'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 1000, hEmu: 500 }
+            },
+            { kind: 'ole', box: { xEmu: 0, yEmu: 900, wEmu: 400, hEmu: 400 } }
+          ]
+        }
+      ]
+    })
+
+    const adapter = new PptxAdapter()
+    await adapter.extract(srcPath)
+
+    const skips = adapter.collectSkips!()
+    expect(skips).toHaveLength(1)
+    expect(skips[0].id).toContain('slide1')
+    expect(skips[0].reason).toMatch(/OLE/)
   })
 })
 
@@ -2093,6 +2166,65 @@ describe('PptxAdapter round-trip', () => {
 
     const integrity = await checkPptxIntegrity(outBuffer)
     expect(integrity.ok).toBe(true)
+  })
+
+  it('OLE object graphicFrame (skip path): a slide containing only an OLE object is extracted as zero segments, reported by collectSkips, and left byte-identical by apply', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [{ kind: 'ole', box: { xEmu: 0, yEmu: 0, wEmu: 800, hEmu: 800 } }]
+        }
+      ]
+    })
+
+    const srcBuffer = await readFile(srcPath)
+    const srcDigests = await digestParts(srcBuffer)
+
+    const adapter = new PptxAdapter()
+    const segments = await adapter.extract(srcPath)
+    expect(segments).toHaveLength(0)
+    expect(adapter.collectSkips!()).toHaveLength(1)
+    expect(adapter.collectSkips!()[0].reason).toMatch(/OLE/)
+
+    const outPath = path.join(path.dirname(srcPath), 'out.pptx')
+    await adapter.apply(srcPath, outPath, [])
+
+    const outBuffer = await readFile(outPath)
+    const outDigests = await digestParts(outBuffer)
+    expect(outDigests.get('ppt/slides/slide1.xml')).toBe(srcDigests.get('ppt/slides/slide1.xml'))
+
+    const integrity = await checkPptxIntegrity(outBuffer)
+    expect(integrity.ok).toBe(true)
+  })
+
+  it('a placeholder shape resolving to box: null (SENTINEL_BOX) has its font size preserved verbatim through apply, even as its text changes', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [{ kind: 'placeholder', phType: 'body', text: ['Unplaced body text'] }]
+        }
+      ]
+    })
+    const adapter = new PptxAdapter()
+    const [seg] = await adapter.extract(srcPath)
+    expect(seg.box.wPt).toBeGreaterThan(100_000) // SENTINEL_BOX (see the dedicated extract-level test above)
+    expect(seg.font.sizePt).toBe(18) // PLACEHOLDER_DEFAULT_FONT_PT['body']
+
+    // SENTINEL_BOX guarantees fit() never needs to shrink from the starting
+    // size, so fittedSizePt === font.sizePt here is exactly what the real
+    // pipeline would hand back for this segment, not a test-only shortcut.
+    const translated = makeTranslated(seg, { translation: 'Texte de corps non place' })
+    const outPath = path.join(path.dirname(srcPath), 'out.pptx')
+    await adapter.apply(srcPath, outPath, [translated])
+
+    const archive = await openPptx(outPath)
+    const doc = archive.readXml(archive.listSlidePaths()[0])
+    const run = elems(doc, A_NS, 'r')[0]
+    expect(elems(run, A_NS, 't')[0].textContent).toBe('Texte de corps non place')
+    // Verbatim: no sz attribute written at all - matches the "never touches
+    // sz when the fitted size equals the segment font size" convention
+    // exercised elsewhere for a normal (non-sentinel) box.
+    expect(elems(run, A_NS, 'rPr')[0].hasAttribute('sz')).toBe(false)
   })
 
   it('a deck spanning every scenario at once: every segment accounted for, nothing lost, nothing duplicated', async () => {
