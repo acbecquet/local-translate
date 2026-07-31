@@ -102,7 +102,17 @@ export async function ensureOllama(opts: {
   const { command, args } = resolveSpawnCommand(exePath)
 
   const spawnOptions: SpawnOptions = {
-    env: { ...process.env, OLLAMA_HOST: `127.0.0.1:${port}`, OLLAMA_MODELS: modelsDir },
+    env: {
+      ...process.env,
+      OLLAMA_HOST: `127.0.0.1:${port}`,
+      OLLAMA_MODELS: modelsDir,
+      // Our backend serializes requests (one group call at a time), so a
+      // single scheduler slot is correct - Ollama's default of 4 parallel
+      // slots quadruples the KV-cache VRAM for zero benefit and caused a
+      // real ~1 GB allocation failure on Charlie's 16 GB card (2026-07-30).
+      OLLAMA_NUM_PARALLEL: '1',
+      OLLAMA_MAX_LOADED_MODELS: '1'
+    },
     windowsHide: true,
     // stdin is piped (never written to, never closed by us) rather than
     // detached or fully ignored: if this app process dies unexpectedly
