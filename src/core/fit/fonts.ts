@@ -75,7 +75,12 @@ export function resolveFontsDir(
 
 const FONTS_DIR = resolveFontsDir(
   path.dirname(fileURLToPath(import.meta.url)),
-  process.resourcesPath
+  // Cast, not the ambient electron.d.ts type: that augmentation only reaches
+  // this file while something in the same TS program imports 'electron', and
+  // it also declares resourcesPath always-present when it is genuinely
+  // undefined outside Electron (CLI via tsx, vitest). The local optional type
+  // keeps src/core's typecheck self-sufficient and honest about undefined.
+  (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath
 )
 let registered = false
 const knownFamilies = new Set<string>()
