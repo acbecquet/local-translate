@@ -104,6 +104,24 @@ function assertUniqueIds(segments: TextSegment[]): void {
 }
 
 /**
+ * The prompt-facing "what is this batch" string for a group. When every
+ * segment in the group shares a `groupKey` (an adapter set one - see
+ * TextSegment.groupKey), the groupKey alone doesn't tell the model what
+ * KINDS of text it's translating (a slide can batch a title, a body, and a
+ * table cell together), so this folds in the sorted set of distinct roles
+ * too: "slide3: body, slide title, table cell". Without a groupKey,
+ * groupSegments (batching.ts) already grouped purely by `context`, so every
+ * segment in the group shares the identical context string - falling back
+ * to that single value, unchanged from the pre-groupKey behavior.
+ */
+function deriveGroupContext(group: TextSegment[]): string {
+  const groupKey = group[0].groupKey
+  if (!groupKey) return group[0].context
+  const roles = [...new Set(group.map((s) => s.context))].sort()
+  return `${groupKey}: ${roles.join(', ')}`
+}
+
+/**
  * Groups translatable segments and calls the backend once per group.
  * Untranslatable segments (dropped by groupSegments) are recorded in
  * `keptOriginal` up front and never reach the backend. Any segment that
@@ -140,7 +158,7 @@ async function translateSegments(
       model: opts.model,
       sourceLang: opts.sourceLang,
       targetLang: opts.targetLang,
-      groupContext: group[0].context,
+      groupContext: deriveGroupContext(group),
       segments: group.map((s) => ({ id: s.id, text: s.text }))
     })
 

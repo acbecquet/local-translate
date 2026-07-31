@@ -276,6 +276,50 @@ describe('runPipeline', () => {
     expect(applied.segments.map((s) => s.id).sort()).toEqual(['s1', 's2', 's3', 's4'])
   })
 
+  it('groupContext derivation: with a groupKey, the backend receives "<groupKey>: <sorted unique roles>"; without one, it falls back to the sole context', async () => {
+    const withGroupKey1 = seg({
+      id: 's1',
+      text: 'Hello',
+      context: 'slide title',
+      groupKey: 'slide3'
+    })
+    const withGroupKey2 = seg({ id: 's2', text: 'World', context: 'body', groupKey: 'slide3' })
+    const withGroupKey3 = seg({
+      id: 's3',
+      text: 'Again',
+      context: 'table cell',
+      groupKey: 'slide3'
+    })
+    const noGroupKey = seg({ id: 's4', text: 'Plain', context: 'doc' })
+    const { file } = writeFixture([withGroupKey1, withGroupKey2, withGroupKey3, noGroupKey])
+
+    const translateBatch = vi.fn(async (req: BatchRequest) => ({
+      translations: req.segments.map((s) => ({ id: s.id, translation: `[${s.text}]` }))
+    }))
+    const backend: TranslationBackend = {
+      listModels: vi.fn().mockResolvedValue([]),
+      pullModel: vi.fn().mockResolvedValue(undefined),
+      translateBatch
+    }
+
+    await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    // groupSegments (batching.ts) groups by groupKey when present, so s1-s3
+    // (same groupKey, different context/role each) land in one call; s4 (no
+    // groupKey) is grouped by its own context and lands in a separate call.
+    expect(translateBatch).toHaveBeenCalledTimes(2)
+    const groupContexts = translateBatch.mock.calls.map((c) => c[0].groupContext)
+    expect(groupContexts).toContain('slide3: body, slide title, table cell')
+    expect(groupContexts).toContain('doc')
+  })
+
   it('respects an explicit out path instead of the default', async () => {
     const s1 = seg({ id: 's1', text: 'Hello', context: 'doc' })
     const { file, dir } = writeFixture([s1])
