@@ -81,10 +81,14 @@ export interface ShapeGeom {
    */
   box: ResolvedBox | null
   /**
-   * Explicit run size if present, else placeholder default, else null;
-   * scaled by `min(groupScale.sx, groupScale.sy)` when the shape sits
-   * inside a group (see `resolveFontPt`'s doc comment for why the smaller
-   * axis is used).
+   * Explicit run size if present, else placeholder default, else null.
+   * Deliberately NOT scaled by `groupScale`: PowerPoint applies group
+   * transforms to child shape GEOMETRY but renders text at its nominal
+   * point size (verified empirically 2026-07-31 on a deck with real 2x
+   * and 0.5x XML transforms - glyphs rendered identical to an ungrouped
+   * 18pt reference while boxes scaled). The fit engine therefore measures
+   * nominal-size text against the SCALED box, which is exactly what
+   * PowerPoint will render.
    */
   fontPt: number | null
   /**
@@ -112,7 +116,7 @@ export function resolveShapeGeom(opts: ResolveShapeGeomOptions): ShapeGeom {
   const { shape, layoutDoc, masterDoc } = opts
   const groupScale = opts.groupScale ?? { sx: 1, sy: 1 }
 
-  const fontPt = resolveFontPt(shape, groupScale)
+  const fontPt = resolveFontPt(shape)
   const insetsPt = readInsetsPt(shape, groupScale)
 
   const ownExt = getOwnExtEmu(shape)
@@ -336,25 +340,14 @@ function findTxBody(shape: Element): Element | undefined {
 
 /**
  * First explicit run size in document order; else the placeholder-type
- * default; else null - then, whichever source it came from, scaled by
- * `min(groupScale.sx, groupScale.sy)`.
- *
- * Why the MINIMUM of the two axes rather than, say, the average or the
- * larger one: unlike a box, a font size has only one degree of freedom -
- * it cannot stretch non-uniformly the way a box's width and height can
- * under an asymmetric group scale. Per an explicit controller ruling, the
- * smaller axis is the conservative choice: it never reports a font size
- * larger than what the MORE-constrained axis can actually accommodate.
- * The fit engine only ever shrinks from whatever starting size it's
- * handed, so underestimating here costs nothing (it just starts its
- * search a little smaller than strictly necessary on the looser axis);
- * overestimating could hand the fit engine a starting size that's already
- * too big for the tighter axis, defeating the point of a starting hint.
+ * default; else null. NO group scaling is applied: PowerPoint renders
+ * grouped text at nominal point size even when the group's XML transform
+ * scales the child geometry (empirically verified 2026-07-31; supersedes
+ * the earlier min(sx,sy) controller ruling, which predated the evidence).
+ * See ShapeGeom.fontPt's doc comment for the full rendering-model note.
  */
-function resolveFontPt(shape: Element, groupScale: { sx: number; sy: number }): number | null {
-  const raw = resolveRawFontPt(shape)
-  if (raw === null) return null
-  return raw * Math.min(groupScale.sx, groupScale.sy)
+function resolveFontPt(shape: Element): number | null {
+  return resolveRawFontPt(shape)
 }
 
 function resolveRawFontPt(shape: Element): number | null {

@@ -101,11 +101,16 @@ async function buildScaledGroup() {
           {
             kind: 'textbox',
             name: 'Instructions',
+            // Right column, clear of C's expected overflow spill (C's text
+            // renders at nominal size inside a half-height box, so it WILL
+            // overflow downward - that overflow is itself part of the
+            // empirical record).
             text: [
-              'QUESTION: Is the sentence in B taller than A, and in C shorter than A?',
-              'Same height everywhere = PowerPoint ignores group scale for text.'
+              'ANSWERED 2026-07-31: all three sentences render the same',
+              'height; B fits one line (box 2x wide), C wraps narrow.',
+              'Conclusion: PowerPoint scales geometry, NOT text glyphs.'
             ],
-            box: { xEmu: pt(40), yEmu: pt(430), wEmu: pt(600), hEmu: pt(70) },
+            box: { xEmu: pt(360), yEmu: pt(350), wEmu: pt(320), hEmu: pt(120) },
             fontPt: 12
           }
         ]

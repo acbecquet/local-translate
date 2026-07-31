@@ -403,8 +403,8 @@ describe('resolveShapeGeom', () => {
     expect(geom.box).toEqual({ wPt: 10 * 4, hPt: 30 * 2 })
   })
 
-  it('fontPt is scaled by min(groupScale.sx, groupScale.sy), not either axis alone', async () => {
-    // Asymmetric 2x-by-1x group: min(2, 1) = 1, so fontPt is unscaled.
+  it('fontPt stays at NOMINAL size regardless of group scale (PowerPoint renders grouped text unscaled - verified empirically 2026-07-31)', async () => {
+    // Asymmetric 2x-by-1x group: fontPt must be the raw run size.
     const asymmetric = await buildPptx({
       slides: [
         {
@@ -435,9 +435,10 @@ describe('resolveShapeGeom', () => {
     expect(asymScale).toEqual({ sx: 2, sy: 1 })
     const asymLeaf = elems(asymDocs.slideDoc, P_NS, 'sp')[0]
     const asymGeom = resolveShapeGeom({ ...asymDocs, shape: asymLeaf, groupScale: asymScale })
-    expect(asymGeom.fontPt).toBe(20 * 1)
+    expect(asymGeom.fontPt).toBe(20)
 
-    // Uniform 2x group: min(2, 2) = 2, so fontPt scales fully.
+    // Uniform 2x group: fontPt must STILL be the raw run size (PowerPoint
+    // scales the child geometry, not the text glyphs).
     const uniform = await buildPptx({
       slides: [
         {
@@ -468,7 +469,7 @@ describe('resolveShapeGeom', () => {
     expect(uniScale).toEqual({ sx: 2, sy: 2 })
     const uniLeaf = elems(uniDocs.slideDoc, P_NS, 'sp')[0]
     const uniGeom = resolveShapeGeom({ ...uniDocs, shape: uniLeaf, groupScale: uniScale })
-    expect(uniGeom.fontPt).toBe(20 * 2)
+    expect(uniGeom.fontPt).toBe(20)
   })
 
   it('contract 6: a shape with no own xfrm and no p:ph is unresolvable - box: null, never a guessed box', async () => {

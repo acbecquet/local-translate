@@ -486,7 +486,7 @@ function handleTable(
         text,
         font: {
           family: font?.family ?? DEFAULT_FALLBACK_FONT_FAMILY,
-          sizePt: resolveExplicitSizePt(txBody, groupScale) ?? DEFAULT_FALLBACK_FONT_PT,
+          sizePt: resolveExplicitSizePt(txBody) ?? DEFAULT_FALLBACK_FONT_PT,
           bold: font?.bold ?? false,
           italic: font?.italic ?? false
         },
@@ -564,7 +564,7 @@ function handleSmartArt(
       text,
       font: {
         family: font?.family ?? DEFAULT_FALLBACK_FONT_FAMILY,
-        sizePt: resolveExplicitSizePt(t, groupScale) ?? DEFAULT_FALLBACK_FONT_PT,
+        sizePt: resolveExplicitSizePt(t) ?? DEFAULT_FALLBACK_FONT_PT,
         bold: font?.bold ?? false,
         italic: font?.italic ?? false
       },
@@ -638,7 +638,7 @@ function handleNotes(ctx: WalkCtx): void {
       text,
       font: {
         family: font?.family ?? DEFAULT_FALLBACK_FONT_FAMILY,
-        sizePt: resolveExplicitSizePt(txBody, { sx: 1, sy: 1 }) ?? DEFAULT_FALLBACK_FONT_PT,
+        sizePt: resolveExplicitSizePt(txBody) ?? DEFAULT_FALLBACK_FONT_PT,
         bold: font?.bold ?? false,
         italic: font?.italic ?? false
       },
@@ -1108,18 +1108,16 @@ function isWordArt(bodyEl: Element): boolean {
  * geometry.ts's resolveRawFontPt run-scan for the "sp" case, reimplemented
  * here because that function only resolves shapes whose element is itself
  * `p:sp` - table cells, notes, and SmartArt data points are never that, so
- * resolveShapeGeom can't be asked about them directly), scaled by
- * `min(groupScale.sx, groupScale.sy)` exactly as resolveFontPt documents.
+ * resolveShapeGeom can't be asked about them directly). NOT group-scaled:
+ * PowerPoint renders grouped text at nominal point size (see
+ * geometry.ts resolveFontPt's rendering-model note, verified 2026-07-31).
  * No placeholder-type default fallback here: `p:ph` only exists on shapes.
  */
-function resolveExplicitSizePt(
-  bodyEl: Element,
-  groupScale: { sx: number; sy: number }
-): number | null {
+function resolveExplicitSizePt(bodyEl: Element): number | null {
   for (const r of elems(bodyEl, A_NS, 'r')) {
     const rPr = childElems(r, A_NS, 'rPr')[0]
     if (rPr?.hasAttribute('sz')) {
-      return (Number(rPr.getAttribute('sz')) / 100) * Math.min(groupScale.sx, groupScale.sy)
+      return Number(rPr.getAttribute('sz')) / 100
     }
   }
   return null

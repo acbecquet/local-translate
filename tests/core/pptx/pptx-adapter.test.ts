@@ -366,7 +366,9 @@ describe('PptxAdapter.extract', () => {
     // Zero insets isolate pure scaling: 10pt * 4 = 40pt, then WRAP_SAFETY on width.
     expect(s.box.wPt).toBeCloseTo(40 * 0.96, 6)
     expect(s.box.hPt).toBeCloseTo(40, 6)
-    expect(s.font.sizePt).toBe(10 * 4)
+    // Font stays NOMINAL under group scale (PowerPoint scales geometry, not
+    // text glyphs - empirically verified 2026-07-31).
+    expect(s.font.sizePt).toBe(10)
   })
 
   it('a table nested one level inside an asymmetrically-scaled group has its cell box scaled by groupScale exactly once (tableCellBoxes is scale-naive; handleTable multiplies externally)', async () => {
