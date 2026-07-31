@@ -30,6 +30,17 @@ const PHASES = {
       { name: 'translated-en-zh.fake.json', source: 'English', target: 'Chinese (Simplified)' },
       { name: 'translated-zh-en.fake.json', source: 'Chinese (Simplified)', target: 'English' }
     ]
+  },
+  // Phase 2 gate: Charlie's real mixed-language benchmark deck, both target
+  // languages, champion model. This is a deliberate GPU run (Charlie-run per
+  // machine rules): expect several minutes per direction.
+  'phase-2': {
+    original: 'fixtures/real/CCELL 3.0 AIO Lab Test Updates Mandarin.pptx',
+    model: 'gemma4:e4b',
+    runs: [
+      { name: 'CCELL-3.0-AIO-english.pptx', source: 'Chinese (Simplified)', target: 'English' },
+      { name: 'CCELL-3.0-AIO-mandarin.pptx', source: 'English', target: 'Chinese (Simplified)' }
+    ]
   }
 }
 
@@ -54,7 +65,7 @@ const rows = []
 for (const run of def.runs) {
   const outFile = path.join('EVIDENCE', phase, run.name)
   if (!reportOnly) {
-    const cmd = `npx tsx src/core/cli.ts ${def.original} "${run.source}" "${run.target}" --model ${def.model} --out ${outFile}`
+    const cmd = `npx tsx src/core/cli.ts "${def.original}" "${run.source}" "${run.target}" --model ${def.model} --out "${outFile}"`
     process.stdout.write(`[evidence] ${cmd}\n`)
     execSync(`${cmd} 2>&1`, {
       cwd: root,
@@ -96,7 +107,11 @@ writeFileSync(
     '',
     ...rows.map((r) => `- [${r.name}](${r.name}) - ${r.source} -> ${r.target}, translated locally`),
     '',
-    ...rows.flatMap((r) => [`## Fit proof: ${r.name}`, '', ...fitTable(r.name), '']),
+    // Fit tables introspect the .fake.json artifact shape; pptx evidence is
+    // judged by opening the decks side by side (that IS the artifact).
+    ...rows
+      .filter((r) => r.name.endsWith('.fake.json'))
+      .flatMap((r) => [`## Fit proof: ${r.name}`, '', ...fitTable(r.name), '']),
     `Regenerate: \`node scripts/capture-evidence.mjs ${phase}\` (or \`--report-only\` to rebuild this README without re-translating).`,
     ''
   ].join('\n')
