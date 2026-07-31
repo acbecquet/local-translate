@@ -30,6 +30,7 @@ const FAKE_REPORT: RunReport = {
   translated: 1,
   keptOriginal: [],
   overflowed: [],
+  skippedUnsupported: [],
   durationMs: 5
 }
 

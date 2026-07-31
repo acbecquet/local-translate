@@ -19,6 +19,8 @@ export interface RunReport {
   translated: number
   keptOriginal: { id: string; reason: string }[]
   overflowed: { id: string; fontSizePt: number }[]
+  /** Unsupported-but-present content the adapter skipped entirely (never a segment, never touched on apply) - e.g. a chart, WordArt, or an unresolvable SmartArt part. Populated from the adapter's optional `collectSkips()` (adapter.ts); `[]` for an adapter that never implements it. */
+  skippedUnsupported: { id: string; reason: string }[]
   durationMs: number
 }
 
@@ -59,6 +61,12 @@ export async function runPipeline(opts: PipelineOpts): Promise<RunReport> {
   assertUniqueIds(segments)
   const total = segments.length
   opts.onProgress?.(total, total, 'extract')
+  // Read immediately after extract() - the adapter contract documents
+  // collectSkips() as reporting the MOST RECENT extract() call's skips, and
+  // apply() below reruns the adapter's own internal walk again (for a
+  // different purpose: relocating nodes to write into), which must not be
+  // mistaken for a second round of skips.
+  const skippedUnsupported = opts.adapter.collectSkips?.() ?? []
 
   const { translationById, keptOriginal } = await translateSegments(opts, segments)
 
@@ -78,6 +86,7 @@ export async function runPipeline(opts: PipelineOpts): Promise<RunReport> {
     translated: total - keptOriginal.length,
     keptOriginal,
     overflowed,
+    skippedUnsupported,
     durationMs: Date.now() - start
   }
 }

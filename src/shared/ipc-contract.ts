@@ -23,6 +23,7 @@ export interface RunReport {
   translated: number
   keptOriginal: { id: string; reason: string }[]
   overflowed: { id: string; fontSizePt: number }[]
+  skippedUnsupported: { id: string; reason: string }[]
   durationMs: number
 }
 

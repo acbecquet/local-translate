@@ -22,6 +22,20 @@ export interface FormatAdapter {
    */
   extract(filePath: string): Promise<TextSegment[]>
   apply(filePath: string, outPath: string, segments: TranslatedSegment[]): Promise<void>
+  /**
+   * Optional: returns the unsupported-but-present content this adapter
+   * skipped (never extracted as a segment, never touched on apply) during
+   * the MOST RECENT extract() call - e.g. a chart, WordArt, or a SmartArt
+   * part that couldn't be resolved. runPipeline calls this right after
+   * extract() and folds the result into RunReport.skippedUnsupported so
+   * skips show up in the run report/CLI/UI, not just a console log.
+   *
+   * Deliberately optional (rather than a required method every adapter
+   * must implement) so adapters with nothing to ever skip - e.g.
+   * FakeAdapter - need no changes at all; runPipeline treats a missing
+   * collectSkips as "this adapter never skips anything" (`?? []`).
+   */
+  collectSkips?(): { id: string; reason: string }[]
 }
 
 /**

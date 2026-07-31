@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { runPipeline } from '../../src/core/pipeline'
 import { FakeAdapter } from '../../src/core/adapters/fake/fake-adapter'
+import type { FormatAdapter } from '../../src/core/adapters/adapter'
 import type { TextSegment } from '../../src/core/segments'
 import type {
   BatchRequest,
@@ -464,5 +465,49 @@ describe('runPipeline', () => {
 
     expect(report.durationMs).toBeGreaterThanOrEqual(0)
     expect(Number.isFinite(report.durationMs)).toBe(true)
+  })
+
+  it('skippedUnsupported defaults to [] for an adapter that never implements the optional collectSkips()', async () => {
+    const s1 = seg({ id: 's1', text: 'Hello', context: 'doc' })
+    const { file } = writeFixture([s1])
+    const backend = makeBackend(() => ({ translations: [{ id: 's1', translation: 'Bonjour' }] }))
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter, // FakeAdapter - deliberately has no collectSkips method at all
+      backend
+    })
+
+    expect(report.skippedUnsupported).toEqual([])
+  })
+
+  it('skippedUnsupported is populated from adapter.collectSkips() when the adapter implements it', async () => {
+    const s1 = seg({ id: 's1', text: 'Hello', context: 'doc' })
+    const { file } = writeFixture([s1])
+    const backend = makeBackend(() => ({ translations: [{ id: 's1', translation: 'Bonjour' }] }))
+
+    const skippingAdapter: FormatAdapter = {
+      name: 'fake-with-skips',
+      extensions: ['.fake.json'],
+      extract: (p) => adapter.extract(p),
+      apply: (p, out, segs) => adapter.apply(p, out, segs),
+      collectSkips: () => [{ id: 'slide1/chart[name=Chart 1]', reason: 'chart' }]
+    }
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter: skippingAdapter,
+      backend
+    })
+
+    expect(report.skippedUnsupported).toEqual([
+      { id: 'slide1/chart[name=Chart 1]', reason: 'chart' }
+    ])
   })
 })

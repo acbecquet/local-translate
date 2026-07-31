@@ -108,6 +108,7 @@ function printReport(report: RunReport): void {
   console.log(`  Translated       ${report.translated}`)
   console.log(`  Kept original    ${report.keptOriginal.length}`)
   console.log(`  Overflowed       ${report.overflowed.length}`)
+  console.log(`  Skipped          ${report.skippedUnsupported.length}`)
   console.log(`  Duration         ${report.durationMs} ms`)
 
   if (report.keptOriginal.length > 0) {

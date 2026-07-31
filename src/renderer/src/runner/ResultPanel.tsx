@@ -40,8 +40,14 @@ export function ResultPanel({ report, onError }: ResultPanelProps): React.JSX.El
       </div>
       {report.overflowed.length > 0 && (
         <p className="result-warning">
-          {report.overflowed.length} segment{report.overflowed.length === 1 ? '' : 's'} overflowed
-          and were shrunk to the smallest fitting size.
+          {report.overflowed.length} segment{report.overflowed.length === 1 ? '' : 's'} could not be
+          fitted (at minimum size, may overflow).
+        </p>
+      )}
+      {report.skippedUnsupported.length > 0 && (
+        <p className="result-warning">
+          {report.skippedUnsupported.length} unsupported item
+          {report.skippedUnsupported.length === 1 ? '' : 's'} skipped (left untouched).
         </p>
       )}
     </div>
