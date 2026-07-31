@@ -50,8 +50,30 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 
 const { OllamaBackend } = await import('../../../src/core/translate/ollama/ollama-backend')
 
-function chatResponse(content: string): { message: { content: string } } {
-  return { message: { content } }
+/**
+ * Builds a mocked ollama ChatResponse. `usage` is optional and, when
+ * omitted, produces exactly the bare `{ message: { content } }` shape every
+ * other test in this file already relies on - OllamaBackend must treat
+ * those missing telemetry fields as 0, not NaN/undefined (see
+ * extractUsage() in ollama-backend.ts), so most tests deliberately never
+ * pass it.
+ */
+function chatResponse(
+  content: string,
+  usage?: { promptEvalCount: number; evalCount: number; totalDurationNs: number }
+): {
+  message: { content: string }
+  prompt_eval_count?: number
+  eval_count?: number
+  total_duration?: number
+} {
+  if (!usage) return { message: { content } }
+  return {
+    message: { content },
+    prompt_eval_count: usage.promptEvalCount,
+    eval_count: usage.evalCount,
+    total_duration: usage.totalDurationNs
+  }
 }
 
 function req(overrides: Partial<BatchRequest> = {}): BatchRequest {
@@ -345,6 +367,205 @@ describe('OllamaBackend.translateBatch', () => {
 
     expect(res.translations).toEqual([{ id: 's1', translation: 'Bonjour' }])
     expect(mocks.chat.mock.calls[0][0]).toMatchObject({ think: true })
+  })
+})
+
+// --- translateBatch: BatchResponse.usage aggregation ----------------------
+
+describe('OllamaBackend.translateBatch usage aggregation', () => {
+  it('happy path: usage reflects exactly the one group call, with no retries or fallbacks', async () => {
+    await seedCaps(appDataDir, 'test-model', { structuredWithThinkOff: true })
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse(JSON.stringify({ translations: [{ id: 's1', translation: 'Bonjour' }] }), {
+        promptEvalCount: 10,
+        evalCount: 4,
+        totalDurationNs: 2_000_000 // 2 ms
+      })
+    )
+
+    const backend = new OllamaBackend({
+      baseUrl: 'http://127.0.0.1:1',
+      appDataDir,
+      retryDelayMs: 0
+    })
+    const res = await backend.translateBatch(req())
+
+    // No probe (caps were pre-seeded), so this is the group call alone.
+    expect(res.usage).toEqual({
+      promptTokens: 10,
+      completionTokens: 4,
+      modelDurationMs: 2,
+      calls: 1,
+      retries: 0,
+      perSegmentFallbacks: 0
+    })
+  })
+
+  it('sums usage across the group call, its retry, and every per-segment fallback', async () => {
+    await seedCaps(appDataDir, 'test-model', { structuredWithThinkOff: true })
+    const request = req({
+      segments: [
+        { id: 's1', text: 'Hello' },
+        { id: 's2', text: 'World' }
+      ]
+    })
+
+    // Attempt 1: whole group, malformed JSON - still spends tokens/time.
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse('not valid json at all', {
+        promptEvalCount: 20,
+        evalCount: 5,
+        totalDurationNs: 1_000_000
+      })
+    )
+    // Attempt 2: whole-group retry, still malformed.
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse('{ this is not json either', {
+        promptEvalCount: 20,
+        evalCount: 5,
+        totalDurationNs: 1_000_000
+      })
+    )
+    // Per-segment fallback for s1: succeeds.
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse(JSON.stringify({ translations: [{ id: 's1', translation: 'Bonjour' }] }), {
+        promptEvalCount: 6,
+        evalCount: 2,
+        totalDurationNs: 500_000
+      })
+    )
+    // Per-segment fallback for s2: fails again, but the model still responded.
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse('still broken', {
+        promptEvalCount: 6,
+        evalCount: 1,
+        totalDurationNs: 500_000
+      })
+    )
+
+    const backend = new OllamaBackend({
+      baseUrl: 'http://127.0.0.1:1',
+      appDataDir,
+      retryDelayMs: 0
+    })
+    const res = await backend.translateBatch(request)
+
+    expect(mocks.chat).toHaveBeenCalledTimes(4)
+    // 4 calls, all of which returned a (parseable-or-not) response: every
+    // one contributes to the sums. Both segments went through exactly one
+    // per-segment fallback attempt each -> perSegmentFallbacks: 2. Exactly
+    // one whole-group retry was attempted -> retries: 1.
+    expect(res.usage).toEqual({
+      promptTokens: 20 + 20 + 6 + 6,
+      completionTokens: 5 + 5 + 2 + 1,
+      modelDurationMs: 1 + 1 + 0.5 + 0.5,
+      calls: 4,
+      retries: 1,
+      perSegmentFallbacks: 2
+    })
+  })
+
+  it('a transport-level failure contributes zero to the token/duration/calls sums, but still counts as an attempted retry and fallback step', async () => {
+    await seedCaps(appDataDir, 'test-model', { structuredWithThinkOff: true })
+    const request = req({ segments: [{ id: 's1', text: 'Hello' }] })
+
+    mocks.chat.mockRejectedValueOnce(new Error('ECONNRESET')) // group call
+    mocks.chat.mockRejectedValueOnce(new Error('ECONNRESET')) // retry
+    mocks.chat.mockRejectedValueOnce(new Error('ECONNRESET')) // per-segment fallback
+
+    const backend = new OllamaBackend({
+      baseUrl: 'http://127.0.0.1:1',
+      appDataDir,
+      retryDelayMs: 0
+    })
+    const res = await backend.translateBatch(request)
+
+    expect(res.usage).toEqual({
+      promptTokens: 0,
+      completionTokens: 0,
+      modelDurationMs: 0,
+      calls: 0, // no response ever came back on any attempt
+      retries: 1,
+      perSegmentFallbacks: 1
+    })
+  })
+
+  it('includes the capability probe call in usage when it actually runs during this request', async () => {
+    // No seeded caps file - the probe runs as part of this translateBatch call.
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse(JSON.stringify({ ok: true }), {
+        promptEvalCount: 3,
+        evalCount: 1,
+        totalDurationNs: 300_000
+      })
+    )
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse(JSON.stringify({ translations: [{ id: 's1', translation: 'Bonjour' }] }), {
+        promptEvalCount: 10,
+        evalCount: 4,
+        totalDurationNs: 2_000_000
+      })
+    )
+
+    const backend = new OllamaBackend({
+      baseUrl: 'http://127.0.0.1:1',
+      appDataDir,
+      retryDelayMs: 0
+    })
+    const res = await backend.translateBatch(req())
+
+    expect(mocks.chat).toHaveBeenCalledTimes(2) // probe + group call
+    expect(res.usage).toEqual({
+      promptTokens: 3 + 10,
+      completionTokens: 1 + 4,
+      modelDurationMs: 0.3 + 2,
+      calls: 2, // probe counts as a call too
+      retries: 0,
+      perSegmentFallbacks: 0
+    })
+  })
+
+  it('excludes the probe from usage on a later call once caps are cached from an earlier probe on the same instance', async () => {
+    mocks.chat.mockResolvedValueOnce(chatResponse(JSON.stringify({ ok: true }))) // probe, no usage fields
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse(JSON.stringify({ translations: [{ id: 's1', translation: 'Bonjour' }] }))
+    )
+
+    const backend = new OllamaBackend({
+      baseUrl: 'http://127.0.0.1:1',
+      appDataDir,
+      retryDelayMs: 0
+    })
+    await backend.translateBatch(req()) // probes and caches caps
+
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse(JSON.stringify({ translations: [{ id: 's1', translation: 'Bonjour again' }] }), {
+        promptEvalCount: 8,
+        evalCount: 3,
+        totalDurationNs: 1_000_000
+      })
+    )
+    const res2 = await backend.translateBatch(req())
+
+    // Only the group call this time - no second probe.
+    expect(res2.usage).toEqual({
+      promptTokens: 8,
+      completionTokens: 3,
+      modelDurationMs: 1,
+      calls: 1,
+      retries: 0,
+      perSegmentFallbacks: 0
+    })
+  })
+
+  it('omits usage entirely for a request with no segments (never calls the model)', async () => {
+    const backend = new OllamaBackend({
+      baseUrl: 'http://127.0.0.1:1',
+      appDataDir,
+      retryDelayMs: 0
+    })
+    const res = await backend.translateBatch(req({ segments: [] }))
+    expect(res.usage).toBeUndefined()
   })
 })
 

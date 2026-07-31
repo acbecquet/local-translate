@@ -36,6 +36,37 @@ export interface BatchResponse {
    * keptOriginal reasons.
    */
   failures?: { id: string; reason: string }[]
+  /**
+   * Telemetry aggregated across every actual model call a backend made
+   * while serving this one BatchResponse - the whole-group call, its retry,
+   * any per-segment fallbacks, and (for OllamaBackend) the model capability
+   * probe if one happened to run during this request. Optional: omitted
+   * entirely for requests that never called the model at all (e.g. an
+   * empty `segments` array), and any backend that doesn't track usage
+   * (or a test double) simply never sets it - the pipeline treats a
+   * missing `usage` as all-zero when aggregating for RunReport.stats.
+   */
+  usage?: {
+    /** Sum of prompt tokens (ollama's `prompt_eval_count`) across every call counted below. */
+    promptTokens: number
+    /** Sum of completion tokens (ollama's `eval_count`) across every call counted below. */
+    completionTokens: number
+    /** Sum of per-call model duration, converted from ollama's nanosecond `total_duration` to milliseconds. */
+    modelDurationMs: number
+    /**
+     * Number of model calls that actually returned a response and
+     * contributed to the sums above - a transport-level failure (the
+     * client call itself threw, so no response ever came back) contributes
+     * nothing to sum against and is therefore not counted here, even
+     * though `retries`/`perSegmentFallbacks` below still count it as an
+     * attempted ladder step.
+     */
+    calls: number
+    /** Number of whole-group retry attempts made (0 or 1 given the current ladder), regardless of whether the retry itself succeeded. */
+    retries: number
+    /** Number of per-segment fallback calls attempted (0..N, one per segment still unresolved after the retry), regardless of whether each fallback succeeded. */
+    perSegmentFallbacks: number
+  }
 }
 
 export interface TranslationBackend {

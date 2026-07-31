@@ -25,6 +25,20 @@ export interface RunReport {
   overflowed: { id: string; fontSizePt: number }[]
   skippedUnsupported: { id: string; reason: string }[]
   durationMs: number
+  stats: {
+    model: string
+    phaseMs: { extract: number; connect: number; translate: number; fit: number; apply: number }
+    groups: number
+    modelCalls: number
+    groupRetries: number
+    perSegmentFallbacks: number
+    promptTokens: number
+    completionTokens: number
+    tokensPerSec: number
+    charsSource: number
+    charsTranslated: number
+    segmentsPerMin: number
+  }
 }
 
 export interface TranslateProgressEvent {

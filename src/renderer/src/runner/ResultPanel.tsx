@@ -11,6 +11,21 @@ function describeCatch(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
+/**
+ * One compact line: duration, segments/min always, tok/s only when the
+ * backend actually reported token usage (a "0.0 tok/s" for every backend
+ * that never tracks it would just be noise - mirrors cli.ts's printStats
+ * doing the same gating on the terminal side).
+ */
+function describeStats(report: RunReport): string {
+  const parts = [
+    `${report.durationMs} ms`,
+    `${report.stats.segmentsPerMin.toFixed(1)} segments/min`,
+    ...(report.stats.completionTokens > 0 ? [`${report.stats.tokensPerSec.toFixed(1)} tok/s`] : [])
+  ]
+  return parts.join(' | ')
+}
+
 export function ResultPanel({ report, onError }: ResultPanelProps): React.JSX.Element {
   const handleOpen = useCallback(() => {
     window.localTranslate
@@ -30,6 +45,9 @@ export function ResultPanel({ report, onError }: ResultPanelProps): React.JSX.El
         Translated {report.translated} of {report.total} segments in {report.durationMs} ms.
       </p>
       <p className="result-path">{report.outPath}</p>
+      <p className="result-stats" data-testid="result-stats">
+        {describeStats(report)}
+      </p>
       <div className="result-actions">
         <button type="button" onClick={handleOpen}>
           Open result

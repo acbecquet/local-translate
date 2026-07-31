@@ -127,6 +127,52 @@ function printReport(report: RunReport): void {
     }
   }
   console.log('')
+
+  printStats(report.stats)
+}
+
+/** `ms` under 1000 as "N ms", otherwise as "N.NN s" - the human-readable rule requirement 3 asks for on every phaseMs entry. */
+function formatMs(ms: number): string {
+  return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(2)} s`
+}
+
+/**
+ * Prints the "Processing stats" block after the existing report table: the
+ * model, per-phase timings, group/call/retry/fallback counts, token
+ * throughput (only when the backend actually reported any - a 0/0 line
+ * would just be noise for a backend that never tracks usage), character
+ * counts, and segments/min. Plain aligned text matching printReport's own
+ * style above, not a second table format.
+ */
+function printStats(stats: RunReport['stats']): void {
+  console.log('Processing stats')
+  console.log('-'.repeat(60))
+  console.log(`  Model            ${stats.model}`)
+  console.log(
+    `  Phases           extract ${formatMs(stats.phaseMs.extract)}, ` +
+      `connect ${formatMs(stats.phaseMs.connect)}, ` +
+      `translate ${formatMs(stats.phaseMs.translate)}, ` +
+      `fit ${formatMs(stats.phaseMs.fit)}, ` +
+      `apply ${formatMs(stats.phaseMs.apply)}`
+  )
+  console.log(
+    `  Groups/calls     ${stats.groups} groups, ${stats.modelCalls} model calls, ` +
+      `${stats.groupRetries} retries, ${stats.perSegmentFallbacks} per-segment fallbacks`
+  )
+  // Token throughput is only meaningful when the backend actually reported
+  // usage - printing "0 prompt, 0 completion, 0.0 tok/s" for every run of a
+  // backend that never tracks it would just be noise.
+  if (stats.promptTokens > 0 || stats.completionTokens > 0) {
+    console.log(
+      `  Tokens           ${stats.promptTokens} prompt, ${stats.completionTokens} completion, ` +
+        `${stats.tokensPerSec.toFixed(1)} tok/s`
+    )
+  }
+  console.log(
+    `  Chars            ${stats.charsSource} source -> ${stats.charsTranslated} translated`
+  )
+  console.log(`  Throughput       ${stats.segmentsPerMin.toFixed(1)} segments/min`)
+  console.log('')
 }
 
 /** Progress line printed to stderr so it never interleaves with the report table on stdout. */
@@ -198,8 +244,11 @@ export async function runCli(argv: string[], deps: CliDeps = defaultDeps): Promi
   const appDataDir = resolveAppDataDir()
 
   let connection: OllamaConnection
+  let connectMs: number
+  const connectStart = Date.now()
   try {
     connection = await deps.ensureOllama({ appDataDir })
+    connectMs = Date.now() - connectStart
   } catch (err) {
     if (err instanceof OllamaNotFoundError) {
       console.error(err.message)
@@ -220,6 +269,7 @@ export async function runCli(argv: string[], deps: CliDeps = defaultDeps): Promi
       model: args.model,
       adapter,
       backend,
+      connectMs,
       onProgress: logProgress
     })
 

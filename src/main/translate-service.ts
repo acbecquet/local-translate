@@ -192,7 +192,15 @@ export class TranslateService {
         )
       }
 
+      // Timed here rather than inside acquireConnection() itself: on a
+      // reused connection (the common case - see acquireConnection's own
+      // doc comment) this resolves immediately without ever calling
+      // ensureOllama, so connectMs naturally comes out ~0 for every run
+      // after the first, exactly like the CLI's equivalent timing in
+      // cli.ts's runCli.
+      const connectStart = Date.now()
       const connection = await this.acquireConnection()
+      const connectMs = Date.now() - connectStart
 
       this.deps.onState({ state: 'translating' })
 
@@ -208,6 +216,7 @@ export class TranslateService {
         model: this.deps.model,
         adapter,
         backend,
+        connectMs,
         onProgress: (done, total, phase) => {
           this.deps.onProgress({ done, total, phase })
           if (this.cancelRequested) throw new CancelledError()

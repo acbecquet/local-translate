@@ -22,6 +22,39 @@ export interface RunReport {
   /** Unsupported-but-present content the adapter skipped entirely (never a segment, never touched on apply) - e.g. a chart, WordArt, or an unresolvable SmartArt part. Populated from the adapter's optional `collectSkips()` (adapter.ts); `[]` for an adapter that never implements it. */
   skippedUnsupported: { id: string; reason: string }[]
   durationMs: number
+  /**
+   * Rich per-run statistics for printing (cli.ts's printReport) and for
+   * comparing models/runs against each other over time. Always populated
+   * (never optional) - every number here is 0-safe: a backend that never
+   * reports BatchResponse.usage (or a document with nothing to translate)
+   * simply yields zeros rather than NaN/undefined anywhere below.
+   */
+  stats: {
+    /** opts.model, verbatim - which model this run's numbers describe. */
+    model: string
+    /** Wall-clock time spent in each phase, in ms. `connect` is 0 unless the caller supplied `PipelineOpts.connectMs` - the pipeline itself never establishes a model-server connection, so it has nothing to time for that phase on its own. */
+    phaseMs: { extract: number; connect: number; translate: number; fit: number; apply: number }
+    /** Number of translateBatch() calls the pipeline made (one per group groupSegments produced). */
+    groups: number
+    /** Sum of BatchResponse.usage.calls across every group - the total count of model calls (group calls + retries + per-segment fallbacks + capability probes) that actually returned a response, across the whole run. */
+    modelCalls: number
+    /** Sum of BatchResponse.usage.retries across every group. */
+    groupRetries: number
+    /** Sum of BatchResponse.usage.perSegmentFallbacks across every group. */
+    perSegmentFallbacks: number
+    /** Sum of BatchResponse.usage.promptTokens across every group; 0 when the backend never reports usage. */
+    promptTokens: number
+    /** Sum of BatchResponse.usage.completionTokens across every group; 0 when the backend never reports usage. */
+    completionTokens: number
+    /** completionTokens / (summed BatchResponse.usage.modelDurationMs / 1000); 0 when either side of that ratio is 0 (no usage reported, or a 0 ms duration). */
+    tokensPerSec: number
+    /** Sum of `.text.length` across every extracted segment, translated or not - the total amount of source text this run processed. */
+    charsSource: number
+    /** Sum of `.length` of each segment's ACTUAL resolved translation - only segments the backend translated. A keptOriginal segment (untranslatable passthrough, or a translation failure that fell back to source text) contributes to `charsSource` above but never to this field, since no translation was produced for it. */
+    charsTranslated: number
+    /** translated / (durationMs / 60000); 0 when durationMs is 0. */
+    segmentsPerMin: number
+  }
 }
 
 export interface PipelineOpts {
@@ -32,6 +65,16 @@ export interface PipelineOpts {
   model: string
   adapter: FormatAdapter
   backend: TranslationBackend
+  /**
+   * How long the caller spent establishing its model-server connection
+   * (e.g. cli.ts/TranslateService timing their own ensureOllama() call)
+   * before invoking runPipeline - reported verbatim as
+   * RunReport.stats.phaseMs.connect. The pipeline has no connection step of
+   * its own to time, so this defaults to 0 when omitted (e.g. a caller that
+   * reuses an already-established connection and pays no connect cost this
+   * run).
+   */
+  connectMs?: number
   onProgress?: (
     done: number,
     total: number,
@@ -57,9 +100,11 @@ export async function runPipeline(opts: PipelineOpts): Promise<RunReport> {
   // pushing this responsibility onto every caller of runPipeline.
   registerBundledFonts()
 
+  const extractStart = Date.now()
   const segments = await opts.adapter.extract(opts.file)
   assertUniqueIds(segments)
   const total = segments.length
+  const extractMs = Date.now() - extractStart
   opts.onProgress?.(total, total, 'extract')
   // Read immediately after extract() - the adapter contract documents
   // collectSkips() as reporting the MOST RECENT extract() call's skips, and
@@ -68,27 +113,86 @@ export async function runPipeline(opts: PipelineOpts): Promise<RunReport> {
   // mistaken for a second round of skips.
   const skippedUnsupported = opts.adapter.collectSkips?.() ?? []
 
-  const { translationById, keptOriginal } = await translateSegments(opts, segments)
+  const translateStart = Date.now()
+  const { translationById, keptOriginal, usage } = await translateSegments(opts, segments)
+  const translateMs = Date.now() - translateStart
 
+  const fitStart = Date.now()
   const { translatedSegments, overflowed } = fitSegments(opts, segments, translationById)
+  const fitMs = Date.now() - fitStart
 
   const outPath = opts.out ?? defaultOutPath(opts.file, opts.adapter)
+  const applyStart = Date.now()
   await opts.adapter.apply(opts.file, outPath, translatedSegments)
+  const applyMs = Date.now() - applyStart
   opts.onProgress?.(1, 1, 'apply')
+
+  // By construction every segment ends up in exactly one of "resolved a
+  // translation" or `keptOriginal` (see translateSegments), so this always
+  // satisfies total === translated + keptOriginal.length.
+  const translated = total - keptOriginal.length
+  const { charsSource, charsTranslated } = charCounts(segments, translationById)
+  const durationMs = Date.now() - start
 
   return {
     file: opts.file,
     outPath,
     total,
-    // By construction every segment ends up in exactly one of "resolved a
-    // translation" or `keptOriginal` (see translateSegments), so this
-    // always satisfies total === translated + keptOriginal.length.
-    translated: total - keptOriginal.length,
+    translated,
     keptOriginal,
     overflowed,
     skippedUnsupported,
-    durationMs: Date.now() - start
+    durationMs,
+    stats: {
+      model: opts.model,
+      phaseMs: {
+        extract: extractMs,
+        connect: opts.connectMs ?? 0,
+        translate: translateMs,
+        fit: fitMs,
+        apply: applyMs
+      },
+      groups: usage.groups,
+      modelCalls: usage.modelCalls,
+      groupRetries: usage.groupRetries,
+      perSegmentFallbacks: usage.perSegmentFallbacks,
+      promptTokens: usage.promptTokens,
+      completionTokens: usage.completionTokens,
+      tokensPerSec: safeRate(usage.completionTokens, usage.modelDurationMs / 1000),
+      charsSource,
+      charsTranslated,
+      segmentsPerMin: safeRate(translated, durationMs / 60000)
+    }
   }
+}
+
+/** `numerator / denominator`, but 0 (never NaN/Infinity) when `denominator` is 0 - the shared "0-safe rate" rule every stats.ts ratio in RunReport.stats follows (tokensPerSec, segmentsPerMin). */
+function safeRate(numerator: number, denominator: number): number {
+  return denominator > 0 ? numerator / denominator : 0
+}
+
+/**
+ * `charsSource` counts every extracted segment's original text length,
+ * whether or not it ended up translated - the total volume of source text
+ * this run processed. `charsTranslated` counts only the segments that
+ * actually have an entry in `translationById` (i.e., the backend produced
+ * a validated translation for them) - a keptOriginal segment (untranslatable
+ * passthrough, or a failed translation that fell back to its original text
+ * in fitSegments) is deliberately excluded from `charsTranslated`, since no
+ * translation was ever produced for it.
+ */
+function charCounts(
+  segments: TextSegment[],
+  translationById: Map<string, string>
+): { charsSource: number; charsTranslated: number } {
+  let charsSource = 0
+  let charsTranslated = 0
+  for (const seg of segments) {
+    charsSource += seg.text.length
+    const translation = translationById.get(seg.id)
+    if (translation !== undefined) charsTranslated += translation.length
+  }
+  return { charsSource, charsTranslated }
 }
 
 /**
@@ -130,6 +234,17 @@ function deriveGroupContext(group: TextSegment[]): string {
   return `${groupKey}: ${roles.join(', ')}`
 }
 
+/** Aggregate of BatchResponse.usage summed across every group this pipeline run sent to the backend - see RunReport.stats's doc comment (pipeline.ts) for how each field maps into the final report. Kept separate from RunReport.stats itself since this also carries `modelDurationMs`, an intermediate the report never exposes directly (only tokensPerSec, derived from it). */
+interface UsageTotals {
+  groups: number
+  modelCalls: number
+  groupRetries: number
+  perSegmentFallbacks: number
+  promptTokens: number
+  completionTokens: number
+  modelDurationMs: number
+}
+
 /**
  * Groups translatable segments and calls the backend once per group.
  * Untranslatable segments (dropped by groupSegments) are recorded in
@@ -137,7 +252,8 @@ function deriveGroupContext(group: TextSegment[]): string {
  * comes back from a group's BatchResponse without a validated translation -
  * whether explicitly listed in `failures` or simply absent - is also
  * recorded in `keptOriginal`, with the backend's reported reason when one
- * was given.
+ * was given. Also aggregates BatchResponse.usage (when the backend reports
+ * it) across every group into the returned `usage` totals.
  */
 async function translateSegments(
   opts: PipelineOpts,
@@ -145,9 +261,19 @@ async function translateSegments(
 ): Promise<{
   translationById: Map<string, string>
   keptOriginal: { id: string; reason: string }[]
+  usage: UsageTotals
 }> {
   const translationById = new Map<string, string>()
   const keptOriginal: { id: string; reason: string }[] = []
+  const usage: UsageTotals = {
+    groups: 0,
+    modelCalls: 0,
+    groupRetries: 0,
+    perSegmentFallbacks: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    modelDurationMs: 0
+  }
 
   for (const seg of segments) {
     if (!hasTranslatableContent(seg.text)) {
@@ -171,6 +297,19 @@ async function translateSegments(
       segments: group.map((s) => ({ id: s.id, text: s.text }))
     })
 
+    usage.groups += 1
+    // response.usage is optional (backend.ts) - a test double or a future
+    // backend that never tracks telemetry simply contributes 0 across the
+    // board rather than this loop needing a special case for it.
+    if (response.usage) {
+      usage.modelCalls += response.usage.calls
+      usage.groupRetries += response.usage.retries
+      usage.perSegmentFallbacks += response.usage.perSegmentFallbacks
+      usage.promptTokens += response.usage.promptTokens
+      usage.completionTokens += response.usage.completionTokens
+      usage.modelDurationMs += response.usage.modelDurationMs
+    }
+
     for (const t of response.translations) {
       translationById.set(t.id, t.translation)
     }
@@ -189,7 +328,7 @@ async function translateSegments(
     opts.onProgress?.(done, totalToTranslate, 'translate')
   }
 
-  return { translationById, keptOriginal }
+  return { translationById, keptOriginal, usage }
 }
 
 /**

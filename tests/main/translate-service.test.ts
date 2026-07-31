@@ -31,7 +31,21 @@ const FAKE_REPORT: RunReport = {
   keptOriginal: [],
   overflowed: [],
   skippedUnsupported: [],
-  durationMs: 5
+  durationMs: 5,
+  stats: {
+    model: 'test-model',
+    phaseMs: { extract: 1, connect: 0, translate: 2, fit: 1, apply: 1 },
+    groups: 1,
+    modelCalls: 1,
+    groupRetries: 0,
+    perSegmentFallbacks: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    tokensPerSec: 0,
+    charsSource: 5,
+    charsTranslated: 5,
+    segmentsPerMin: 12
+  }
 }
 
 function fakeConnection(stop = vi.fn().mockResolvedValue(undefined)): OllamaConnection {
@@ -115,6 +129,24 @@ describe('TranslateService.run: argument mapping', () => {
     expect(opts.model).toBe('test-model')
     expect(opts.adapter).toBe(FAKE_ADAPTER)
     expect(typeof opts.onProgress).toBe('function')
+    // Times its own ensureOllama() call (via acquireConnection) and passes
+    // the result through as PipelineOpts.connectMs - see run()'s doc
+    // comment on why this is timed around acquireConnection rather than
+    // ensureOllama directly.
+    expect(typeof opts.connectMs).toBe('number')
+    expect(opts.connectMs).toBeGreaterThanOrEqual(0)
+  })
+
+  it('reports connectMs as ~0 on a reused connection (no ensureOllama call made this run)', async () => {
+    const { service, runPipeline } = harness()
+    const req = { filePath: 'doc.fake.json', sourceLang: 'English', targetLang: 'French' }
+
+    await service.run(req)
+    runPipeline.mockClear()
+    await service.run(req)
+
+    const opts = runPipeline.mock.calls[0][0] as PipelineOpts
+    expect(opts.connectMs).toBeGreaterThanOrEqual(0)
   })
 
   it('rejects with a descriptive error and never touches Ollama when no adapter matches', async () => {

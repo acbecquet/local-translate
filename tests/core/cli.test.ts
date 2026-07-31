@@ -256,11 +256,51 @@ describe('runCli: exit codes and dependency injection', () => {
     expect(table).toContain('Translation report')
     expect(table).toContain('Translated       1')
 
+    // Processing stats block: model, phase timings, group/call/retry
+    // counts, chars, and throughput always render; the Tokens line is
+    // omitted here since this backend's mocked response carries no `usage`
+    // (asserted separately below).
+    expect(table).toContain('Processing stats')
+    expect(table).toContain('Model            llama3.1')
+    expect(table).toContain('Phases           extract')
+    expect(table).toContain('Groups/calls')
+    expect(table).toContain('Chars            5 source -> 7 translated')
+    expect(table).toContain('Throughput')
+    expect(table).not.toContain('Tokens ')
+
     const progress = errSpy.mock.calls.map((c) => String(c[0])).join('\n')
     expect(progress).toContain('[extract]')
     expect(progress).toContain('[translate]')
     expect(progress).toContain('[fit]')
     expect(progress).toContain('[apply]')
+  })
+
+  it('prints the Tokens line only when the backend reports non-zero usage', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const file = writeFixture([seg({ id: 's1', text: 'Hello' })])
+    const stop = vi.fn().mockResolvedValue(undefined)
+    const ensureOllama = vi.fn().mockResolvedValue(fakeConnection(stop))
+    const backend = fakeBackend({
+      translateBatch: vi.fn().mockResolvedValue({
+        translations: [{ id: 's1', translation: 'Bonjour' }],
+        usage: {
+          promptTokens: 12,
+          completionTokens: 5,
+          modelDurationMs: 250,
+          calls: 1,
+          retries: 0,
+          perSegmentFallbacks: 0
+        }
+      })
+    })
+    const createBackend = vi.fn().mockReturnValue(backend)
+
+    const code = await runCli([file, 'English', 'French'], { ensureOllama, createBackend })
+
+    expect(code).toBe(0)
+    const table = logSpy.mock.calls.map((c) => String(c[0])).join('\n')
+    expect(table).toContain('Tokens           12 prompt, 5 completion, 20.0 tok/s')
   })
 
   it('still calls stop exactly once when the pipeline throws (e.g. the input file cannot be read)', async () => {

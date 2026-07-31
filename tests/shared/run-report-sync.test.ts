@@ -30,7 +30,21 @@ describe('RunReport type sync (compile-time drift guard)', () => {
       keptOriginal: [{ id: 's2', reason: 'skipped-untranslatable' }],
       overflowed: [{ id: 's1', fontSizePt: 10 }],
       skippedUnsupported: [{ id: 's3', reason: 'chart' }],
-      durationMs: 5
+      durationMs: 5,
+      stats: {
+        model: 'test-model',
+        phaseMs: { extract: 1, connect: 0, translate: 2, fit: 1, apply: 1 },
+        groups: 1,
+        modelCalls: 1,
+        groupRetries: 0,
+        perSegmentFallbacks: 0,
+        promptTokens: 10,
+        completionTokens: 4,
+        tokensPerSec: 2.5,
+        charsSource: 10,
+        charsTranslated: 7,
+        segmentsPerMin: 12
+      }
     }
 
     // Assignable in BOTH directions. If either interface gains, loses,

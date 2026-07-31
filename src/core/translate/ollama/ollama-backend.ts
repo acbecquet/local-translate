@@ -14,8 +14,33 @@ import { buildPrompt } from '../prompts'
 
 const DEFAULT_RETRY_DELAY_MS = 500
 const CAPS_FILE_NAME = 'model-caps.json'
+const NS_PER_MS = 1_000_000
 
 type TranslatedEntry = { id: string; translation: string }
+
+/** Per-call usage telemetry, already unit-converted (ns -> ms) and defaulted, extracted from one ollama.chat() response. */
+type CallUsage = { promptTokens: number; completionTokens: number; modelDurationMs: number }
+
+/**
+ * Pulls usage telemetry off a raw ollama ChatResponse. The ollama npm
+ * client's ChatResponse type (v0.6.x) declares prompt_eval_count,
+ * eval_count, and total_duration (nanoseconds) as required fields, but
+ * this project's own test mocks (and conceivably a real server on an older
+ * protocol version) commonly hand back a bare `{ message: { content } }`
+ * with none of them - so every field is read defensively and defaulted to
+ * 0 rather than trusted as present, keeping aggregation NaN-free.
+ */
+function extractUsage(res: {
+  prompt_eval_count?: number
+  eval_count?: number
+  total_duration?: number
+}): CallUsage {
+  return {
+    promptTokens: res.prompt_eval_count ?? 0,
+    completionTokens: res.eval_count ?? 0,
+    modelDurationMs: (res.total_duration ?? 0) / NS_PER_MS
+  }
+}
 
 const BATCH_SCHEMA = z.object({
   translations: z.array(z.object({ id: z.string(), translation: z.string() }))
@@ -81,7 +106,10 @@ export class OllamaBackend implements TranslationBackend {
   // (no await before the .set()) so two calls issued back-to-back without
   // an intervening await can never both observe "no in-flight probe" and
   // race into probing twice.
-  private readonly capsProbes = new Map<string, Promise<ModelCaps>>()
+  private readonly capsProbes = new Map<
+    string,
+    Promise<{ caps: ModelCaps; probeUsage: CallUsage | null }>
+  >()
   // Serializes every read-modify-write of model-caps.json on this
   // instance, so probing two different models concurrently can't have one
   // write clobber the other (each write waits for, and reads the result
@@ -119,7 +147,34 @@ export class OllamaBackend implements TranslationBackend {
   async translateBatch(req: BatchRequest): Promise<BatchResponse> {
     if (req.segments.length === 0) return { translations: [] }
 
-    const caps = await this.getModelCaps(req.model)
+    // Accumulates telemetry across every model call this one translateBatch
+    // invocation ends up making - the group call, its retry, every
+    // per-segment fallback, and the capability probe below if it actually
+    // ran (as opposed to being served from cache). See BatchResponse.usage's
+    // doc comment (backend.ts) for the exact accounting rules.
+    const usage = {
+      promptTokens: 0,
+      completionTokens: 0,
+      modelDurationMs: 0,
+      calls: 0,
+      retries: 0,
+      perSegmentFallbacks: 0
+    }
+    const addCall = (call: CallUsage | null): void => {
+      // null means that attempt was a transport-level failure - no response
+      // ever came back, so there's nothing to sum and it doesn't count as a
+      // completed call (unlike the retry/fallback ladder-step counters
+      // above, which count the ATTEMPT regardless of outcome).
+      if (!call) return
+      usage.promptTokens += call.promptTokens
+      usage.completionTokens += call.completionTokens
+      usage.modelDurationMs += call.modelDurationMs
+      usage.calls += 1
+    }
+
+    const { caps, probeUsage } = await this.getModelCaps(req.model)
+    addCall(probeUsage)
+
     const okById = new Map<string, TranslatedEntry>()
     // Reason a segment failed at the most recent attempt that touched it -
     // overwritten as the ladder progresses, and deleted the moment a
@@ -128,14 +183,17 @@ export class OllamaBackend implements TranslationBackend {
     const reasonById = new Map<string, ValidationFailure | 'error'>()
 
     const attempt1 = await this.attemptGroup(req, caps)
+    addCall(attempt1.usage)
     for (const o of attempt1.ok) okById.set(o.id, o)
     for (const f of attempt1.failed) reasonById.set(f.id, f.reason)
 
     let unresolvedIds = req.segments.map((s) => s.id).filter((id) => !okById.has(id))
 
     if (unresolvedIds.length > 0) {
+      usage.retries += 1
       await delay(this.retryDelayMs)
       const attempt2 = await this.attemptGroup(req, caps)
+      addCall(attempt2.usage)
       for (const o of attempt2.ok) {
         if (!okById.has(o.id)) {
           okById.set(o.id, o)
@@ -153,8 +211,10 @@ export class OllamaBackend implements TranslationBackend {
       for (const id of unresolvedIds) {
         const seg = segById.get(id)
         if (!seg) continue
+        usage.perSegmentFallbacks += 1
         const singleReq: BatchRequest = { ...req, segments: [seg] }
         const attempt = await this.attemptGroup(singleReq, caps)
+        addCall(attempt.usage)
         const solved = attempt.ok.find((o) => o.id === id)
         if (solved) {
           okById.set(id, solved)
@@ -179,25 +239,27 @@ export class OllamaBackend implements TranslationBackend {
       .filter((s) => !okById.has(s.id))
       .map((s) => ({ id: s.id, reason: reasonById.get(s.id) ?? 'error' }))
 
-    return failures.length > 0 ? { translations, failures } : { translations }
+    return failures.length > 0 ? { translations, failures, usage } : { translations, usage }
   }
 
-  /** One ollama.chat call for `req`, parsed and validated. Never throws - a transport-level failure becomes an all-'error' failure list, an unparseable/schema-invalid response becomes an all-'parse' one. */
+  /** One ollama.chat call for `req`, parsed and validated. Never throws - a transport-level failure becomes an all-'error' failure list (and a null `usage`, since no response came back to read telemetry from), an unparseable/schema-invalid response becomes an all-'parse' one (with `usage` still populated - the model DID respond and spend real compute, even though its output was unusable). */
   private async attemptGroup(
     req: BatchRequest,
     caps: ModelCaps
   ): Promise<{
     ok: TranslatedEntry[]
     failed: { id: string; reason: ValidationFailure | 'error' }[]
+    usage: CallUsage | null
   }> {
     const raw = await this.callChat(req, caps)
     if (raw.kind !== 'ok') {
       return {
         ok: [],
-        failed: req.segments.map((s) => ({ id: s.id, reason: raw.kind }))
+        failed: req.segments.map((s) => ({ id: s.id, reason: raw.kind })),
+        usage: raw.kind === 'error' ? null : raw.usage
       }
     }
-    return validateBatch(req, raw.translations)
+    return { ...validateBatch(req, raw.translations), usage: raw.usage }
   }
 
   /**
@@ -214,7 +276,11 @@ export class OllamaBackend implements TranslationBackend {
   private async callChat(
     req: BatchRequest,
     caps: ModelCaps
-  ): Promise<{ kind: 'ok'; translations: TranslatedEntry[] } | { kind: 'error' | 'parse' }> {
+  ): Promise<
+    | { kind: 'ok'; translations: TranslatedEntry[]; usage: CallUsage }
+    | { kind: 'parse'; usage: CallUsage }
+    | { kind: 'error' }
+  > {
     const prompt = buildPrompt(req)
     let res: Awaited<ReturnType<Ollama['chat']>>
     try {
@@ -236,21 +302,39 @@ export class OllamaBackend implements TranslationBackend {
       return { kind: 'error' }
     }
 
+    const usage = extractUsage(res)
     try {
       const content = stripThinkTags(res.message.content)
       const parsed: unknown = JSON.parse(content)
       const result = BATCH_SCHEMA.safeParse(parsed)
       return result.success
-        ? { kind: 'ok', translations: result.data.translations }
-        : { kind: 'parse' }
+        ? { kind: 'ok', translations: result.data.translations, usage }
+        : { kind: 'parse', usage }
     } catch {
-      return { kind: 'parse' }
+      return { kind: 'parse', usage }
     }
   }
 
   // --- capability probe + model-caps.json cache --------------------------
 
-  private async getModelCaps(model: string): Promise<ModelCaps> {
+  /**
+   * Resolves this model's caps, alongside the capability probe's usage
+   * telemetry if a probe actually executed while resolving them this call
+   * (null when the caps came from the on-disk cache or the in-memory memo -
+   * no model call was made at all). Concurrent callers for the same
+   * not-yet-cached model share one in-flight probe via `capsProbes` (see
+   * the field's own doc comment) - a documented, deliberately-accepted
+   * consequence being that if two translateBatch() calls for the same
+   * brand-new model race, BOTH observe (and both attribute to their own
+   * BatchResponse.usage) the same single probe's telemetry. In practice
+   * this never happens from runPipeline, which awaits each group's
+   * translateBatch() before starting the next, so no two calls into this
+   * backend are ever actually concurrent; it only matters for a caller
+   * (or test) that deliberately fires overlapping translateBatch() calls.
+   */
+  private async getModelCaps(
+    model: string
+  ): Promise<{ caps: ModelCaps; probeUsage: CallUsage | null }> {
     const inFlight = this.capsProbes.get(model)
     if (inFlight) return inFlight
 
@@ -261,15 +345,17 @@ export class OllamaBackend implements TranslationBackend {
     return promise
   }
 
-  private async resolveModelCaps(model: string): Promise<ModelCaps> {
+  private async resolveModelCaps(
+    model: string
+  ): Promise<{ caps: ModelCaps; probeUsage: CallUsage | null }> {
     const cached = (await this.loadCapsFile())[model]
-    if (cached) return cached
+    if (cached) return { caps: cached, probeUsage: null }
 
     const outcome = await this.probeModelCaps(model)
-    if (outcome.kind === 'unknown') return OPTIMISTIC_UNKNOWN_CAPS
+    if (outcome.kind === 'unknown') return { caps: OPTIMISTIC_UNKNOWN_CAPS, probeUsage: null }
 
     await this.persistModelCaps(model, outcome.caps)
-    return outcome.caps
+    return { caps: outcome.caps, probeUsage: outcome.usage }
   }
 
   /**
@@ -290,7 +376,7 @@ export class OllamaBackend implements TranslationBackend {
    */
   private async probeModelCaps(
     model: string
-  ): Promise<{ kind: 'known'; caps: ModelCaps } | { kind: 'unknown' }> {
+  ): Promise<{ kind: 'known'; caps: ModelCaps; usage: CallUsage } | { kind: 'unknown' }> {
     let res: Awaited<ReturnType<Ollama['chat']>>
     try {
       res = await this.client.chat({
@@ -309,14 +395,16 @@ export class OllamaBackend implements TranslationBackend {
       return { kind: 'unknown' }
     }
 
+    const usage = extractUsage(res)
     try {
       const parsed: unknown = JSON.parse(stripThinkTags(res.message.content))
       return {
         kind: 'known',
-        caps: { structuredWithThinkOff: PROBE_SCHEMA.safeParse(parsed).success }
+        caps: { structuredWithThinkOff: PROBE_SCHEMA.safeParse(parsed).success },
+        usage
       }
     } catch {
-      return { kind: 'known', caps: { structuredWithThinkOff: false } }
+      return { kind: 'known', caps: { structuredWithThinkOff: false }, usage }
     }
   }
 

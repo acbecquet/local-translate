@@ -511,3 +511,188 @@ describe('runPipeline', () => {
     ])
   })
 })
+
+describe('runPipeline: RunReport.stats', () => {
+  it('reports model, non-negative phase timings for every phase, and connect defaulting to 0 when connectMs is omitted', async () => {
+    const s1 = seg({ id: 's1', text: 'Hello', context: 'doc' })
+    const { file } = writeFixture([s1])
+    const backend = makeBackend(() => ({ translations: [{ id: 's1', translation: 'Bonjour' }] }))
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    expect(report.stats.model).toBe('test-model')
+    expect(report.stats.phaseMs.extract).toBeGreaterThanOrEqual(0)
+    expect(report.stats.phaseMs.translate).toBeGreaterThanOrEqual(0)
+    expect(report.stats.phaseMs.fit).toBeGreaterThanOrEqual(0)
+    expect(report.stats.phaseMs.apply).toBeGreaterThanOrEqual(0)
+    expect(report.stats.phaseMs.connect).toBe(0)
+    for (const ms of Object.values(report.stats.phaseMs)) {
+      expect(Number.isFinite(ms)).toBe(true)
+    }
+  })
+
+  it('reports the caller-supplied connectMs verbatim as phaseMs.connect', async () => {
+    const s1 = seg({ id: 's1', text: 'Hello', context: 'doc' })
+    const { file } = writeFixture([s1])
+    const backend = makeBackend(() => ({ translations: [{ id: 's1', translation: 'Bonjour' }] }))
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend,
+      connectMs: 123
+    })
+
+    expect(report.stats.phaseMs.connect).toBe(123)
+  })
+
+  it('groups/modelCalls/groupRetries/perSegmentFallbacks/tokens: sums BatchResponse.usage across every group', async () => {
+    // Two separate groupContexts -> two groups -> two translateBatch calls,
+    // each reporting its own usage; the report sums both.
+    const s1 = seg({ id: 's1', text: 'Hello', context: 'doc-a' })
+    const s2 = seg({ id: 's2', text: 'World', context: 'doc-b' })
+    const { file } = writeFixture([s1, s2])
+
+    const translateBatch = vi.fn(async (req: BatchRequest) => ({
+      translations: req.segments.map((s) => ({ id: s.id, translation: `[${s.text}]` })),
+      usage: {
+        promptTokens: 10,
+        completionTokens: 4,
+        modelDurationMs: 100,
+        calls: 1,
+        retries: req.groupContext === 'doc-a' ? 1 : 0,
+        perSegmentFallbacks: req.groupContext === 'doc-a' ? 1 : 0
+      }
+    }))
+    const backend: TranslationBackend = {
+      listModels: vi.fn().mockResolvedValue([]),
+      pullModel: vi.fn().mockResolvedValue(undefined),
+      translateBatch
+    }
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    expect(translateBatch).toHaveBeenCalledTimes(2)
+    expect(report.stats.groups).toBe(2)
+    expect(report.stats.modelCalls).toBe(2) // 1 call per group, summed
+    expect(report.stats.groupRetries).toBe(1)
+    expect(report.stats.perSegmentFallbacks).toBe(1)
+    expect(report.stats.promptTokens).toBe(20)
+    expect(report.stats.completionTokens).toBe(8)
+    // tokensPerSec = completionTokens / (summed modelDurationMs / 1000)
+    // = 8 / (200 / 1000) = 40
+    expect(report.stats.tokensPerSec).toBe(40)
+  })
+
+  it('is 0-safe throughout when the backend never reports usage at all', async () => {
+    const s1 = seg({ id: 's1', text: 'Hello', context: 'doc' })
+    const { file } = writeFixture([s1])
+    // makeBackend's translateBatch response has no `usage` field.
+    const backend = makeBackend(() => ({ translations: [{ id: 's1', translation: 'Bonjour' }] }))
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    expect(report.stats.modelCalls).toBe(0)
+    expect(report.stats.groupRetries).toBe(0)
+    expect(report.stats.perSegmentFallbacks).toBe(0)
+    expect(report.stats.promptTokens).toBe(0)
+    expect(report.stats.completionTokens).toBe(0)
+    expect(report.stats.tokensPerSec).toBe(0)
+    expect(Number.isFinite(report.stats.tokensPerSec)).toBe(true)
+  })
+
+  it('charsSource counts every extracted segment; charsTranslated counts only segments that actually got a translation - keptOriginal segments (untranslatable, or a failed translation) contribute to charsSource but not charsTranslated', async () => {
+    const translated = seg({ id: 's1', text: 'Hello', context: 'doc' }) // 5 chars source
+    const untranslatable = seg({ id: 's2', text: '12345', context: 'doc' }) // 5 chars source, never sent to backend
+    const failed = seg({ id: 's3', text: 'Worldly', context: 'doc' }) // 7 chars source, backend reports failure
+    const { file } = writeFixture([translated, untranslatable, failed])
+
+    const backend = makeBackend(() => ({
+      translations: [{ id: 's1', translation: 'Bonjour' }], // 7 chars translated
+      failures: [{ id: 's3', reason: 'empty' }]
+    }))
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    expect(report.stats.charsSource).toBe(5 + 5 + 7) // every extracted segment's original text
+    expect(report.stats.charsTranslated).toBe(7) // only s1's actual translation
+  })
+
+  it('segmentsPerMin is 0-safe and reflects translated / (durationMs / 60000)', async () => {
+    const s1 = seg({ id: 's1', text: 'Hello', context: 'doc' })
+    const { file } = writeFixture([s1])
+    const backend = makeBackend(() => ({ translations: [{ id: 's1', translation: 'Bonjour' }] }))
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    expect(report.stats.segmentsPerMin).toBeGreaterThanOrEqual(0)
+    expect(Number.isFinite(report.stats.segmentsPerMin)).toBe(true)
+  })
+
+  it('handles an empty document: groups 0, all sums 0, no division-by-zero NaN anywhere in stats', async () => {
+    const { file } = writeFixture([])
+    const translateBatch = vi.fn()
+    const backend: TranslationBackend = {
+      listModels: vi.fn().mockResolvedValue([]),
+      pullModel: vi.fn().mockResolvedValue(undefined),
+      translateBatch
+    }
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    expect(report.stats.groups).toBe(0)
+    expect(report.stats.modelCalls).toBe(0)
+    expect(report.stats.charsSource).toBe(0)
+    expect(report.stats.charsTranslated).toBe(0)
+    expect(report.stats.tokensPerSec).toBe(0)
+    expect(report.stats.segmentsPerMin).toBe(0)
+    for (const v of Object.values(report.stats)) {
+      if (typeof v === 'number') expect(Number.isFinite(v)).toBe(true)
+    }
+  })
+})
