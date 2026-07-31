@@ -108,7 +108,7 @@ Plus `real/`: extract 4 representative media parts from the benchmark deck (2 pn
 **Spike harness (`spike-image-regions.mjs`):** `node scripts/spike-image-regions.mjs --engine <name>` runs one engine over all fixtures and prints a markdown table:
 
 - Per image and overall: recall (ground-truth region matched at IoU >= 0.5), precision (unmatched detections = hallucinations), mean IoU of matches, text accuracy (1 - normalized Levenshtein on matched regions), wall ms.
-- Engines: `vlm:<model>` (Ollama `/api/chat` with `images:[...]`, JSON-schema output, bboxes in normalized 0-1000 coords, temperature 0) and `ocr:ppocr` (PP-OCR detection+recognition via an ONNX runtime package - candidate `@gutenye/ocr-node`, fallback raw `onnxruntime-node` + PP-OCRv4 det/rec models; the spike's first step is proving ONE of these installs and runs on Windows CPU).
+- Engines: `vlm:<model>` (Ollama `/api/chat` with `images:[...]`, JSON-schema output, bboxes in normalized 0-1000 coords, temperature 0) and `ocr:ppocr` (PP-OCR detection+recognition via an ONNX runtime package - candidates in order: `@gutenye/ocr-node` (PP-OCRv4), `ppu-paddle-ocr` (TS, multilingual, RapidOCR-integrated), raw `onnxruntime-node` + PP-OCRv4 det/rec models; the spike's first step is proving ONE of these installs and runs on Windows CPU with the CHINESE recognition model, not just the default latin one).
 - The harness is engine-agnostic: an engine is any module exporting `detectRegions(buffer): Promise<TextRegion[]>` - the exact interface Task 2 ships, so the winning spike code moves into `regions.ts` nearly verbatim.
 
 **Execution split (machine rules):**
