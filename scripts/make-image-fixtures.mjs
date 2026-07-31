@@ -7,15 +7,21 @@
 //
 // Ground truth is recorded AS drawn, not guessed after the fact: every
 // drawRegion() call below both paints the glyphs and returns the bbox that
-// is the true painted extent - measureText() for width (called against the
-// SAME ctx.font state used to draw), fontSize * LINE_HEIGHT_FACTOR for
-// height. LINE_HEIGHT_FACTOR mirrors src/core/fit/fit-engine.ts's constant
-// of the same name and value; it is re-declared here (not imported) because
-// this script lives outside src/core by design (fixture tooling, not
-// shipped code) - a drift-guard test isn't warranted for a throwaway
-// generator, but keeping the value textually identical matters so fixture
-// ground truth stays consistent with how the real pipeline will estimate
-// region font size from bbox height (Task 4).
+// is the true painted INK extent, read from skia-canvas's own TextMetrics
+// (measureText's actualBoundingBoxLeft/Right/Ascent/Descent), not a
+// fontSize*1.2 line-height approximation. That line-height approximation
+// was this generator's first cut and was deliberately replaced: it
+// systematically over-pads every region vertically relative to what any
+// region-detection engine actually paints/detects (glyph ink, not the
+// font's full em-box + leading), which put an artificial ~0.5 IoU ceiling
+// on an engine that localizes ink correctly - a measurement artifact in the
+// fixtures, not a property of engine quality, and it would have unfairly
+// distorted the ocr:ppocr-vs-vlm comparison this spike exists to make.
+// LINE_HEIGHT_FACTOR mirrors src/core/fit/fit-engine.ts's constant of the
+// same name and value; it is re-declared here (not imported, since this
+// script lives outside src/core by design) and used ONLY to space
+// consecutive lines vertically within a multi-line region - never as a
+// substitute for measured ink extent.
 //
 // Run: npx tsx scripts/make-image-fixtures.mjs
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -59,15 +65,62 @@ function clampByte(v) {
   return v < 0 ? 0 : v > 255 ? 255 : v
 }
 
-/** Paints one line of text and returns its {bbox, text} ground-truth entry. */
+/**
+ * The ink-true bbox of one line drawn at (x, y) with textAlign='left',
+ * textBaseline='top' - derived from TextMetrics rather than the font's
+ * nominal em-box. Per the Canvas 2D spec, actualBoundingBox{Left,Right} are
+ * distances from the alignment point (x) going left/right, and
+ * actualBoundingBox{Ascent,Descent} are distances from the textBaseline
+ * anchor (y, since baseline='top' puts that anchor at the em-box top, ABOVE
+ * the real glyph ink - ascent is typically negative here) going up/down to
+ * the ink edges. Verified empirically against skia-canvas's own rendered
+ * pixels (Latin/CJK, regular/bold, digits-only, punctuation) to within
+ * antialiasing-edge rounding before relying on it for ground truth.
+ */
+function inkBoxForLine(ctx, x, y, text) {
+  const m = ctx.measureText(text)
+  return {
+    left: x - m.actualBoundingBoxLeft,
+    right: x + m.actualBoundingBoxRight,
+    top: y - m.actualBoundingBoxAscent,
+    bottom: y + m.actualBoundingBoxDescent
+  }
+}
+
+/**
+ * Paints one region - one line, or several stacked lines spaced by
+ * LINE_HEIGHT_FACTOR*sizePt - and returns its {bbox, text} ground-truth
+ * entry as the UNION of each line's ink-true bbox (inkBoxForLine). Every
+ * current fixture only ever passes a single-line `text`, in which case the
+ * "union" is just that one line's own ink box; the multi-line path exists
+ * so a future fixture can add a wrapped block without a second bbox
+ * convention to keep in sync.
+ */
 function drawRegion(ctx, { x, y, text, sizePt, family = LATIN, color, bold = false }) {
   ctx.font = `${bold ? 'bold ' : ''}${sizePt}px "${family}"`
   ctx.fillStyle = color
   ctx.textAlign = 'left'
   ctx.textBaseline = 'top'
-  const w = ctx.measureText(text).width
-  ctx.fillText(text, x, y)
-  return { bbox: { x, y, w: round2(w), h: round2(sizePt * LINE_HEIGHT_FACTOR) }, text }
+
+  const lines = Array.isArray(text) ? text : [text]
+  const lineHeightPx = sizePt * LINE_HEIGHT_FACTOR
+  let left = Infinity
+  let top = Infinity
+  let right = -Infinity
+  let bottom = -Infinity
+  for (let i = 0; i < lines.length; i++) {
+    const lineY = y + i * lineHeightPx
+    ctx.fillText(lines[i], x, lineY)
+    const box = inkBoxForLine(ctx, x, lineY, lines[i])
+    left = Math.min(left, box.left)
+    top = Math.min(top, box.top)
+    right = Math.max(right, box.right)
+    bottom = Math.max(bottom, box.bottom)
+  }
+  return {
+    bbox: { x: round2(left), y: round2(top), w: round2(right - left), h: round2(bottom - top) },
+    text: lines.join(' ')
+  }
 }
 
 function fillSolid(ctx, w, h, color) {

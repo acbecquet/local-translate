@@ -1,10 +1,21 @@
 // Phase-3 region-engine spike harness. Scores any engine implementing
 // detectRegions(buffer): Promise<TextRegion[]> against the labeled fixtures
 // in fixtures/image-regions/, printing a markdown table (per-image + overall)
-// of recall, precision, mean IoU of matches, and text accuracy. This is the
-// exact interface Task 2's regions.ts ships, so the winning engine's code
-// moves over nearly verbatim. See plan Task 1:
+// of recall/precision/mean-IoU/text-accuracy at two IoU thresholds (strict
+// 0.5, relaxed 0.4), plus a coverage-recall column and an unmatched-detection
+// dump. This is the exact interface Task 2's regions.ts ships, so the
+// winning engine's code moves over nearly verbatim. See plan Task 1:
 // docs/superpowers/plans/2026-07-31-phase-3-image-text.md
+//
+// Two IoU thresholds, not one, because a single strict cutoff conflates two
+// different failure modes: genuine mislocalization vs. a detection that
+// found the right text but drew a slightly looser/tighter box around it.
+// Coverage recall exists for a THIRD failure mode neither IoU threshold
+// catches well: an engine (or its own post-processing, e.g. PP-OCR merging
+// nearby same-row cells) that reports fewer, larger detections which still
+// jointly cover every ground-truth region - useful signal for dense/table
+// content (img08, and the real table crop) where "one bbox per GT region"
+// isn't how the engine naturally segments the content.
 //
 // Usage: node scripts/spike-image-regions.mjs --engine <name>
 //   --engine mock:labels    replays labels.json verbatim - self-tests the
@@ -84,18 +95,22 @@ function textAccuracy(gtText, detText) {
   return 1 - levenshtein(gtText, detText) / maxLen
 }
 
-// Greedy IoU>=0.5 matching: highest-scoring pairs are claimed first, each
-// ground-truth region and each detection used in at most one match.
+// Greedy IoU>=threshold matching: highest-scoring pairs are claimed first,
+// each ground-truth region and each detection used in at most one match.
 // Unmatched detections are hallucinations (hurt precision); unmatched
-// ground-truth regions are misses (hurt recall).
-const IOU_THRESHOLD = 0.5
+// ground-truth regions are misses (hurt recall). Run once per threshold
+// (STRICT, RELAXED) rather than filtering one match set post hoc: lowering
+// the threshold changes which pairs are ELIGIBLE, which can change the
+// greedy assignment itself, not just add extra matches on top.
+const IOU_STRICT = 0.5
+const IOU_RELAXED = 0.4
 
-function matchRegions(gtRegions, detected) {
+function matchRegions(gtRegions, detected, threshold) {
   const pairs = []
   for (let gi = 0; gi < gtRegions.length; gi++) {
     for (let di = 0; di < detected.length; di++) {
       const score = iou(gtRegions[gi].bbox, detected[di].bbox)
-      if (score >= IOU_THRESHOLD) pairs.push({ gi, di, score })
+      if (score >= threshold) pairs.push({ gi, di, score })
     }
   }
   pairs.sort((a, b) => b.score - a.score)
@@ -108,11 +123,10 @@ function matchRegions(gtRegions, detected) {
     usedDet.add(p.di)
     matches.push(p)
   }
-  return matches
+  return { matches, usedDet }
 }
 
-function scoreImage(gtRegions, detected) {
-  const matches = matchRegions(gtRegions, detected)
+function summarizeMatches(gtRegions, detected, matches) {
   const matched = matches.length
   const totalGt = gtRegions.length
   const totalDet = detected.length
@@ -133,31 +147,99 @@ function scoreImage(gtRegions, detected) {
   }
 }
 
+// ---- coverage recall ----
+// "Covered" is a looser bar than any single IoU match: a GT region counts
+// as covered when >= 70% of its area is jointly covered by the UNION of all
+// detections on that image, regardless of how many separate detections it
+// took. clipRect intersects one detection with the GT box; unionArea sums
+// the covered area of a set of (possibly overlapping) sub-rectangles via
+// coordinate-compression sweep - exact, not a Monte-Carlo estimate, and
+// cheap at fixture scale (single digits to low tens of rects per image).
+const COVERAGE_THRESHOLD = 0.7
+
+function clipRect(a, b) {
+  const left = Math.max(a.x, b.x)
+  const top = Math.max(a.y, b.y)
+  const right = Math.min(a.x + a.w, b.x + b.w)
+  const bottom = Math.min(a.y + a.h, b.y + b.h)
+  if (right <= left || bottom <= top) return null
+  return { x: left, y: top, w: right - left, h: bottom - top }
+}
+
+function unionArea(rects) {
+  if (rects.length === 0) return 0
+  const xs = [...new Set(rects.flatMap((r) => [r.x, r.x + r.w]))].sort((a, b) => a - b)
+  const ys = [...new Set(rects.flatMap((r) => [r.y, r.y + r.h]))].sort((a, b) => a - b)
+  let area = 0
+  for (let i = 0; i < xs.length - 1; i++) {
+    const cx = (xs[i] + xs[i + 1]) / 2
+    const cellW = xs[i + 1] - xs[i]
+    for (let j = 0; j < ys.length - 1; j++) {
+      const cy = (ys[j] + ys[j + 1]) / 2
+      const cellH = ys[j + 1] - ys[j]
+      const covered = rects.some(
+        (r) => cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h
+      )
+      if (covered) area += cellW * cellH
+    }
+  }
+  return area
+}
+
+function coverageRecall(gtRegions, detected) {
+  if (gtRegions.length === 0) return null
+  let covered = 0
+  for (const gt of gtRegions) {
+    const clipped = detected.map((d) => clipRect(gt.bbox, d.bbox)).filter((r) => r !== null)
+    const gtArea = gt.bbox.w * gt.bbox.h
+    if (gtArea > 0 && unionArea(clipped) / gtArea >= COVERAGE_THRESHOLD) covered++
+  }
+  return covered / gtRegions.length
+}
+
+// ---- per-image / overall scoring ----
+
+function scoreImage(gtRegions, detected) {
+  const strict = matchRegions(gtRegions, detected, IOU_STRICT)
+  const relaxed = matchRegions(gtRegions, detected, IOU_RELAXED)
+  const unmatchedAtRelaxed = detected
+    .map((d, di) => ({ d, di }))
+    .filter(({ di }) => !relaxed.usedDet.has(di))
+    .map(({ d }) => d)
+  return {
+    totalGt: gtRegions.length,
+    totalDet: detected.length,
+    strict: summarizeMatches(gtRegions, detected, strict.matches),
+    relaxed: summarizeMatches(gtRegions, detected, relaxed.matches),
+    coverageRecall: coverageRecall(gtRegions, detected),
+    unmatchedAtRelaxed
+  }
+}
+
 // Micro-average across images (sum matches/totals, not average of per-image
 // ratios) - correctly lets a zero-region image (img10) contribute 0/0 to
 // every sum without perturbing the overall ratio, which is exactly what
 // makes the mock:labels self-test come out at a clean 100% on every column.
-function aggregate(perImage) {
+function aggregateBucket(summaries, totalsGt) {
   let matched = 0
-  let totalGt = 0
   let totalDet = 0
   let iouSum = 0
   let iouCount = 0
   let taSum = 0
   let taCount = 0
-  for (const r of perImage) {
-    matched += r.matched
-    totalGt += r.totalGt
-    totalDet += r.totalDet
-    if (r.meanIoU !== null) {
-      iouSum += r.meanIoU * r.matched
-      iouCount += r.matched
+  for (const s of summaries) {
+    matched += s.matched
+    totalDet += s.totalDet
+    if (s.meanIoU !== null) {
+      iouSum += s.meanIoU * s.matched
+      iouCount += s.matched
     }
-    if (r.meanTextAcc !== null) {
-      taSum += r.meanTextAcc * r.matched
-      taCount += r.matched
+    if (s.meanTextAcc !== null) {
+      taSum += s.meanTextAcc * s.matched
+      taCount += s.matched
     }
   }
+  const totalGt = totalsGt.reduce((a, b) => a + b, 0)
   return {
     matched,
     totalGt,
@@ -169,31 +251,96 @@ function aggregate(perImage) {
   }
 }
 
+function aggregate(perImage) {
+  const totalsGt = perImage.map((r) => r.totalGt)
+  let coveredSum = 0
+  let coveredCount = 0
+  for (const r of perImage) {
+    if (r.coverageRecall !== null) {
+      coveredSum += r.coverageRecall * r.totalGt
+      coveredCount += r.totalGt
+    }
+  }
+  return {
+    totalGt: totalsGt.reduce((a, b) => a + b, 0),
+    totalDet: perImage.reduce((a, r) => a + r.totalDet, 0),
+    strict: aggregateBucket(
+      perImage.map((r) => r.strict),
+      totalsGt
+    ),
+    relaxed: aggregateBucket(
+      perImage.map((r) => r.relaxed),
+      totalsGt
+    ),
+    coverageRecall: coveredCount > 0 ? coveredSum / coveredCount : null
+  }
+}
+
 // ---- markdown report ----
 
 function pct(v) {
   return v === null ? 'N/A' : `${(v * 100).toFixed(1)}%`
 }
 
+function renderRow(label, totalGt, totalDet, strict, relaxed, coverage, wallMs) {
+  return (
+    `| ${label} | ${totalGt} | ${totalDet} | ` +
+    `${strict.matched} | ${pct(strict.recall)} | ${pct(strict.precision)} | ${pct(strict.meanIoU)} | ${pct(strict.meanTextAcc)} | ` +
+    `${relaxed.matched} | ${pct(relaxed.recall)} | ${pct(relaxed.precision)} | ${pct(relaxed.meanIoU)} | ${pct(relaxed.meanTextAcc)} | ` +
+    `${pct(coverage)} | ${wallMs} |`
+  )
+}
+
 function renderTable(engineName, rows, overall, totalWallMs) {
   const lines = [
     `## Spike results: ${engineName}`,
     '',
-    '| image | gt | det | matched | recall | precision | mean IoU | text acc | wall ms |',
-    '|---|---|---|---|---|---|---|---|---|'
+    '@.5 = strict IoU>=0.5 match. @.4 = relaxed IoU>=0.4 match. coverage = fraction of GT ' +
+      'regions >=70% covered by the union of all detections (see COVERAGE_THRESHOLD).',
+    '',
+    '| image | gt | det | m@.5 | recall@.5 | precision@.5 | IoU@.5 | text@.5 | ' +
+      'm@.4 | recall@.4 | precision@.4 | IoU@.4 | text@.4 | coverage | wall ms |',
+    '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|'
   ]
   for (const r of rows) {
     lines.push(
-      `| ${r.name} | ${r.scored.totalGt} | ${r.scored.totalDet} | ${r.scored.matched} | ` +
-        `${pct(r.scored.recall)} | ${pct(r.scored.precision)} | ${pct(r.scored.meanIoU)} | ` +
-        `${pct(r.scored.meanTextAcc)} | ${r.wallMs} |`
+      renderRow(
+        r.name,
+        r.scored.totalGt,
+        r.scored.totalDet,
+        r.scored.strict,
+        r.scored.relaxed,
+        r.scored.coverageRecall,
+        r.wallMs
+      )
     )
   }
   lines.push(
-    `| **overall** | ${overall.totalGt} | ${overall.totalDet} | ${overall.matched} | ` +
-      `${pct(overall.recall)} | ${pct(overall.precision)} | ${pct(overall.meanIoU)} | ` +
-      `${pct(overall.meanTextAcc)} | ${totalWallMs} |`
+    renderRow(
+      '**overall**',
+      overall.totalGt,
+      overall.totalDet,
+      overall.strict,
+      overall.relaxed,
+      overall.coverageRecall,
+      totalWallMs
+    )
   )
+
+  const unmatched = rows.flatMap((r) =>
+    r.scored.unmatchedAtRelaxed.map((d) => ({ image: r.name, d }))
+  )
+  if (unmatched.length > 0) {
+    lines.push('', '### Unmatched detections (no GT region even at relaxed IoU>=0.4)', '')
+    lines.push('| image | bbox | text | confidence |', '|---|---|---|---|')
+    for (const { image, d } of unmatched) {
+      const bbox = `x=${d.bbox.x.toFixed(0)},y=${d.bbox.y.toFixed(0)},w=${d.bbox.w.toFixed(0)},h=${d.bbox.h.toFixed(0)}`
+      lines.push(`| ${image} | ${bbox} | ${JSON.stringify(d.text)} | ${d.confidence.toFixed(2)} |`)
+    }
+  } else {
+    lines.push('', '_No unmatched detections at relaxed IoU>=0.4 - zero hallucinations._')
+  }
+
   return lines.join('\n')
 }
 
