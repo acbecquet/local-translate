@@ -430,8 +430,8 @@ async function createPPOcrEngine() {
   }
 }
 
-function chatOnce(client, model, buffer) {
-  return client.chat({
+async function chatOnce(client, model, buffer) {
+  const req = {
     model,
     messages: [
       {
@@ -447,7 +447,19 @@ function chatOnce(client, model, buffer) {
     format: z.toJSONSchema(VLM_REGION_SCHEMA),
     options: { temperature: 0 },
     stream: false
-  })
+  }
+  // Thinking-family models (qwen3.5/3.6) NEED think disabled under a forced
+  // JSON-schema format: otherwise they spend the entire generation budget in
+  // thinking tokens and return empty message content ("Unexpected end of
+  // JSON input", observed live on qwen3.5:9b). Models without a thinking
+  // mode reject the think parameter outright, so retry once without it.
+  try {
+    return await client.chat({ ...req, think: false })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (/think/i.test(msg)) return client.chat(req)
+    throw err
+  }
 }
 
 const VLM_REGION_SCHEMA = z.object({
@@ -481,7 +493,7 @@ function createVlmEngine(model) {
   // silently stalls (no vision support, driver wedge) has to surface as a
   // per-image failure, not an indefinite hang. Overridable for slow first
   // loads via SPIKE_VLM_TIMEOUT_MS.
-  const timeoutMs = Number(process.env.SPIKE_VLM_TIMEOUT_MS || 180000)
+  const timeoutMs = Number(process.env.SPIKE_VLM_TIMEOUT_MS || 300000)
   return {
     async detectRegions(buffer) {
       const img = new Image(buffer)
@@ -503,7 +515,13 @@ function createVlmEngine(model) {
       const res = await Promise.race([chatOnce(client, model, buffer), timeout]).finally(() =>
         clearTimeout(timer)
       )
-      const parsed = VLM_REGION_SCHEMA.parse(JSON.parse(res.message.content))
+      const content = res.message.content ?? ''
+      if (content.trim() === '') {
+        throw new Error(
+          'model returned empty content (thinking-only output? unsupported image input?)'
+        )
+      }
+      const parsed = VLM_REGION_SCHEMA.parse(JSON.parse(content))
       return parsed.regions.map((r, i) => ({
         id: `r${i + 1}`,
         bbox: {
