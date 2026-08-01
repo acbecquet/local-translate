@@ -393,6 +393,12 @@ function resolveEmbedTarget(archive: PptxArchive, partPath: string, rId: string)
   }
   for (const rel of elems(relsDoc, RELS_NS, 'Relationship')) {
     if (rel.getAttribute('Id') === rId) {
+      // External targets (TargetMode="External") are URLs, not archive
+      // parts - resolving one into a local part path would fabricate a
+      // nonsense path that later crashes readMediaBytes. Linked (not
+      // embedded) pictures are simply not local content this tool can
+      // translate, so they resolve to nothing.
+      if (rel.getAttribute('TargetMode') === 'External') return null
       const target = rel.getAttribute('Target')
       if (target) return resolvePartPath(partPath, target)
     }

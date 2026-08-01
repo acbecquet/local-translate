@@ -486,9 +486,23 @@ async function collectMediaSegments(
       continue
     }
 
-    const buffer = await readMediaBytes(archive, mediaPath)
-    const img = await loadImage(buffer)
-    const raw = await regionEngine.detectRegions(buffer)
+    // Per-part isolation: a dangling relationship target, an undecodable
+    // raster (mislabeled/corrupt bytes), or an engine failure on one image
+    // must degrade to a skip for THAT part, never crash the whole extract -
+    // same defensive stance as the SmartArt data-part reads above. The
+    // untouched part stays byte-identical through save(), so a skipped
+    // image is preserved content, not lost content.
+    let img: Awaited<ReturnType<typeof loadImage>>
+    let raw: TextRegion[]
+    let buffer: Buffer
+    try {
+      buffer = await readMediaBytes(archive, mediaPath)
+      img = await loadImage(buffer)
+      raw = await regionEngine.detectRegions(buffer)
+    } catch {
+      onSkip?.(mediaPath, 'media part unreadable', name)
+      continue
+    }
     const validated = validateRegions(raw, img.width, img.height)
     const groupKey = `slide${slideNumberOf(firstSlidePath)}`
 

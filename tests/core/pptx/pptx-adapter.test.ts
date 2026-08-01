@@ -2584,6 +2584,93 @@ describe('embedded media - dedup by part path (behavior contract point 1)', () =
   })
 })
 
+describe('embedded media - malformed references degrade to skips, never crash extract', () => {
+  async function patchSlideRels(
+    srcPath: string,
+    mutate: (relsXml: string) => string
+  ): Promise<string> {
+    const zip = await JSZip.loadAsync(await readFile(srcPath))
+    const relsPath = 'ppt/slides/_rels/slide1.xml.rels'
+    const xml = await zip.file(relsPath)!.async('string')
+    zip.file(relsPath, mutate(xml))
+    const patched = path.join(path.dirname(srcPath), 'patched.pptx')
+    await writeFile(patched, await zip.generateAsync({ type: 'nodebuffer' }))
+    return patched
+  }
+
+  it('a dangling relationship target (part does not exist) yields a media-part-unreadable skip, not a throw', async () => {
+    const png = await makePngBytes(200, 100, '#ffffff')
+    const engine = fakeMediaEngine([{ bytes: png, regions: [] }])
+    const srcPath = await writeDeck({
+      slides: [{ shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: png }] }]
+    })
+    const patched = await patchSlideRels(srcPath, (xml) =>
+      xml.replace(/Target="\.\.\/media\/[^"]+"/, 'Target="../media/missing.png"')
+    )
+
+    const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const segments = await adapter.extract(patched)
+
+    expect(segments.filter((s) => s.kind === 'image-region')).toHaveLength(0)
+    const skips = adapter.collectSkips()
+    expect(skips.some((s) => s.reason === 'media part unreadable')).toBe(true)
+  })
+
+  it('a TargetMode=External picture relationship is ignored entirely: no segment, no skip, no crash', async () => {
+    const png = await makePngBytes(200, 100, '#ffffff')
+    const engine = fakeMediaEngine([{ bytes: png, regions: [] }])
+    const srcPath = await writeDeck({
+      slides: [{ shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: png }] }]
+    })
+    const patched = await patchSlideRels(srcPath, (xml) =>
+      xml.replace(
+        /Target="\.\.\/media\/[^"]+"/,
+        'Target="https://example.com/x.png" TargetMode="External"'
+      )
+    )
+
+    const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const segments = await adapter.extract(patched)
+
+    expect(segments.filter((s) => s.kind === 'image-region')).toHaveLength(0)
+    expect(adapter.collectSkips()).toHaveLength(0)
+    expect(engine.detectRegions).not.toHaveBeenCalled()
+  })
+
+  it('an undecodable raster part (corrupt bytes under a .png name) degrades to a skip and the part stays byte-identical through apply', async () => {
+    const png = await makePngBytes(200, 100, '#ffffff')
+    const engine = fakeMediaEngine([{ bytes: png, regions: [] }])
+    const srcPath = await writeDeck({
+      slides: [{ shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: png }] }]
+    })
+    // Corrupt the media part in place: still a .png part path, garbage bytes.
+    // Skip JSZip's directory entries ('ppt/media/') - matching one would
+    // corrupt a phantom entry and leave the real image intact.
+    const zip = await JSZip.loadAsync(await readFile(srcPath))
+    const mediaName = Object.keys(zip.files).find(
+      (p) => p.startsWith('ppt/media/') && !zip.files[p].dir
+    )!
+    zip.file(mediaName, Buffer.from('not an image at all'))
+    const patched = path.join(path.dirname(srcPath), 'corrupt.pptx')
+    await writeFile(patched, await zip.generateAsync({ type: 'nodebuffer' }))
+    const srcDigests = await digestParts(await readFile(patched))
+
+    const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const report = await runPipeline({
+      file: patched,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend: translateBackend(mockTranslate)
+    })
+
+    expect(adapter.collectSkips().some((s) => s.reason === 'media part unreadable')).toBe(true)
+    const outDigests = await digestParts(await readFile(report.outPath))
+    expect(outDigests.get(mediaName)).toBe(srcDigests.get(mediaName))
+  })
+})
+
 describe('embedded media - id/groupKey/context (behavior contract point 2)', () => {
   it('ids are namespaced media/<basename>#r<n>, globally unique against text-site ids by construction', async () => {
     const png = await makePngBytes(200, 100, '#ffffff')
