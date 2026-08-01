@@ -23,6 +23,7 @@
     "spike-image-regions": "node scripts/spike-image-regions.mjs"
   },
   "dependencies": {
+    "@gutenye/ocr-node": "^1.4.8",
     "@xmldom/xmldom": "^0.9.10",
     "jszip": "^3.10.1",
     "ollama": "^0.6.3",
@@ -33,7 +34,6 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@gutenye/ocr-node": "^1.4.8",
     "@playwright/test": "^1.62.0",
     "@types/node": "^26.1.2",
     "@types/react": "^19.2.17",
