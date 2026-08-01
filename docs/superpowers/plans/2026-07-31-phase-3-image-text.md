@@ -114,7 +114,9 @@ Plus `real/`: extract 4 representative media parts from the benchmark deck (2 pn
 **Execution split (machine rules):**
 
 - Agent runs: fixture generation, harness self-test (a `mock:labels` engine that replays labels.json must score recall=precision=IoU=1.0 - proves the scorer), and the `ocr:ppocr` leg (CPU, light).
-- Charlie runs (run-tagged blocks, pasted output): `vlm:qwen3-vl` leg and `vlm:gemma4:e4b` leg (probing whether e4b accepts images at all is step one of that leg).
+- Charlie runs (run-tagged blocks, pasted output): the VLM legs.
+  AMENDED 2026-08-01 (Charlie: qwen3-vl is outdated; leaderboard-informed reselect): `vlm:glm-ocr` (2.2GB document-OCR specialist VLM, vision-confirmed on ollama) and `vlm:qwen3.5:9b` (current multimodal Qwen line, 6.6GB, leaderboard intelligence 21).
+  `vlm:gemma4:e4b` stays as an optional zero-download leg: the ollama library confirms the whole gemma4 family is vision-capable, so the original "does e4b accept images" probe is already answered yes; running it only measures quality.
 
 **Decision criteria (recorded in the decision doc):**
 
