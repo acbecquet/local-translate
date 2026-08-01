@@ -475,6 +475,35 @@ async function chatOnce(client, model, buffer) {
  * for a schema-compliant one - which output convention a model actually
  * emits is itself spike data for Task 2's validation ladder.
  */
+/**
+ * Some VLMs fill the schema's w/h fields with x2/y2 corner coordinates
+ * despite the field names (observed live: qwen3.6:35b did this on 9 of 10
+ * images while emitting true w/h on the 10th). Decide per image which
+ * reading is geometrically saner: reinterpret {w,h} as {x2,y2} only when
+ * every resulting extent stays positive AND the corner reading produces
+ * strictly less mutual overlap between regions than the literal one.
+ * Single-region images have no overlap signal, so corner wins there only
+ * when the literal reading is degenerate (w<=x or h<=y would be required
+ * for certainty; without it, literal stands).
+ */
+function disambiguateBoxes(regions) {
+  if (regions.length < 2) return { regions, corner: false }
+  const corner = regions.map((r) => ({
+    ...r,
+    bbox: { x: r.bbox.x, y: r.bbox.y, w: r.bbox.w - r.bbox.x, h: r.bbox.h - r.bbox.y }
+  }))
+  if (!corner.every((r) => r.bbox.w > 0 && r.bbox.h > 0)) return { regions, corner: false }
+  const overlap = (list) => {
+    let sum = 0
+    for (let i = 0; i < list.length; i++) {
+      for (let j = i + 1; j < list.length; j++) sum += iou(list[i].bbox, list[j].bbox)
+    }
+    return sum
+  }
+  if (overlap(corner) < overlap(regions)) return { regions: corner, corner: true }
+  return { regions, corner: false }
+}
+
 function parseVlmRegions(content) {
   try {
     return VLM_REGION_SCHEMA.parse(JSON.parse(content)).regions
@@ -566,7 +595,9 @@ function createVlmEngine(model) {
           'model returned empty content (thinking-only output? unsupported image input?)'
         )
       }
-      const regions = parseVlmRegions(content)
+      const parsedRegions = parseVlmRegions(content)
+      const { regions, corner } = disambiguateBoxes(parsedRegions)
+      if (corner) process.stdout.write('(corner-convention boxes) ')
       return regions.map((r, i) => ({
         id: `r${i + 1}`,
         bbox: {
