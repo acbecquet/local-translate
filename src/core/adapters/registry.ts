@@ -33,7 +33,10 @@ export interface AdapterDeps {
  * module-level constant the way the old `ADAPTERS` array was.
  */
 export function buildAdapters(deps: AdapterDeps): FormatAdapter[] {
-  const adapters: FormatAdapter[] = [new FakeAdapter(), new PptxAdapter()]
+  const adapters: FormatAdapter[] = [
+    new FakeAdapter(),
+    new PptxAdapter({ regionEngine: deps.regionEngine, sourceLang: deps.sourceLang })
+  ]
   if (deps.regionEngine) {
     adapters.push(createImageAdapter(deps.regionEngine, { sourceLang: deps.sourceLang }))
   }

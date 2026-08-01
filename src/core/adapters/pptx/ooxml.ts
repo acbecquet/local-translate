@@ -44,6 +44,17 @@ export interface PptxArchive {
   layoutPathFor(slidePath: string): string | null
   /** Resolves a layout's master part path via the layout's `_rels`, or null if unresolvable. */
   masterPathFor(layoutPath: string): string | null
+  /**
+   * Raw bytes of a binary (non-XML) part, e.g. a media part - throws if the
+   * part doesn't exist. Never goes through the XML DOM cache: media bytes
+   * (PNG/JPG/EMF/...) would fail readXml's parse outright.
+   */
+  readRawBytes(partPath: string): Buffer
+  /**
+   * Replaces a binary part's bytes and marks it dirty (see markDirty) - only
+   * dirty parts are re-serialized on save().
+   */
+  writeRawBytes(partPath: string, bytes: Buffer): void
   /** Writes a .pptx to outPath: dirty parts re-serialized, everything else byte-identical. */
   save(outPath: string): Promise<void>
 }
@@ -77,6 +88,8 @@ export async function openPptx(filePath: string): Promise<PptxArchive> {
 class PptxArchiveImpl implements PptxArchive {
   private readonly domCache = new Map<string, Document>()
   private readonly dirty = new Set<string>()
+  /** Overrides for parts written via writeRawBytes - checked ahead of the original bytes in `parts` by both readRawBytes and save(). */
+  private readonly rawOverrides = new Map<string, Buffer>()
 
   constructor(
     private readonly filePath: string,
@@ -122,6 +135,24 @@ class PptxArchiveImpl implements PptxArchive {
     this.dirty.add(partPath)
   }
 
+  readRawBytes(partPath: string): Buffer {
+    const override = this.rawOverrides.get(partPath)
+    if (override) return override
+    const raw = this.parts.get(partPath)
+    if (raw === undefined) {
+      throw new Error(`Part "${partPath}" not found in "${this.filePath}"`)
+    }
+    return raw
+  }
+
+  writeRawBytes(partPath: string, bytes: Buffer): void {
+    if (!this.parts.has(partPath)) {
+      throw new Error(`Cannot write unknown part "${partPath}" in "${this.filePath}"`)
+    }
+    this.rawOverrides.set(partPath, bytes)
+    this.markDirty(partPath)
+  }
+
   layoutPathFor(slidePath: string): string | null {
     return this.resolveRelTarget(slidePath, REL_TYPE_SLIDE_LAYOUT)
   }
@@ -150,13 +181,19 @@ class PptxArchiveImpl implements PptxArchive {
 
     for (const [partPath, raw] of this.parts) {
       if (this.dirty.has(partPath)) {
-        const doc = this.domCache.get(partPath)
-        if (!doc) {
-          throw new Error(
-            `Part "${partPath}" was marked dirty but was never read via readXml() - nothing to serialize`
-          )
+        const rawOverride = this.rawOverrides.get(partPath)
+        if (rawOverride) {
+          outZip.file(partPath, rawOverride)
+        } else {
+          const doc = this.domCache.get(partPath)
+          if (!doc) {
+            throw new Error(
+              `Part "${partPath}" was marked dirty but was never read via readXml() or written via ` +
+                'writeRawBytes() - nothing to serialize'
+            )
+          }
+          outZip.file(partPath, serializeXmlPart(doc))
         }
-        outZip.file(partPath, serializeXmlPart(doc))
       } else {
         outZip.file(partPath, raw)
       }
@@ -291,4 +328,84 @@ export function setRunText(r: Element, text: string): void {
   } else if (t.hasAttribute('xml:space')) {
     t.removeAttribute('xml:space')
   }
+}
+
+// ---- embedded-media enumeration (Phase 3, Task 5) ----
+
+/** One `<p:pic>`'s embedded media usage - see listPictureMedia. */
+export interface MediaRef {
+  mediaPath: string
+  slidePath: string
+}
+
+/**
+ * Every embedded picture's media part, one MediaRef per USAGE (not deduped -
+ * a media part referenced by 3 `<p:pic>` elements across the deck yields 3
+ * entries here; deduping by `mediaPath` is the caller's job - see
+ * pptx-adapter.ts's embedded-media hookup, Phase 3 Task 5 behavior contract
+ * point 1). Resolves through `<p:pic>/<p:blipFill>/<a:blip r:embed="...">`
+ * on every slide, via a deep search (elems), so pictures nested inside
+ * `<p:grpSp>` groups are found too, not just direct spTree children.
+ *
+ * Only EMBEDDED media is returned: a `<a:blip>` with `r:link` instead of
+ * `r:embed` (a LINKED, external image with no local part) has nothing for
+ * `mediaPath` to name and is silently skipped - there is no local media part
+ * to read or rewrite for it.
+ *
+ * Returns BOTH raster (png/jpg/jpeg) and vector metafile (emf/wmf) media
+ * refs without filtering by format - real PowerPoint stores a pasted
+ * EMF/WMF exactly like any other picture (a `<p:pic>` with a normal
+ * `r:embed` blip), and the caller needs to know it exists to report it as a
+ * skip (Task 5 behavior contract point 3), which it could never do if this
+ * enumeration silently dropped it. The raster/vector split is the caller's
+ * decision, not this function's.
+ */
+export function listPictureMedia(archive: PptxArchive): MediaRef[] {
+  const refs: MediaRef[] = []
+  for (const slidePath of archive.listSlidePaths()) {
+    const slideDoc = archive.readXml(slidePath)
+    for (const pic of elems(slideDoc, P_NS, 'pic')) {
+      const blipFill = childElems(pic, P_NS, 'blipFill')[0]
+      const blip = blipFill && childElems(blipFill, A_NS, 'blip')[0]
+      const rId = blip?.getAttributeNS(R_NS, 'embed')
+      if (!rId) continue
+      const mediaPath = resolveEmbedTarget(archive, slidePath, rId)
+      if (mediaPath) refs.push({ mediaPath, slidePath })
+    }
+  }
+  return refs
+}
+
+/**
+ * Resolves a relationship by exact Id (not Type) in `partPath`'s own
+ * `_rels` file. Reimplements pptx-adapter.ts's private resolveRelById
+ * (not exported - it resolves OTHER relationship kinds this module doesn't
+ * cover: notesSlide, SmartArt data) since relationship-by-Id resolution
+ * belongs at this layer for the relationship kind ooxml.ts itself now
+ * needs (image).
+ */
+function resolveEmbedTarget(archive: PptxArchive, partPath: string, rId: string): string | null {
+  let relsDoc: Document
+  try {
+    relsDoc = archive.readXml(relsPathFor(partPath))
+  } catch {
+    return null
+  }
+  for (const rel of elems(relsDoc, RELS_NS, 'Relationship')) {
+    if (rel.getAttribute('Id') === rId) {
+      const target = rel.getAttribute('Target')
+      if (target) return resolvePartPath(partPath, target)
+    }
+  }
+  return null
+}
+
+/** Reads a media part's raw bytes (PNG/JPG/EMF/... - never parsed as XML). */
+export async function readMediaBytes(archive: PptxArchive, mediaPath: string): Promise<Buffer> {
+  return archive.readRawBytes(mediaPath)
+}
+
+/** Replaces a media part's bytes and marks it dirty - see PptxArchive.writeRawBytes. */
+export function writeMediaBytes(archive: PptxArchive, mediaPath: string, bytes: Buffer): void {
+  archive.writeRawBytes(mediaPath, bytes)
 }

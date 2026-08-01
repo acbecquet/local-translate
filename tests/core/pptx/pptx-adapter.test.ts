@@ -1,14 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import JSZip from 'jszip'
+import { Canvas } from 'skia-canvas'
 import type { Element } from '@xmldom/xmldom'
 import { A_NS, elems, openPptx } from '../../../src/core/adapters/pptx/ooxml'
 import { PptxAdapter } from '../../../src/core/adapters/pptx/pptx-adapter'
 import { runPipeline } from '../../../src/core/pipeline'
 import type { TextSegment, TranslatedSegment } from '../../../src/core/segments'
+import {
+  CONFIDENCE_FLOOR,
+  type RegionEngine,
+  type TextRegion
+} from '../../../src/core/images/regions'
 import type {
   BatchRequest,
   BatchResponse,
@@ -16,6 +23,38 @@ import type {
 } from '../../../src/core/translate/backend'
 import { buildPptx, type BuildPptxOptions } from '../../helpers/build-pptx'
 import { checkPptxIntegrity } from '../../helpers/pptx-integrity'
+
+/** A real, skia-canvas-decodable solid-color PNG - media region detection decodes real dimensions, so every fixture here must be a genuine encoded image, never a raw/fake buffer. */
+async function makePngBytes(width: number, height: number, color = '#ffffff'): Promise<Buffer> {
+  const canvas = new Canvas(width, height)
+  const ctx = canvas.getContext('2d')
+  ctx.fillStyle = color
+  ctx.fillRect(0, 0, width, height)
+  return canvas.toBuffer('png')
+}
+
+async function makeJpegBytes(width: number, height: number, color = '#ffffff'): Promise<Buffer> {
+  const canvas = new Canvas(width, height)
+  const ctx = canvas.getContext('2d')
+  ctx.fillStyle = color
+  ctx.fillRect(0, 0, width, height)
+  return canvas.toBuffer('jpeg', { quality: 0.9 })
+}
+
+/** Routes detectRegions by exact buffer identity - lets one test register several distinct media buffers, each with its own canned detection result (mirrors tests/core/images/image-adapter.test.ts's own per-file routing for the same reason: more than one real media buffer can be in play in a single test). */
+function fakeMediaEngine(entries: { bytes: Buffer; regions: TextRegion[] }[]): RegionEngine {
+  const detectRegions = vi.fn(async (buf: Buffer) => {
+    const match = entries.find((e) => e.bytes.equals(buf))
+    return match ? match.regions : []
+  })
+  return { detectRegions }
+}
+
+function rawMediaRegion(
+  overrides: Partial<TextRegion> & { bbox: TextRegion['bbox']; text: string }
+): TextRegion {
+  return { id: 'raw', confidence: 0.9, ...overrides }
+}
 
 const EMU_PER_PT = 12700
 
@@ -37,6 +76,14 @@ async function writeDeck(opts: BuildPptxOptions): Promise<string> {
   const srcPath = path.join(dir, 'src.pptx')
   await writeFile(srcPath, buffer)
   return srcPath
+}
+
+/** Writes a real image buffer to a fresh tmp file - for the gating-parity test, which runs image-adapter.ts (a standalone-file adapter) side by side with the pptx adapter over equivalent content. */
+async function writeStandaloneImage(bytes: Buffer): Promise<string> {
+  const dir = await tmpDir('lt-pptx-gating-parity-')
+  const file = path.join(dir, 'photo.png')
+  await writeFile(file, bytes)
+  return file
 }
 
 /** sha256 of the decompressed bytes of every part in a .pptx buffer, keyed by part path (same technique as ooxml.test.ts). */
@@ -2462,5 +2509,484 @@ describe('PptxAdapter round-trip', () => {
 
     const integrity = await checkPptxIntegrity(await readFile(outPath))
     expect(integrity.ok).toBe(true)
+  })
+})
+
+/**
+ * Embedded-media (pptx picture) translation via media re-embedding - Phase
+ * 3 Task 5. Every describe block below is named after one of the plan's 7
+ * behavior-contract points (see docs/superpowers/plans/2026-07-31-phase-3-
+ * image-text.md, "Task 5: pptx embedded-media hookup"). All engine-mocked,
+ * builder decks, no model loads.
+ */
+const PIC_BOX = { xEmu: 0, yEmu: 0, wEmu: 200 * EMU_PER_PT, hEmu: 100 * EMU_PER_PT }
+
+describe('embedded media - dedup by part path (behavior contract point 1)', () => {
+  it('a media part used on 3 slides is detected once and produces exactly one segment', async () => {
+    const png = await makePngBytes(200, 100, '#ffffff')
+    const engine = fakeMediaEngine([
+      {
+        bytes: png,
+        regions: [rawMediaRegion({ bbox: { x: 20, y: 20, w: 100, h: 30 }, text: 'Hello' })]
+      }
+    ])
+    const srcPath = await writeDeck({
+      slides: [
+        { shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: png, sharedMediaKey: 'shared' }] },
+        { shapes: [{ kind: 'picture', box: PIC_BOX, sharedMediaKey: 'shared' }] },
+        { shapes: [{ kind: 'picture', box: PIC_BOX, sharedMediaKey: 'shared' }] }
+      ]
+    })
+
+    const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const segments = await adapter.extract(srcPath)
+    const imageSegs = segments.filter((s) => s.kind === 'image-region')
+
+    expect(imageSegs).toHaveLength(1)
+    expect(engine.detectRegions).toHaveBeenCalledTimes(1)
+  })
+
+  it('translated once, rewritten once: the deck ends up with exactly one changed media part, still valid', async () => {
+    const png = await makePngBytes(200, 100, '#ffffff')
+    const engine = fakeMediaEngine([
+      {
+        bytes: png,
+        regions: [rawMediaRegion({ bbox: { x: 20, y: 20, w: 100, h: 30 }, text: 'Hello' })]
+      }
+    ])
+    const srcPath = await writeDeck({
+      slides: [
+        { shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: png, sharedMediaKey: 'shared' }] },
+        { shapes: [{ kind: 'picture', box: PIC_BOX, sharedMediaKey: 'shared' }] },
+        { shapes: [{ kind: 'picture', box: PIC_BOX, sharedMediaKey: 'shared' }] }
+      ]
+    })
+    const srcDigests = await digestParts(await readFile(srcPath))
+
+    const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const report = await runPipeline({
+      file: srcPath,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend: translateBackend(mockTranslate)
+    })
+
+    const outBuffer = await readFile(report.outPath)
+    const outDigests = await digestParts(outBuffer)
+    const mediaParts = [...outDigests.keys()].filter((p) => p.startsWith('ppt/media/'))
+    expect(mediaParts).toHaveLength(1) // one part in the deck to begin with, still one - dedup shares it
+    expect(outDigests.get(mediaParts[0])).not.toBe(srcDigests.get(mediaParts[0]))
+
+    const integrity = await checkPptxIntegrity(outBuffer)
+    expect(integrity.ok).toBe(true)
+  })
+})
+
+describe('embedded media - id/groupKey/context (behavior contract point 2)', () => {
+  it('ids are namespaced media/<basename>#r<n>, globally unique against text-site ids by construction', async () => {
+    const png = await makePngBytes(200, 100, '#ffffff')
+    const engine = fakeMediaEngine([
+      {
+        bytes: png,
+        regions: [rawMediaRegion({ bbox: { x: 20, y: 20, w: 100, h: 30 }, text: 'Hello' })]
+      }
+    ])
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Real text'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 3000 * EMU_PER_PT, hEmu: 1500 * EMU_PER_PT }
+            },
+            { kind: 'picture', box: PIC_BOX, mediaBytes: png }
+          ]
+        }
+      ]
+    })
+
+    const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const segments = await adapter.extract(srcPath)
+
+    expect(new Set(segments.map((s) => s.id)).size).toBe(segments.length) // no id collisions at all
+    const mediaSeg = segments.find((s) => s.kind === 'image-region')!
+    expect(mediaSeg.id).toMatch(/^media\/image\d+\.png#r1$/)
+    expect(mediaSeg.context).toBe('embedded image text')
+  })
+
+  it('groupKey is the FIRST slide that uses the part, not a later slide sharing it', async () => {
+    const png = await makePngBytes(200, 100, '#ffffff')
+    const engine = fakeMediaEngine([
+      {
+        bytes: png,
+        regions: [rawMediaRegion({ bbox: { x: 20, y: 20, w: 100, h: 30 }, text: 'Hello' })]
+      }
+    ])
+    const srcPath = await writeDeck({
+      slides: [
+        { shapes: [{ kind: 'textbox', text: ['Slide one text'], box: PIC_BOX }] }, // no picture here
+        { shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: png, sharedMediaKey: 'shared' }] }, // first usage
+        { shapes: [{ kind: 'picture', box: PIC_BOX, sharedMediaKey: 'shared' }] } // second usage, later slide
+      ]
+    })
+
+    const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const segments = await adapter.extract(srcPath)
+    const mediaSeg = segments.find((s) => s.kind === 'image-region')!
+
+    expect(mediaSeg.groupKey).toBe('slide2') // the first slide that uses the shared part, not slide3
+  })
+})
+
+describe('embedded media - raster filter (behavior contract point 3)', () => {
+  it('png/jpg parts are processed (produce segments)', async () => {
+    const png = await makePngBytes(150, 80, '#ffffff')
+    const jpeg = await makeJpegBytes(150, 80, '#ffffff')
+    const engine = fakeMediaEngine([
+      {
+        bytes: png,
+        regions: [rawMediaRegion({ bbox: { x: 10, y: 10, w: 80, h: 20 }, text: 'PngText' })]
+      },
+      {
+        bytes: jpeg,
+        regions: [rawMediaRegion({ bbox: { x: 10, y: 10, w: 80, h: 20 }, text: 'JpgText' })]
+      }
+    ])
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            { kind: 'picture', box: PIC_BOX, mediaBytes: png, mediaExt: 'png' },
+            { kind: 'picture', box: PIC_BOX, mediaBytes: jpeg, mediaExt: 'jpg' }
+          ]
+        }
+      ]
+    })
+
+    const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const segments = await adapter.extract(srcPath)
+    const mediaTexts = segments.filter((s) => s.kind === 'image-region').map((s) => s.text)
+
+    expect(mediaTexts.sort()).toEqual(['JpgText', 'PngText'])
+    expect(adapter.collectSkips!()).toEqual([])
+  })
+
+  it('emf/wmf parts are never decoded and are reported as "vector metafile image", not processed', async () => {
+    const engine = fakeMediaEngine([]) // must never be asked to detect on the emf bytes
+    const garbageMetafile = Buffer.from('not a real EMF, but that is exactly the point')
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: garbageMetafile, mediaExt: 'emf' }]
+        }
+      ]
+    })
+
+    const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const segments = await adapter.extract(srcPath)
+
+    expect(segments.filter((s) => s.kind === 'image-region')).toEqual([])
+    const skips = adapter.collectSkips!()
+    expect(skips).toHaveLength(1)
+    expect(skips[0].reason).toBe('vector metafile image')
+    expect(skips[0].id).toMatch(/\.emf$/)
+    expect(engine.detectRegions).not.toHaveBeenCalled() // never attempted to decode garbage bytes as an image
+  })
+})
+
+describe('embedded media - regionEngine null is exactly Phase 2 behavior (behavior contract point 4)', () => {
+  it('zero image segments, zero media rewrites, and no skips added for media', async () => {
+    const png = await makePngBytes(150, 80, '#ffffff')
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Real text'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 3000 * EMU_PER_PT, hEmu: 1500 * EMU_PER_PT }
+            },
+            { kind: 'picture', box: PIC_BOX, mediaBytes: png }
+          ]
+        }
+      ]
+    })
+    const srcDigests = await digestParts(await readFile(srcPath))
+
+    // Both the default (no-arg) construction and an explicit null engine
+    // must behave identically - the default IS { regionEngine: null, ... }.
+    for (const adapter of [
+      new PptxAdapter(),
+      new PptxAdapter({ regionEngine: null, sourceLang: 'English' })
+    ]) {
+      const segments = await adapter.extract(srcPath)
+      expect(segments.filter((s) => s.kind === 'image-region')).toEqual([])
+      expect(adapter.collectSkips!()).toEqual([]) // no "vector metafile image" or any other media skip
+
+      const outPath = path.join(
+        path.dirname(srcPath),
+        `out-${Math.random().toString(36).slice(2)}.pptx`
+      )
+      await adapter.apply(srcPath, outPath, [])
+      const outDigests = await digestParts(await readFile(outPath))
+      const mediaPart = [...srcDigests.keys()].find((p) => p.startsWith('ppt/media/'))!
+      expect(outDigests.get(mediaPart)).toBe(srcDigests.get(mediaPart)) // never rewritten
+    }
+  })
+})
+
+describe('embedded media - apply() rewrites only painted media parts; everything else stays lossless (behavior contract point 5)', () => {
+  it('a gated-out (non-CJK under CJK source) media part and every other part stay byte-identical; only the painted part changes', async () => {
+    const paintedPng = await makePngBytes(150, 80, '#ffffff')
+    const gatedPng = await makePngBytes(120, 60, '#000000')
+    const engine = fakeMediaEngine([
+      {
+        bytes: paintedPng,
+        regions: [rawMediaRegion({ bbox: { x: 10, y: 10, w: 60, h: 20 }, text: '你好世界' })]
+      },
+      {
+        bytes: gatedPng,
+        regions: [rawMediaRegion({ bbox: { x: 10, y: 10, w: 60, h: 20 }, text: 'Model X200' })] // pure-latin, gated out under a CJK source
+      }
+    ])
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['这是标题文本'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 3000 * EMU_PER_PT, hEmu: 1500 * EMU_PER_PT }
+            },
+            { kind: 'picture', box: PIC_BOX, mediaBytes: paintedPng, name: 'Painted' },
+            { kind: 'picture', box: PIC_BOX, mediaBytes: gatedPng, name: 'Gated' }
+          ]
+        }
+      ]
+    })
+    const srcDigests = await digestParts(await readFile(srcPath))
+
+    const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'Chinese (Simplified)' })
+    const report = await runPipeline({
+      file: srcPath,
+      sourceLang: 'Chinese (Simplified)',
+      targetLang: 'English',
+      model: 'test-model',
+      adapter,
+      backend: translateBackend(mockTranslate)
+    })
+
+    const outBuffer = await readFile(report.outPath)
+    const outDigests = await digestParts(outBuffer)
+    const mediaParts = [...srcDigests.keys()].filter((p) => p.startsWith('ppt/media/'))
+    expect(mediaParts).toHaveLength(2)
+
+    let changedCount = 0
+    for (const part of mediaParts) {
+      if (outDigests.get(part) !== srcDigests.get(part)) changedCount++
+    }
+    expect(changedCount).toBe(1) // only the CJK (painted) region's media part changed
+
+    // Every part OTHER than the painted media part and the slide xml (which
+    // legitimately changed due to the translated textbox) stays byte-identical.
+    for (const [part, digest] of srcDigests) {
+      if (part.startsWith('ppt/media/')) continue
+      if (part === 'ppt/slides/slide1.xml') continue
+      expect(outDigests.get(part)).toBe(digest)
+    }
+
+    const integrity = await checkPptxIntegrity(outBuffer)
+    expect(integrity.ok).toBe(true)
+  })
+
+  it('translating an embedded image never touches the slide XML that displays it (picture-only slide)', async () => {
+    const png = await makePngBytes(150, 80, '#ffffff')
+    const engine = fakeMediaEngine([
+      {
+        bytes: png,
+        regions: [rawMediaRegion({ bbox: { x: 10, y: 10, w: 60, h: 20 }, text: 'Hello' })]
+      }
+    ])
+    const srcPath = await writeDeck({
+      slides: [{ shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: png }] }]
+    })
+    const srcDigests = await digestParts(await readFile(srcPath))
+
+    const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const report = await runPipeline({
+      file: srcPath,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend: translateBackend(mockTranslate)
+    })
+
+    const outDigests = await digestParts(await readFile(report.outPath))
+    expect(outDigests.get('ppt/slides/slide1.xml')).toBe(srcDigests.get('ppt/slides/slide1.xml'))
+    const mediaPart = [...srcDigests.keys()].find((p) => p.startsWith('ppt/media/'))!
+    expect(outDigests.get(mediaPart)).not.toBe(srcDigests.get(mediaPart))
+  })
+})
+
+describe('embedded media - rewritten parts keep their original format (behavior contract point 6)', () => {
+  const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47])
+  const JPEG_MAGIC = Buffer.from([0xff, 0xd8])
+
+  it.each([
+    { label: 'png', make: () => makePngBytes(150, 80, '#ffffff'), ext: 'png', magic: PNG_MAGIC },
+    { label: 'jpg', make: () => makeJpegBytes(150, 80, '#ffffff'), ext: 'jpg', magic: JPEG_MAGIC }
+  ])(
+    'a rewritten $label media part still starts with $label magic bytes',
+    async ({ make, ext, magic }) => {
+      const bytes = await make()
+      const engine = fakeMediaEngine([
+        {
+          bytes,
+          regions: [rawMediaRegion({ bbox: { x: 10, y: 10, w: 60, h: 20 }, text: 'Hello' })]
+        }
+      ])
+      const srcPath = await writeDeck({
+        slides: [{ shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: bytes, mediaExt: ext }] }]
+      })
+
+      const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+      const report = await runPipeline({
+        file: srcPath,
+        sourceLang: 'English',
+        targetLang: 'French',
+        model: 'test-model',
+        adapter,
+        backend: translateBackend(mockTranslate)
+      })
+
+      const outZip = await JSZip.loadAsync(await readFile(report.outPath))
+      const mediaEntry = Object.keys(outZip.files).find((p) => /^ppt\/media\/[^/]+$/.test(p))!
+      const outBytes = await outZip.file(mediaEntry)!.async('nodebuffer')
+      expect(outBytes.subarray(0, magic.length).equals(magic)).toBe(true)
+    }
+  )
+})
+
+describe('embedded media - confidence/rotated gating mirrors image-adapter.ts (behavior contract point 7)', () => {
+  it('a low-confidence media region is skipped with reason "low-confidence region", no segment', async () => {
+    const png = await makePngBytes(150, 80, '#ffffff')
+    const engine = fakeMediaEngine([
+      {
+        bytes: png,
+        regions: [
+          rawMediaRegion({
+            bbox: { x: 10, y: 10, w: 60, h: 20 },
+            text: 'Hello',
+            confidence: CONFIDENCE_FLOOR - 0.1
+          })
+        ]
+      }
+    ])
+    const srcPath = await writeDeck({
+      slides: [{ shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: png }] }]
+    })
+
+    const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const segments = await adapter.extract(srcPath)
+
+    expect(segments.filter((s) => s.kind === 'image-region')).toEqual([])
+    const skips = adapter.collectSkips!()
+    expect(skips).toHaveLength(1)
+    expect(skips[0].reason).toBe('low-confidence region')
+  })
+
+  it('a rotated media region is skipped with reason "rotated region", no segment', async () => {
+    const png = await makePngBytes(150, 80, '#ffffff')
+    const engine = fakeMediaEngine([
+      {
+        bytes: png,
+        regions: [
+          rawMediaRegion({ bbox: { x: 10, y: 10, w: 60, h: 20 }, text: 'Hello', rotated: true })
+        ]
+      }
+    ])
+    const srcPath = await writeDeck({
+      slides: [{ shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: png }] }]
+    })
+
+    const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const segments = await adapter.extract(srcPath)
+
+    expect(segments.filter((s) => s.kind === 'image-region')).toEqual([])
+    const skips = adapter.collectSkips!()
+    expect(skips).toHaveLength(1)
+    expect(skips[0].reason).toBe('rotated region')
+  })
+})
+
+describe('embedded media - gating parity with image-adapter.ts (behavior contract point 7)', () => {
+  it('pptx-adapter.ts and image-adapter.ts both import isSourceLanguageRegion from the single gating.ts module (no copy-paste divergence)', () => {
+    const pptxAdapterPath = path.resolve(
+      __dirname,
+      '../../../src/core/adapters/pptx/pptx-adapter.ts'
+    )
+    const imageAdapterPath = path.resolve(
+      __dirname,
+      '../../../src/core/adapters/images/image-adapter.ts'
+    )
+    const importRe = /import\s*\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]/g
+
+    function resolveGatingImport(filePath: string): string | null {
+      const src = readFileSync(filePath, 'utf8')
+      let m: RegExpExecArray | null
+      importRe.lastIndex = 0
+      while ((m = importRe.exec(src))) {
+        const names = m[1]
+        const specifier = m[2]
+        if (/\bisSourceLanguageRegion\b/.test(names)) {
+          return path.resolve(path.dirname(filePath), `${specifier}.ts`)
+        }
+      }
+      return null
+    }
+
+    const pptxGatingPath = resolveGatingImport(pptxAdapterPath)
+    const imageGatingPath = resolveGatingImport(imageAdapterPath)
+
+    expect(pptxGatingPath).not.toBeNull()
+    expect(imageGatingPath).not.toBeNull()
+    expect(pptxGatingPath).toBe(imageGatingPath)
+    expect(pptxGatingPath).toBe(path.resolve(__dirname, '../../../src/core/images/gating.ts'))
+  })
+
+  it('behavioral parity: pptx-adapter and image-adapter make the IDENTICAL accept/reject decision for the same {sourceLang, text} region across a matrix of cases', async () => {
+    const cases: { sourceLang: string; text: string; expectKept: boolean }[] = [
+      { sourceLang: 'Chinese (Simplified)', text: '你好世界的问候语', expectKept: true },
+      { sourceLang: 'Chinese (Simplified)', text: 'Model X200', expectKept: false },
+      { sourceLang: 'English', text: '你好世界的问候语', expectKept: true }, // v1: non-CJK source doesn't filter
+      { sourceLang: 'English', text: 'Model X200', expectKept: true }
+    ]
+
+    for (const { sourceLang, text, expectKept } of cases) {
+      const png = await makePngBytes(150, 80, '#ffffff')
+      const region = rawMediaRegion({ bbox: { x: 10, y: 10, w: 100, h: 20 }, text })
+      const engine = fakeMediaEngine([{ bytes: png, regions: [region] }])
+
+      const srcPath = await writeDeck({
+        slides: [{ shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: png }] }]
+      })
+      const pptxAdapter = new PptxAdapter({ regionEngine: engine, sourceLang })
+      const pptxSegments = await pptxAdapter.extract(srcPath)
+      const pptxKept = pptxSegments.some((s) => s.kind === 'image-region')
+
+      const { createImageAdapter } = await import('../../../src/core/adapters/images/image-adapter')
+      const imgFile = await writeStandaloneImage(png)
+      const imageAdapter = createImageAdapter(engine, { sourceLang })
+      const imageSegments = await imageAdapter.extract(imgFile)
+      const imageKept = imageSegments.length > 0
+
+      expect(pptxKept).toBe(expectKept)
+      expect(imageKept).toBe(expectKept)
+      expect(pptxKept).toBe(imageKept) // the parity assertion itself
+    }
   })
 })

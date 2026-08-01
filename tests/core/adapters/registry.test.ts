@@ -1,10 +1,15 @@
 import { describe, expect, it, vi } from 'vitest'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { Canvas } from 'skia-canvas'
 import { adapterFor } from '../../../src/core/adapters/adapter'
 import { buildAdapters } from '../../../src/core/adapters/registry'
-import type { RegionEngine } from '../../../src/core/images/regions'
+import type { RegionEngine, TextRegion } from '../../../src/core/images/regions'
+import { buildPptx } from '../../helpers/build-pptx'
 
-function fakeEngine(): RegionEngine {
-  return { detectRegions: vi.fn().mockResolvedValue([]) }
+function fakeEngine(regions: TextRegion[] = []): RegionEngine {
+  return { detectRegions: vi.fn().mockResolvedValue(regions) }
 }
 
 describe('buildAdapters', () => {
@@ -41,5 +46,57 @@ describe('buildAdapters', () => {
   it('returns null for an unregistered extension', () => {
     const adapters = buildAdapters({ regionEngine: null, sourceLang: 'English' })
     expect(adapterFor('doc.docx', adapters)).toBeNull()
+  })
+})
+
+describe('buildAdapters - pptx adapter receives regionEngine/sourceLang (Phase 3 Task 5)', () => {
+  async function writeDeckWithPicture(mediaBytes: Buffer): Promise<string> {
+    const buffer = await buildPptx({
+      slides: [
+        {
+          shapes: [{ kind: 'picture', box: { xEmu: 0, yEmu: 0, wEmu: 400, hEmu: 400 }, mediaBytes }]
+        }
+      ]
+    })
+    const dir = await mkdtemp(path.join(tmpdir(), 'lt-registry-pptx-'))
+    const file = path.join(dir, 'deck.pptx')
+    await writeFile(file, buffer)
+    return file
+  }
+
+  async function makePngBytes(width: number, height: number): Promise<Buffer> {
+    const canvas = new Canvas(width, height)
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, width, height)
+    return canvas.toBuffer('png')
+  }
+
+  it('with a regionEngine supplied, the registry-built pptx adapter detects embedded image text', async () => {
+    const png = await makePngBytes(200, 100)
+    const engine = fakeEngine([
+      { id: 'raw', bbox: { x: 10, y: 10, w: 100, h: 30 }, text: 'Hello', confidence: 0.9 }
+    ])
+    const file = await writeDeckWithPicture(png)
+
+    const adapters = buildAdapters({ regionEngine: engine, sourceLang: 'English' })
+    const pptxAdapter = adapterFor(file, adapters)!
+    const segments = await pptxAdapter.extract(file)
+
+    expect(segments.some((s) => s.kind === 'image-region')).toBe(true)
+    await rm(path.dirname(file), { recursive: true, force: true })
+  })
+
+  it('with regionEngine null, the registry-built pptx adapter detects zero embedded image text (exact Phase 2 behavior)', async () => {
+    const png = await makePngBytes(200, 100)
+    const file = await writeDeckWithPicture(png)
+
+    const adapters = buildAdapters({ regionEngine: null, sourceLang: 'English' })
+    const pptxAdapter = adapterFor(file, adapters)!
+    const segments = await pptxAdapter.extract(file)
+
+    expect(segments.filter((s) => s.kind === 'image-region')).toEqual([])
+    expect(pptxAdapter.collectSkips?.()).toEqual([])
+    await rm(path.dirname(file), { recursive: true, force: true })
   })
 })

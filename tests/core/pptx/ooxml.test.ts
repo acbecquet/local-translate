@@ -5,6 +5,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import JSZip from 'jszip'
+import { Canvas } from 'skia-canvas'
 import {
   A_NS,
   P_NS,
@@ -12,11 +13,23 @@ import {
   RELS_NS,
   childElems,
   elems,
+  listPictureMedia,
   openPptx,
+  readMediaBytes,
   setRunText,
-  textOfRun
+  textOfRun,
+  writeMediaBytes
 } from '../../../src/core/adapters/pptx/ooxml'
 import { buildPptx } from '../../helpers/build-pptx'
+
+/** A real, skia-canvas-decodable solid-color PNG - media byte tests need genuine encoded images, never raw/fake buffers. */
+async function makePngBytes(width: number, height: number, color = '#3366cc'): Promise<Buffer> {
+  const canvas = new Canvas(width, height)
+  const ctx = canvas.getContext('2d')
+  ctx.fillStyle = color
+  ctx.fillRect(0, 0, width, height)
+  return canvas.toBuffer('png')
+}
 
 const tmpDirs: string[] = []
 afterEach(async () => {
@@ -558,5 +571,170 @@ describe('openPptx / PptxArchive', () => {
 
     await expect(archive.save(outPath)).rejects.toThrow(/never read/)
     expect(existsSync(outPath)).toBe(false)
+  })
+})
+
+describe('listPictureMedia / readMediaBytes / writeMediaBytes (Phase 3, Task 5)', () => {
+  it('returns one MediaRef per usage, resolving each a:blip r:embed to its media part and slide', async () => {
+    const dir = await tmpDir('lt-ooxml-media-')
+    const pngA = await makePngBytes(40, 20, '#ff0000')
+    const pngB = await makePngBytes(60, 30, '#00ff00')
+    const buffer = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            { kind: 'picture', box: { xEmu: 0, yEmu: 0, wEmu: 400, hEmu: 400 }, mediaBytes: pngA }
+          ]
+        },
+        {
+          shapes: [
+            { kind: 'picture', box: { xEmu: 0, yEmu: 0, wEmu: 400, hEmu: 400 }, mediaBytes: pngB }
+          ]
+        }
+      ]
+    })
+    const srcPath = path.join(dir, 'src.pptx')
+    await writeFile(srcPath, buffer)
+
+    const archive = await openPptx(srcPath)
+    const refs = listPictureMedia(archive)
+
+    expect(refs).toHaveLength(2)
+    expect(refs[0].slidePath).toBe('ppt/slides/slide1.xml')
+    expect(refs[1].slidePath).toBe('ppt/slides/slide2.xml')
+    expect(refs[0].mediaPath).not.toBe(refs[1].mediaPath)
+    expect(refs.every((r) => r.mediaPath.startsWith('ppt/media/'))).toBe(true)
+  })
+
+  it("returns one MediaRef per usage even when the SAME media part is used on multiple slides (non-deduped - dedup is the caller's job)", async () => {
+    const dir = await tmpDir('lt-ooxml-media-')
+    const png = await makePngBytes(40, 20)
+    const buffer = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'picture',
+              box: { xEmu: 0, yEmu: 0, wEmu: 400, hEmu: 400 },
+              mediaBytes: png,
+              sharedMediaKey: 'logo'
+            }
+          ]
+        },
+        {
+          shapes: [
+            {
+              kind: 'picture',
+              box: { xEmu: 0, yEmu: 0, wEmu: 400, hEmu: 400 },
+              sharedMediaKey: 'logo'
+            }
+          ]
+        },
+        {
+          shapes: [
+            {
+              kind: 'picture',
+              box: { xEmu: 0, yEmu: 0, wEmu: 400, hEmu: 400 },
+              sharedMediaKey: 'logo'
+            }
+          ]
+        }
+      ]
+    })
+    const srcPath = path.join(dir, 'src.pptx')
+    await writeFile(srcPath, buffer)
+
+    const archive = await openPptx(srcPath)
+    const refs = listPictureMedia(archive)
+
+    expect(refs).toHaveLength(3)
+    const mediaPaths = new Set(refs.map((r) => r.mediaPath))
+    expect(mediaPaths.size).toBe(1) // all three usages point at the one shared part
+    expect(refs.map((r) => r.slidePath)).toEqual([
+      'ppt/slides/slide1.xml',
+      'ppt/slides/slide2.xml',
+      'ppt/slides/slide3.xml'
+    ])
+  })
+
+  it('readMediaBytes returns the exact original bytes of a media part', async () => {
+    const dir = await tmpDir('lt-ooxml-media-')
+    const png = await makePngBytes(50, 25, '#123456')
+    const buffer = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            { kind: 'picture', box: { xEmu: 0, yEmu: 0, wEmu: 400, hEmu: 400 }, mediaBytes: png }
+          ]
+        }
+      ]
+    })
+    const srcPath = path.join(dir, 'src.pptx')
+    await writeFile(srcPath, buffer)
+
+    const archive = await openPptx(srcPath)
+    const [ref] = listPictureMedia(archive)
+    const read = await readMediaBytes(archive, ref.mediaPath)
+
+    expect(read.equals(png)).toBe(true)
+  })
+
+  it("writeMediaBytes replaces a part's bytes and marks it dirty; save() writes the new bytes and leaves every other part byte-identical", async () => {
+    const dir = await tmpDir('lt-ooxml-media-')
+    const original = await makePngBytes(50, 25, '#111111')
+    const replacement = await makePngBytes(50, 25, '#eeeeee')
+    const buffer = await buildPptx({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Hello'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 1000, hEmu: 500 }
+            },
+            {
+              kind: 'picture',
+              box: { xEmu: 0, yEmu: 600, wEmu: 400, hEmu: 400 },
+              mediaBytes: original
+            }
+          ]
+        }
+      ]
+    })
+    const srcPath = path.join(dir, 'src.pptx')
+    await writeFile(srcPath, buffer)
+    const srcDigests = await digestParts(buffer)
+
+    const archive = await openPptx(srcPath)
+    const [ref] = listPictureMedia(archive)
+    writeMediaBytes(archive, ref.mediaPath, replacement)
+
+    const outPath = path.join(dir, 'out.pptx')
+    await archive.save(outPath)
+
+    const outBuffer = await readFile(outPath)
+    const outDigests = await digestParts(outBuffer)
+    const rewritten = await readFile(outPath).then(async () => {
+      const zip = await JSZip.loadAsync(outBuffer)
+      return zip.file(ref.mediaPath)!.async('nodebuffer')
+    })
+
+    expect(rewritten.equals(replacement)).toBe(true)
+    expect(outDigests.get(ref.mediaPath)).not.toBe(srcDigests.get(ref.mediaPath))
+    for (const [part, digest] of srcDigests) {
+      if (part === ref.mediaPath) continue
+      expect(outDigests.get(part)).toBe(digest)
+    }
+  })
+
+  it('readRawBytes/writeRawBytes throw a clear error for an unknown part', async () => {
+    const dir = await tmpDir('lt-ooxml-media-')
+    const buffer = await buildSampleDeck()
+    const srcPath = path.join(dir, 'src.pptx')
+    await writeFile(srcPath, buffer)
+
+    const archive = await openPptx(srcPath)
+    expect(() => archive.readRawBytes('ppt/media/nope.png')).toThrow(/nope\.png/)
+    expect(() => archive.writeRawBytes('ppt/media/nope.png', Buffer.from(''))).toThrow(/nope\.png/)
   })
 })

@@ -119,6 +119,22 @@ export interface PictureShapeSpec {
   name?: string
   /** Adds an `a:videoFile` marker under `p:nvPr` (linked, external target) - exercises the adapter's video-skip log path. */
   video?: boolean
+  /** Test override: explicit media bytes for the embedded picture (defaults to a 1x1 transparent PNG) - lets Phase-3 embedded-media tests embed a real, skia-canvas-decodable image (dimensions matter - region detection needs real width/height) or format-specific content (e.g. garbage bytes for an emf/wmf skip-path fixture, which is never decoded). */
+  mediaBytes?: Buffer
+  /** Test override: media part extension without the leading dot (defaults to 'png') - lets tests exercise the raster (png/jpg/jpeg) vs vector-metafile (emf/wmf) media filter (Phase 3 Task 5). */
+  mediaExt?: string
+  /**
+   * When set, this picture reuses whichever `ppt/media/imageN.<ext>` part
+   * was already created for an EARLIER 'picture' shape sharing the same key
+   * (across any slide) instead of minting a new media part - the fixture
+   * mechanism for "the same media part is used by more than one shape/slide"
+   * dedup tests (Phase 3 Task 5, behavior contract point 1). Only the FIRST
+   * shape using a given key supplies mediaBytes/mediaExt; later shapes
+   * sharing the key reuse that part's already-written bytes/ext regardless
+   * of their own mediaBytes/mediaExt (a real deck can't have two different
+   * byte contents at one part path either).
+   */
+  sharedMediaKey?: string
 }
 
 /** A minimal chart graphicFrame: `a:graphicData` with the DrawingML chart URI, referencing a stub `ppt/charts/chartN.xml` part - never readable as text, exercises the adapter's chart-skip path. */
@@ -291,6 +307,8 @@ interface BuildCtx {
   chartCounter: { n: number }
   diagramCounter: { n: number }
   contentTypeOverrides: { partName: string; contentType: string }[]
+  /** sharedMediaKey -> the ppt/media/<name> already written for that key (see PictureShapeSpec.sharedMediaKey). */
+  sharedMedia: Map<string, string>
 }
 
 function buildShapeXml(
@@ -396,9 +414,14 @@ function buildShapeXml(
     }
     case 'picture': {
       const name = shape.name ?? `Picture ${ordinal}`
-      ctx.mediaCounter.n += 1
-      const mediaName = `image${ctx.mediaCounter.n}.png`
-      ctx.zip.file(`ppt/media/${mediaName}`, ONE_PX_PNG)
+      let mediaName = shape.sharedMediaKey ? ctx.sharedMedia.get(shape.sharedMediaKey) : undefined
+      if (!mediaName) {
+        ctx.mediaCounter.n += 1
+        const ext = shape.mediaExt ?? 'png'
+        mediaName = `image${ctx.mediaCounter.n}.${ext}`
+        ctx.zip.file(`ppt/media/${mediaName}`, shape.mediaBytes ?? ONE_PX_PNG)
+        if (shape.sharedMediaKey) ctx.sharedMedia.set(shape.sharedMediaKey, mediaName)
+      }
       const rId = addRel(REL_TYPE.image, `../media/${mediaName}`)
       const nvPr = shape.video
         ? (() => {
@@ -695,7 +718,16 @@ function buildContentTypes(overrides: { partName: string; contentType: string }[
   const defaults =
     '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
     '<Default Extension="xml" ContentType="application/xml"/>' +
-    '<Default Extension="png" ContentType="image/png"/>'
+    '<Default Extension="png" ContentType="image/png"/>' +
+    // Always present (harmless if unused) so fixtures exercising the raster
+    // (jpg) vs vector-metafile (emf/wmf) media filter (Phase 3 Task 5) never
+    // need per-test content-type bookkeeping - checkPptxIntegrity only
+    // requires that a USED extension be declared, not that every declared
+    // extension be used.
+    '<Default Extension="jpg" ContentType="image/jpeg"/>' +
+    '<Default Extension="jpeg" ContentType="image/jpeg"/>' +
+    '<Default Extension="emf" ContentType="image/x-emf"/>' +
+    '<Default Extension="wmf" ContentType="image/x-wmf"/>'
   const overrideXml = overrides
     .map((o) => `<Override PartName="${o.partName}" ContentType="${o.contentType}"/>`)
     .join('')
@@ -725,7 +757,8 @@ export async function buildPptx(opts: BuildPptxOptions): Promise<Buffer> {
     mediaCounter: { n: 0 },
     chartCounter: { n: 0 },
     diagramCounter: { n: 0 },
-    contentTypeOverrides: []
+    contentTypeOverrides: [],
+    sharedMedia: new Map()
   }
   const hasNotes = opts.slides.some((s) => s.notes !== undefined)
 

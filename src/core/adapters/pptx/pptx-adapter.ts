@@ -23,6 +23,7 @@
  */
 import path from 'node:path'
 import type { Document, Element, Node } from '@xmldom/xmldom'
+import { loadImage } from 'skia-canvas'
 import type { FormatAdapter } from '../adapter'
 import type { Box, FontSpec, SegmentKind, TextSegment, TranslatedSegment } from '../../segments'
 import {
@@ -32,12 +33,23 @@ import {
   RELS_NS,
   childElems,
   elems,
+  listPictureMedia,
   openPptx,
+  readMediaBytes,
   setRunText,
   textOfRun,
+  writeMediaBytes,
   type PptxArchive
 } from './ooxml'
 import { groupChildScale, resolveShapeGeom, tableCellBoxes } from './geometry'
+import {
+  CONFIDENCE_FLOOR,
+  validateRegions,
+  type RegionEngine,
+  type TextRegion
+} from '../../images/regions'
+import { renderOverlay, type OverlayRegion } from '../../images/overlay'
+import { containsCjk, isSourceLanguageRegion } from '../../images/gating'
 
 /** DrawingML diagram (SmartArt) namespace - not part of ooxml.ts's exported constants (only a:/p:/r:/rels are). */
 const DGM_NS = 'http://schemas.openxmlformats.org/drawingml/2006/diagram'
@@ -96,6 +108,44 @@ const DEFAULT_FALLBACK_FONT_PT = 18
 /** Used only when a segment's first non-empty run carries no a:latin/a:ea typeface at all. */
 const DEFAULT_FALLBACK_FONT_FAMILY = 'Calibri'
 
+/**
+ * Dependencies for the embedded-media (Phase 3, Task 5) hookup - mirrors
+ * image-adapter.ts's own ImageAdapterOpts. `regionEngine: null` (the
+ * default) means image translation is OFF: extract() adds zero image
+ * segments and zero media skips, and apply() never rewrites a media part -
+ * exactly Phase 2 behavior (plan Task 5 behavior contract point 4). Every
+ * existing `new PptxAdapter()` call site in this codebase (tests included)
+ * relies on this default, which is also what makes those call sites double
+ * as the null-engine regression suite.
+ */
+export interface PptxAdapterDeps {
+  regionEngine: RegionEngine | null
+  /** This run's source language - passed to isSourceLanguageRegion for every detected media region. Unused when regionEngine is null. */
+  sourceLang: string
+}
+
+const DEFAULT_PPTX_ADAPTER_DEPS: PptxAdapterDeps = { regionEngine: null, sourceLang: '' }
+
+/**
+ * Mirrors image-adapter.ts's own ONE_LINE_HEIGHT_FACTOR (a module-private
+ * constant there, so not importable): a detected region's bbox height IS
+ * its rendered line height, and line height is fontSizePt * this factor
+ * everywhere else in the codebase (fit-engine.ts's LINE_HEIGHT_FACTOR).
+ * Kept as a separately-documented duplicate rather than a shared import -
+ * the same low-risk mirroring overlay.ts already does for fit-engine's own
+ * LINE_HEIGHT_FACTOR. The gating LOGIC (isSourceLanguageRegion/containsCjk,
+ * imported below) is what plan Task 5 behavior contract point 7 requires
+ * NOT to diverge; a plain arithmetic constant like this one carries no such
+ * risk.
+ */
+const MEDIA_ONE_LINE_HEIGHT_FACTOR = 1.2
+
+const MEDIA_NOTO_SANS = 'Noto Sans'
+const MEDIA_NOTO_SANS_CJK_SC = 'Noto Sans CJK SC'
+
+/** Raster extensions processed for embedded-media translation; anything else (emf/wmf/...) is a vector metafile - skip-with-log, never decoded (decoding one as a raster image would throw) - plan Task 5 behavior contract point 3. */
+const RASTER_MEDIA_EXTENSIONS = new Set(['png', 'jpg', 'jpeg'])
+
 /** CJK Unified Ideographs + Hiragana/Katakana + Hangul + compatibility/fullwidth forms - used only to pick a:ea vs a:latin typeface by script, a coarser heuristic than fit-engine's own wrap-break table (different job: family choice, not break opportunities). */
 const CJK_RANGE = /[\u3000-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]/
 
@@ -124,24 +174,53 @@ export class PptxAdapter implements FormatAdapter {
   /** Skips recorded by the MOST RECENT extract() call; read (and never re-populated) by apply() re-walking the same content, and by collectSkips(). */
   private lastSkips: { id: string; reason: string }[] = []
 
+  /**
+   * Per SOURCE FILE path (path.resolve'd), every PAINTABLE media-region
+   * segment id -> {mediaPath, region} from the MOST RECENT extract() call
+   * on that exact path. apply()'s lookup table for embedded-media
+   * translation (Phase 3, Task 5): mirrors image-adapter.ts's own
+   * regionsByPath cache (Task 4 behavior contract point 4) so apply() never
+   * re-runs regionEngine.detectRegions - a second, possibly non-deterministic
+   * detection pass must never disagree with what extract() already
+   * segmented/reported.
+   */
+  private readonly mediaSegmentsByPath = new Map<
+    string,
+    Map<string, { mediaPath: string; region: TextRegion }>
+  >()
+
+  constructor(private readonly deps: PptxAdapterDeps = DEFAULT_PPTX_ADAPTER_DEPS) {}
+
   async extract(filePath: string): Promise<TextSegment[]> {
     const archive = await openPptx(filePath)
     const skips: { id: string; reason: string }[] = []
-    const sites = collectSites(archive, (id, kind, name) => {
+    const onSkip: SkipRecorder = (id, kind, name) => {
       console.warn(`pptx adapter: skipping unsupported ${kind} "${name}" - left untouched on apply`)
       skips.push({ id, reason: kind })
-    })
-    this.lastSkips = skips
+    }
+    const sites = collectSites(archive, onSkip)
+    const { segments: mediaSegments, paintableById } = await collectMediaSegments(
+      archive,
+      this.deps.regionEngine,
+      this.deps.sourceLang,
+      onSkip
+    )
 
-    return sites.map((s) => ({
-      id: s.id,
-      text: s.text,
-      box: s.box,
-      font: s.font,
-      context: s.context,
-      groupKey: s.groupKey,
-      kind: s.kind
-    }))
+    this.lastSkips = skips
+    this.mediaSegmentsByPath.set(path.resolve(filePath), paintableById)
+
+    return [
+      ...sites.map((s) => ({
+        id: s.id,
+        text: s.text,
+        box: s.box,
+        font: s.font,
+        context: s.context,
+        groupKey: s.groupKey,
+        kind: s.kind
+      })),
+      ...mediaSegments
+    ]
   }
 
   /** See FormatAdapter.collectSkips's doc comment (adapter.ts). */
@@ -174,51 +253,92 @@ export class PptxAdapter implements FormatAdapter {
    * text but got DIFFERENT translations, that source text is recorded as
    * `AMBIGUOUS_TRANSLATION` instead of either translation - see its own
    * doc comment for why silently picking one (last-write-wins) is wrong.
+   *
+   * A segment id NOT found among the text sites is checked against the
+   * MOST RECENT extract() call's cached media-region index instead (Phase
+   * 3, Task 5): a matching, actually-changed (translation !== text) entry
+   * queues an OverlayRegion for its media part, batched per part (one
+   * `<p:pic>` can carry several detected text regions) and painted/rewritten
+   * in one pass AFTER the main loop (see the final for-loop below) - only
+   * media parts that end up with at least one queued region are ever
+   * touched via writeMediaBytes; every other part - including a media part
+   * whose regions ALL failed gating or all kept their original text - stays
+   * byte-identical. A segment id matching NEITHER a text site NOR a cached
+   * media region throws the same error a missing text site always has:
+   * apply() must be called with the same file extract() already read
+   * (media detection is cached-only - unlike text-site ids, which are pure
+   * functions of the deck's own content, media ids can't be re-derived
+   * without re-running regionEngine.detectRegions, which apply() never does).
    */
   async apply(filePath: string, outPath: string, segments: TranslatedSegment[]): Promise<void> {
     const archive = await openPptx(filePath)
     const siteById = new Map(collectSites(archive).map((s) => [s.id, s]))
     const drawingUpdates = new Map<string, Map<string, string | typeof AMBIGUOUS_TRANSLATION>>()
+    const mediaSegIndex = this.mediaSegmentsByPath.get(path.resolve(filePath))
+    const overlaysByMediaPath = new Map<string, OverlayRegion[]>()
 
     for (const seg of segments) {
       const site = siteById.get(seg.id)
-      if (!site) {
+      if (site) {
+        if (seg.translation === seg.text) continue
+
+        writeTranslation(site.bodyEl, seg.translation)
+        archive.markDirty(site.partPath)
+
+        if (site.smartArtDrawingPath) {
+          let bySourceText = drawingUpdates.get(site.smartArtDrawingPath)
+          if (!bySourceText) {
+            bySourceText = new Map()
+            drawingUpdates.set(site.smartArtDrawingPath, bySourceText)
+          }
+          const existing = bySourceText.get(seg.text)
+          if (existing === undefined || existing === seg.translation) {
+            bySourceText.set(seg.text, seg.translation)
+          } else {
+            bySourceText.set(seg.text, AMBIGUOUS_TRANSLATION)
+          }
+        }
+
+        // Relies on fit-engine's fit() returning font.sizePt back bit-identically
+        // (not merely a numerically-equal-but-recomputed value) whenever the
+        // text already fits at the starting size - i.e. that this comparison
+        // is a reliable proxy for "no shrink happened", not just a close one.
+        if (site.kind !== 'notes' && seg.fittedSizePt !== seg.font.sizePt) {
+          writeSize(site.bodyEl, seg.fittedSizePt)
+        }
+        continue
+      }
+
+      const mediaEntry = mediaSegIndex?.get(seg.id)
+      if (!mediaEntry) {
         throw new Error(
           `pptx adapter: apply() could not locate segment "${seg.id}" while re-walking "${filePath}" - ` +
             'apply() must be called with the same file extract() read.'
         )
       }
-
+      // Zero-diff guarantee (mirrors image-adapter.ts's own apply()): a
+      // region whose translation is identical to its source text is left
+      // unpainted - nothing changed, nothing worth risking a repaint over.
       if (seg.translation === seg.text) continue
 
-      writeTranslation(site.bodyEl, seg.translation)
-      archive.markDirty(site.partPath)
-
-      if (site.smartArtDrawingPath) {
-        let bySourceText = drawingUpdates.get(site.smartArtDrawingPath)
-        if (!bySourceText) {
-          bySourceText = new Map()
-          drawingUpdates.set(site.smartArtDrawingPath, bySourceText)
-        }
-        const existing = bySourceText.get(seg.text)
-        if (existing === undefined || existing === seg.translation) {
-          bySourceText.set(seg.text, seg.translation)
-        } else {
-          bySourceText.set(seg.text, AMBIGUOUS_TRANSLATION)
-        }
-      }
-
-      // Relies on fit-engine's fit() returning font.sizePt back bit-identically
-      // (not merely a numerically-equal-but-recomputed value) whenever the
-      // text already fits at the starting size - i.e. that this comparison
-      // is a reliable proxy for "no shrink happened", not just a close one.
-      if (site.kind !== 'notes' && seg.fittedSizePt !== seg.font.sizePt) {
-        writeSize(site.bodyEl, seg.fittedSizePt)
-      }
+      const overlayRegions = overlaysByMediaPath.get(mediaEntry.mediaPath) ?? []
+      overlayRegions.push({
+        bbox: mediaEntry.region.bbox,
+        lines: seg.fittedLines,
+        fontSizePt: seg.fittedSizePt,
+        font: seg.font
+      })
+      overlaysByMediaPath.set(mediaEntry.mediaPath, overlayRegions)
     }
 
     for (const [drawingPath, bySourceText] of drawingUpdates) {
       applySmartArtDrawingText(archive, drawingPath, bySourceText)
+    }
+
+    for (const [mediaPath, overlayRegions] of overlaysByMediaPath) {
+      const buffer = await readMediaBytes(archive, mediaPath)
+      const result = await renderOverlay(buffer, overlayRegions)
+      writeMediaBytes(archive, mediaPath, result.image)
     }
 
     await archive.save(outPath)
@@ -288,6 +408,125 @@ function collectSites(archive: PptxArchive, onSkip?: SkipRecorder): Site[] {
   }
 
   return sites
+}
+
+// ---- embedded media (Phase 3, Task 5) ----
+
+function mediaExtension(mediaPath: string): string {
+  const m = /\.([a-zA-Z0-9]+)$/.exec(mediaPath)
+  return m ? m[1].toLowerCase() : ''
+}
+
+function mediaBasename(mediaPath: string): string {
+  return mediaPath.split('/').pop() ?? mediaPath
+}
+
+interface MediaCollectionResult {
+  segments: TextSegment[]
+  /**
+   * Every PAINTABLE (gated-in) region's final segment id -> {mediaPath,
+   * region} - the same shape PptxAdapter.mediaSegmentsByPath caches per
+   * source file path for apply() to consume without re-detecting.
+   */
+  paintableById: Map<string, { mediaPath: string; region: TextRegion }>
+}
+
+/**
+ * Detects and gates translatable text in every embedded picture's media
+ * part, DEDUPED by part path (plan Task 5 behavior contract point 1): a
+ * media part used by 3 `<p:pic>` elements across the deck is decoded and
+ * run through regionEngine.detectRegions ONCE, not once per usage.
+ * `regionEngine: null` short-circuits to zero segments/skips - exactly
+ * Phase 2 behavior (behavior contract point 4).
+ *
+ * Segment ids are namespaced `media/<basename>#r<n>` (point 2) - a prefix no
+ * text-site id ever uses (see the id scheme's doc comment atop this file),
+ * so global uniqueness holds by construction; `uniqueId` is still applied
+ * as the same cheap defense every other id in this file gets, in the
+ *(real-world impossible, but not worth trusting blindly) case two
+ * different media parts share a basename. `groupKey` is the FIRST slide
+ * that uses the part (`listPictureMedia`'s usage order is numeric-slide,
+ * then document order within a slide, so "first" is well-defined) -
+ * formatted identically to a text site's own `slide<N>` groupKey so
+ * batching.ts's groupSegments puts a media region's text in the same batch
+ * as that slide's other text (point 2). `context` is the fixed
+ * 'embedded image text' the plan specifies.
+ *
+ * Source-language gating (isSourceLanguageRegion) and the CJK font-family
+ * pick (containsCjk) are IMPORTED from gating.ts, the exact same functions
+ * image-adapter.ts imports - no reimplementation, so the two adapters can
+ * never gate a given {sourceLang, text} pair differently (behavior contract
+ * point 7).
+ */
+async function collectMediaSegments(
+  archive: PptxArchive,
+  regionEngine: RegionEngine | null,
+  sourceLang: string,
+  onSkip?: SkipRecorder
+): Promise<MediaCollectionResult> {
+  const paintableById = new Map<string, { mediaPath: string; region: TextRegion }>()
+  if (!regionEngine) return { segments: [], paintableById }
+
+  const usages = listPictureMedia(archive)
+  const firstSlidePathByMedia = new Map<string, string>()
+  for (const usage of usages) {
+    if (!firstSlidePathByMedia.has(usage.mediaPath)) {
+      firstSlidePathByMedia.set(usage.mediaPath, usage.slidePath)
+    }
+  }
+
+  const usedIds = new Set<string>()
+  const segments: TextSegment[] = []
+
+  for (const [mediaPath, firstSlidePath] of firstSlidePathByMedia) {
+    const name = mediaBasename(mediaPath)
+    const ext = mediaExtension(mediaPath)
+    if (!RASTER_MEDIA_EXTENSIONS.has(ext)) {
+      onSkip?.(mediaPath, 'vector metafile image', name)
+      continue
+    }
+
+    const buffer = await readMediaBytes(archive, mediaPath)
+    const img = await loadImage(buffer)
+    const raw = await regionEngine.detectRegions(buffer)
+    const validated = validateRegions(raw, img.width, img.height)
+    const groupKey = `slide${slideNumberOf(firstSlidePath)}`
+
+    for (const region of validated) {
+      // Source-language gating: a region whose text isn't in the run's
+      // source language is legitimate leave-alone content (a logo, a part
+      // number) - NO segment, and it must NOT show up in collectSkips()
+      // either, mirroring image-adapter.ts's own extract() (Task 4 point 2).
+      if (!isSourceLanguageRegion(sourceLang, region.text)) continue
+
+      const rawId = `media/${name}#${region.id}`
+      if (region.confidence < CONFIDENCE_FLOOR) {
+        onSkip?.(rawId, 'low-confidence region', name)
+        continue
+      }
+      if (region.rotated) {
+        onSkip?.(rawId, 'rotated region', name)
+        continue
+      }
+
+      const id = uniqueId(rawId, usedIds)
+      paintableById.set(id, { mediaPath, region })
+      segments.push({
+        id,
+        text: region.text,
+        box: { wPt: region.bbox.w, hPt: region.bbox.h },
+        font: {
+          family: containsCjk(region.text) ? MEDIA_NOTO_SANS_CJK_SC : MEDIA_NOTO_SANS,
+          sizePt: region.bbox.h / MEDIA_ONE_LINE_HEIGHT_FACTOR
+        },
+        context: 'embedded image text',
+        groupKey,
+        kind: 'image-region'
+      })
+    }
+  }
+
+  return { segments, paintableById }
 }
 
 function slideNumberOf(slidePath: string): number {
