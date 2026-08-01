@@ -624,6 +624,20 @@ async function main() {
       failures.push({ name, error })
       totalWallMs += Date.now() - t0
       process.stdout.write(`FAILED (${error})\n`)
+      // Circuit breaker: an allocation-class load failure means the model
+      // does not fit RIGHT NOW, and on this machine's ROCm stack every
+      // retried load leaks pinned/nonpaged memory and deepens the hole
+      // (observed live: repeated ROCm_Host alloc failures until reboot).
+      // One such failure aborts the whole leg instead of retrying the load
+      // 13 more times.
+      if (/failed to allocate|unable to allocate|out of memory|OOM/i.test(error)) {
+        process.stdout.write(
+          '\nABORTING LEG: allocation failure - the model does not fit in ' +
+            'available VRAM/RAM. Retrying a failed load leaks driver memory ' +
+            'on ROCm; free memory (or reboot) before trying again.\n'
+        )
+        break
+      }
       continue
     }
     const wallMs = Date.now() - t0
