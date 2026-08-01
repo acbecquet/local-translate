@@ -462,6 +462,51 @@ async function chatOnce(client, model, buffer) {
   }
 }
 
+/**
+ * Parse VLM output into [{bbox:{x,y,w,h} in 0-1000, text}]. Strict path
+ * first: the exact schema we force via ollama's format parameter. Fallback
+ * is deliberately lenient because format enforcement is NOT reliable across
+ * model families (observed live: qwen3.5:9b with think disabled returned a
+ * markdown-fenced top-level ARRAY, ignoring the schema entirely): strip
+ * code fences, accept a bare array or {regions:[...]}, accept bbox as our
+ * {x,y,w,h} object or as a 4-number array read per the Qwen-VL convention
+ * [x1,y1,x2,y2] (also 0-1000), accept common text key aliases. Lenient use
+ * is flagged inline in the progress line so nobody mistakes a salvaged run
+ * for a schema-compliant one - which output convention a model actually
+ * emits is itself spike data for Task 2's validation ladder.
+ */
+function parseVlmRegions(content) {
+  try {
+    return VLM_REGION_SCHEMA.parse(JSON.parse(content)).regions
+  } catch {
+    process.stdout.write('(lenient parse) ')
+  }
+  let body = content.trim()
+  const fence = body.match(/```(?:json)?\s*([\s\S]*?)\s*```/)
+  if (fence) body = fence[1]
+  const data = JSON.parse(body)
+  const list = Array.isArray(data) ? data : Array.isArray(data?.regions) ? data.regions : null
+  if (!list) throw new Error('no regions array found in model output')
+  return list.map((item, i) => {
+    const raw = item.bbox ?? item.bbox_2d ?? item.box
+    let bbox
+    if (Array.isArray(raw) && raw.length === 4 && raw.every((n) => typeof n === 'number')) {
+      bbox = { x: raw[0], y: raw[1], w: raw[2] - raw[0], h: raw[3] - raw[1] }
+    } else if (
+      raw &&
+      typeof raw === 'object' &&
+      ['x', 'y', 'w', 'h'].every((k) => typeof raw[k] === 'number')
+    ) {
+      bbox = { x: raw.x, y: raw.y, w: raw.w, h: raw.h }
+    } else {
+      throw new Error(`region ${i}: unrecognized bbox shape ${JSON.stringify(raw)}`)
+    }
+    const text = item.text ?? item.text_content ?? item.content ?? item.label
+    if (typeof text !== 'string') throw new Error(`region ${i}: no text field`)
+    return { bbox, text }
+  })
+}
+
 const VLM_REGION_SCHEMA = z.object({
   regions: z.array(
     z.object({
@@ -521,8 +566,8 @@ function createVlmEngine(model) {
           'model returned empty content (thinking-only output? unsupported image input?)'
         )
       }
-      const parsed = VLM_REGION_SCHEMA.parse(JSON.parse(content))
-      return parsed.regions.map((r, i) => ({
+      const regions = parseVlmRegions(content)
+      return regions.map((r, i) => ({
         id: `r${i + 1}`,
         bbox: {
           x: (r.bbox.x / 1000) * width,
