@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from 'react'
 
-const ACCEPTED_SUFFIXES = ['.pptx', '.fake.json']
+const ACCEPTED_SUFFIXES = ['.pptx', '.png', '.jpg', '.jpeg', '.fake.json']
 
 function isAcceptedFile(name: string): boolean {
   const lower = name.toLowerCase()
@@ -22,7 +22,9 @@ export function DropZone({ filePath, disabled, onFileSelected }: DropZoneProps):
   const acceptFile = useCallback(
     (file: File) => {
       if (!isAcceptedFile(file.name)) {
-        setRejected(`"${file.name}" is not a supported file (expected .pptx or .fake.json).`)
+        setRejected(
+          `"${file.name}" is not a supported file (expected .pptx, .png/.jpg/.jpeg, or .fake.json).`
+        )
         return
       }
       setRejected(null)
@@ -63,14 +65,16 @@ export function DropZone({ filePath, disabled, onFileSelected }: DropZoneProps):
       onDrop={handleDrop}
       data-testid="drop-zone"
     >
-      <p className="drop-zone-hint">{filePath ?? 'Drop a .pptx or .fake.json file here'}</p>
+      <p className="drop-zone-hint">
+        {filePath ?? 'Drop a .pptx, image (.png/.jpg/.jpeg), or .fake.json file here'}
+      </p>
       <button type="button" disabled={disabled} onClick={() => inputRef.current?.click()}>
         Choose file...
       </button>
       <input
         ref={inputRef}
         type="file"
-        accept=".pptx,.json"
+        accept=".pptx,.png,.jpg,.jpeg,.json"
         hidden
         onChange={handlePick}
         data-testid="file-input"

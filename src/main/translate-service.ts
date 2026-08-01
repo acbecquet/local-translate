@@ -15,8 +15,9 @@
 import os from 'node:os'
 import path from 'node:path'
 import { adapterFor, type FormatAdapter } from '../core/adapters/adapter'
-import { ADAPTERS } from '../core/adapters/registry'
+import { buildAdapters } from '../core/adapters/registry'
 import { DEFAULT_MODEL } from '../core/defaults'
+import { createPPOcrEngine } from '../core/images/engines/ppocr'
 import { runPipeline as realRunPipeline, type PipelineOpts, type RunReport } from '../core/pipeline'
 import type { TranslationBackend } from '../core/translate/backend'
 import {
@@ -50,7 +51,17 @@ export function resolveAppDataDir(): string {
 }
 
 export interface TranslateServiceDeps {
-  adapters: FormatAdapter[]
+  /**
+   * Builds the adapter list for one run, given that run's source language -
+   * a function rather than a static array because the image adapter needs
+   * its run's sourceLang baked in at construction (registry.ts's
+   * buildAdapters/AdapterDeps), which varies per request. The default
+   * (defaultDeps() below) closes over ONE createPPOcrEngine() instance
+   * constructed just once, so translating a second file never re-loads the
+   * PP-OCR ONNX session - only the (cheap) adapter list itself is rebuilt
+   * per call.
+   */
+  adapters: (sourceLang: string) => FormatAdapter[]
   ensureOllama: (opts: { appDataDir: string }) => Promise<OllamaConnection>
   createBackend: (opts: { baseUrl: string; appDataDir: string }) => TranslationBackend
   runPipeline: (opts: PipelineOpts) => Promise<RunReport>
@@ -61,8 +72,13 @@ export interface TranslateServiceDeps {
 }
 
 function defaultDeps(): TranslateServiceDeps {
+  // Constructed once, here - not inside the returned closure below - so
+  // every run() call across this service's lifetime reuses the SAME
+  // RegionEngine (and therefore the same lazily-loaded PP-OCR ONNX
+  // session) rather than paying init cost again per file.
+  const regionEngine = createPPOcrEngine()
   return {
-    adapters: ADAPTERS,
+    adapters: (sourceLang) => buildAdapters({ regionEngine, sourceLang }),
     ensureOllama: realEnsureOllama,
     createBackend: (opts) => new OllamaBackend(opts),
     runPipeline: realRunPipeline,
@@ -182,11 +198,12 @@ export class TranslateService {
     this.cancelRequested = false
 
     try {
-      const adapter = adapterFor(req.filePath, this.deps.adapters)
+      const adapters = this.deps.adapters(req.sourceLang)
+      const adapter = adapterFor(req.filePath, adapters)
       if (!adapter) {
         throw new Error(
           `No adapter registered for "${req.filePath}" (known extensions: ` +
-            `${this.deps.adapters.flatMap((a) => a.extensions).join(', ')})`
+            `${adapters.flatMap((a) => a.extensions).join(', ')})`
         )
       }
 

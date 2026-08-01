@@ -24,8 +24,9 @@ import { fileURLToPath } from 'node:url'
 import os from 'node:os'
 import path from 'node:path'
 import { adapterFor } from './adapters/adapter'
-import { ADAPTERS } from './adapters/registry'
+import { buildAdapters } from './adapters/registry'
 import { DEFAULT_MODEL } from './defaults'
+import { createPPOcrEngine } from './images/engines/ppocr'
 import { runPipeline, UNTRANSLATABLE_REASON, type RunReport } from './pipeline'
 import {
   ensureOllama as realEnsureOllama,
@@ -229,10 +230,21 @@ export async function runCli(argv: string[], deps: CliDeps = defaultDeps): Promi
   }
   const args = parsed.args
 
-  const adapter = adapterFor(args.file, ADAPTERS)
+  // Cheap and side-effect-free to construct regardless of whether this run
+  // ends up needing it: createPPOcrEngine() only returns a lazily-loading
+  // closure - the actual ONNX model load (CPU-only; MACHINE RULES bar GPU
+  // loads from an agent-run process) happens on the engine's first
+  // detectRegions() call, inside runPipeline's extract() phase, not here.
+  // Built before resolving the adapter (rather than after connecting to
+  // Ollama) so an unsupported file extension still fails fast without ever
+  // touching Ollama - the same property this file already guaranteed before
+  // image support existed.
+  const regionEngine = createPPOcrEngine()
+  const adapters = buildAdapters({ regionEngine, sourceLang: args.sourceLang })
+  const adapter = adapterFor(args.file, adapters)
   if (!adapter) {
     console.error(
-      `No adapter registered for "${args.file}" (known extensions: ${ADAPTERS.flatMap((a) => a.extensions).join(', ')})`
+      `No adapter registered for "${args.file}" (known extensions: ${adapters.flatMap((a) => a.extensions).join(', ')})`
     )
     return 1
   }

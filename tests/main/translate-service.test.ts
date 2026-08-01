@@ -69,7 +69,7 @@ function harness(overrides: Partial<TranslateServiceDeps> = {}) {
   const runPipeline = vi.fn().mockResolvedValue(FAKE_REPORT)
 
   const service = new TranslateService({
-    adapters: [FAKE_ADAPTER],
+    adapters: () => [FAKE_ADAPTER],
     ensureOllama,
     createBackend,
     runPipeline,
@@ -309,7 +309,7 @@ describe('DEFAULT_MODEL', () => {
   it('is used when no model override is supplied', async () => {
     const runPipeline = vi.fn().mockResolvedValue(FAKE_REPORT)
     const service = new TranslateService({
-      adapters: [FAKE_ADAPTER],
+      adapters: () => [FAKE_ADAPTER],
       ensureOllama: vi.fn().mockResolvedValue(fakeConnection()),
       createBackend: vi.fn().mockReturnValue(fakeBackend()),
       runPipeline
