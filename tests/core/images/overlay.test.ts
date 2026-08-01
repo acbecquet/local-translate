@@ -128,6 +128,83 @@ describe('renderOverlay - background-sampled fill (behavior contract point 2)', 
   })
 })
 
+describe('renderOverlay - large regions (regression: spread over per-pixel arrays)', () => {
+  it('handles a region large enough to overflow a spread-args call without throwing', async () => {
+    // 460x340 interior = ~156k pixels. Math.max(...distances) over an array
+    // that size exceeds V8's call-argument limit and throws RangeError - the
+    // accumulator-loop implementation must survive it. Real banner/title
+    // regions on deck screenshots reach this size routinely.
+    const width = 500
+    const height = 400
+    const canvas = new Canvas(width, height)
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = '#204060'
+    ctx.fillRect(0, 0, width, height)
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(60, 60, 380, 280)
+    const input = await canvas.toBuffer('png')
+
+    const region: OverlayRegion = {
+      bbox: { x: 20, y: 30, w: 460, h: 340 },
+      lines: ['Large banner'],
+      fontSizePt: 24,
+      font: { family: 'Noto Sans', sizePt: 24 }
+    }
+
+    const result = await renderOverlay(input, [region])
+    const decoded = await decode(result.image)
+    expect(decoded.width).toBe(width)
+    expect(decoded.height).toBe(height)
+  })
+})
+
+describe('renderOverlay - 2-means cluster branch (not just the uniform fallback)', () => {
+  it('draws glyphs near the interior text cluster color when the region genuinely contains old text pixels', async () => {
+    // Yellow background with BLUE original text inside the bbox: maxDist to
+    // the yellow fill is far above the uniform floor, so this exercises the
+    // real Lloyd clustering, and the picked text color must land near blue -
+    // NOT the black that the luminance fallback would choose for a bright
+    // yellow fill. That difference is what distinguishes a working
+    // cluster-selection from a silently broken one.
+    const width = 160
+    const height = 80
+    const yellow = { r: 240, g: 220, b: 40 }
+    const blue = { r: 20, g: 40, b: 200 }
+    const canvas = new Canvas(width, height)
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = `rgb(${yellow.r}, ${yellow.g}, ${yellow.b})`
+    ctx.fillRect(0, 0, width, height)
+    ctx.fillStyle = `rgb(${blue.r}, ${blue.g}, ${blue.b})`
+    ctx.fillRect(30, 30, 100, 20)
+    const input = await canvas.toBuffer('png')
+
+    const region: OverlayRegion = {
+      bbox: { x: 15, y: 15, w: 130, h: 50 },
+      lines: ['Text'],
+      fontSizePt: 20,
+      font: { family: 'Noto Sans', sizePt: 20 }
+    }
+
+    const result = await renderOverlay(input, [region])
+    const decoded = await decode(result.image)
+
+    // Scan the bbox interior for the darkest drawn pixel - with working
+    // clustering it belongs to a glyph in (near-)blue; with the luminance
+    // fallback it would be (near-)black. Blue distance << black distance.
+    let darkest = { r: 255, g: 255, b: 255 }
+    for (let y = 16; y < 64; y++) {
+      for (let x = 16; x < 144; x++) {
+        const p = pixelAt(decoded, x, y)
+        if (luminance(p) < luminance(darkest)) darkest = p
+      }
+    }
+    const distTo = (c: { r: number; g: number; b: number }): number =>
+      Math.hypot(darkest.r - c.r, darkest.g - c.g, darkest.b - c.b)
+    expect(distTo(blue)).toBeLessThan(distTo({ r: 0, g: 0, b: 0 }))
+    expect(distTo(blue)).toBeLessThan(80)
+  })
+})
+
 describe('renderOverlay - text color contrast (behavior contract point 3)', () => {
   it('picks light text on a dark fill', async () => {
     const input = await solidImageBuffer(120, 60, '#101010', 'png')

@@ -186,16 +186,26 @@ function sampleInteriorPixels(ctx: CanvasRenderingContext2D, inner: RegionBBox):
  * not just probabilistically good on average.
  */
 function textColorFor(pixels: RGB[], fill: RGB): RGB {
+  // Accumulator loop, never Math.max(...spread): `pixels` is per-pixel data
+  // for the whole bbox interior, and spreading tens of thousands of
+  // arguments overflows V8's call-argument limit (RangeError) on regions as
+  // small as a few hundred px on a side.
   const distances = pixels.map((p) => distance(p, fill))
-  const maxDist = distances.length ? Math.max(...distances) : 0
-  if (maxDist < TEXT_CLUSTER_DISTANCE_FLOOR) {
+  let maxDist = 0
+  let farIdx = -1
+  for (let i = 0; i < distances.length; i++) {
+    if (distances[i] > maxDist || farIdx === -1) {
+      maxDist = distances[i]
+      farIdx = i
+    }
+  }
+  if (farIdx === -1 || maxDist < TEXT_CLUSTER_DISTANCE_FLOOR) {
     return luminance(fill) >= FILL_LUMINANCE_THRESHOLD
       ? { r: 0, g: 0, b: 0 }
       : { r: 255, g: 255, b: 255 }
   }
 
   let centroidNear: RGB = { ...fill }
-  const farIdx = distances.indexOf(maxDist)
   let centroidFar: RGB = { ...pixels[farIdx] }
 
   for (let iter = 0; iter < 10; iter++) {
