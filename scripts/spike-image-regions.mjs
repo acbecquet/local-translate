@@ -32,6 +32,7 @@
 //                           Charlie-run only) - a human runs this directly.
 import { readFileSync, readdirSync } from 'node:fs'
 import { unlink, writeFile } from 'node:fs/promises'
+import { setTimeout, clearTimeout } from 'node:timers'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -429,6 +430,26 @@ async function createPPOcrEngine() {
   }
 }
 
+function chatOnce(client, model, buffer) {
+  return client.chat({
+    model,
+    messages: [
+      {
+        role: 'user',
+        content:
+          'Detect every text region in this image. For each region, report its bounding ' +
+          'box normalized to a 0-1000 scale (x, y, w, h all in 0-1000, independent of the ' +
+          "image's actual pixel dimensions) and the exact text it contains, read in the " +
+          "image's source language.",
+        images: [buffer.toString('base64')]
+      }
+    ],
+    format: z.toJSONSchema(VLM_REGION_SCHEMA),
+    options: { temperature: 0 },
+    stream: false
+  })
+}
+
 const VLM_REGION_SCHEMA = z.object({
   regions: z.array(
     z.object({
@@ -455,30 +476,33 @@ const VLM_REGION_SCHEMA = z.object({
 function createVlmEngine(model) {
   const baseUrl = process.env.OLLAMA_HOST || 'http://127.0.0.1:11434'
   const client = new Ollama({ host: baseUrl })
+  // Manual GPU runs must never wait forever on one image: the first request
+  // also pays model load, so the ceiling is generous, but a model that
+  // silently stalls (no vision support, driver wedge) has to surface as a
+  // per-image failure, not an indefinite hang. Overridable for slow first
+  // loads via SPIKE_VLM_TIMEOUT_MS.
+  const timeoutMs = Number(process.env.SPIKE_VLM_TIMEOUT_MS || 180000)
   return {
     async detectRegions(buffer) {
       const img = new Image(buffer)
       await img.decode()
       const { width, height } = img
 
-      const res = await client.chat({
-        model,
-        messages: [
-          {
-            role: 'user',
-            content:
-              'Detect every text region in this image. For each region, report its bounding ' +
-              'box normalized to a 0-1000 scale (x, y, w, h all in 0-1000, independent of the ' +
-              "image's actual pixel dimensions) and the exact text it contains, read in the " +
-              "image's source language.",
-            images: [buffer.toString('base64')]
-          }
-        ],
-        format: z.toJSONSchema(VLM_REGION_SCHEMA),
-        options: { temperature: 0 },
-        stream: false
+      let timer
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          client.abort()
+          reject(
+            new Error(
+              `no response after ${timeoutMs / 1000}s (includes model load on the first image) - request aborted`
+            )
+          )
+        }, timeoutMs)
       })
 
+      const res = await Promise.race([chatOnce(client, model, buffer), timeout]).finally(() =>
+        clearTimeout(timer)
+      )
       const parsed = VLM_REGION_SCHEMA.parse(JSON.parse(res.message.content))
       return parsed.regions.map((r, i) => ({
         id: `r${i + 1}`,
@@ -517,8 +541,12 @@ async function main() {
   const perImageForAgg = []
   const failures = []
   let totalWallMs = 0
+  // Live progress per image: a VLM leg pays model load on the first request
+  // and tens of seconds per image after it, so a silent loop is
+  // indistinguishable from a hang to the human running it.
   for (const name of imageNames) {
     const buffer = readFileSync(path.join(fixturesDir, name))
+    process.stdout.write(`[spike] ${name} ... `)
     const t0 = Date.now()
     // Per-image isolation: an engine failure on one image (malformed VLM
     // JSON, an ollama transport error, a model without vision support) must
@@ -529,8 +557,10 @@ async function main() {
     try {
       detected = await engine.detectRegions(buffer)
     } catch (err) {
-      failures.push({ name, error: err instanceof Error ? err.message : String(err) })
+      const error = err instanceof Error ? err.message : String(err)
+      failures.push({ name, error })
       totalWallMs += Date.now() - t0
+      process.stdout.write(`FAILED (${error})\n`)
       continue
     }
     const wallMs = Date.now() - t0
@@ -538,7 +568,9 @@ async function main() {
     const scored = scoreImage(labels[name] ?? [], detected)
     perImageForAgg.push(scored)
     rows.push({ name, scored, wallMs })
+    process.stdout.write(`${detected.length} regions in ${wallMs}ms\n`)
   }
+  process.stdout.write('\n')
   const overall = aggregate(perImageForAgg)
 
   process.stdout.write(renderTable(engineName, rows, overall, totalWallMs) + '\n')
