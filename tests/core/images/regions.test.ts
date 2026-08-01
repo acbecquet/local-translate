@@ -149,6 +149,22 @@ describe('validateRegions - reading order sort (plan point 4)', () => {
 
     expect(result.map((r) => r.text)).toEqual(['FirstBandLeft', 'ThirdOnSameBand', 'SecondBandRow'])
   })
+
+  it('keeps tightly-spaced rows in top-to-bottom order: dilation must not chain separate rows into one band', () => {
+    // Three visually distinct rows whose raw vertical gaps (3px) are smaller
+    // than what dilation closes (2 * DILATION_PX = 4px). Sorting on dilated
+    // geometry would chain all three into a single band via the sweep's
+    // running max and return them x-sorted: ['Aa', 'Mm', 'Zz'] - the exact
+    // reverse of reading order. The ladder sorts BEFORE dilation, so row
+    // order must survive.
+    const topRight = region({ bbox: { x: 200, y: 0, w: 40, h: 20 }, text: 'Zz' })
+    const middle = region({ bbox: { x: 100, y: 23, w: 40, h: 20 }, text: 'Mm' })
+    const bottomLeft = region({ bbox: { x: 0, y: 46, w: 40, h: 20 }, text: 'Aa' })
+
+    const result = validateRegions([topRight, middle, bottomLeft], 1000, 1000)
+
+    expect(result.map((r) => r.text)).toEqual(['Zz', 'Mm', 'Aa'])
+  })
 })
 
 describe('validateRegions - id assignment (plan point 5)', () => {

@@ -79,8 +79,18 @@ export function createPPOcrEngine(): RegionEngine {
   async function getOcr(): Promise<OcrInstance> {
     if (!ocrPromise) {
       ocrPromise = (async () => {
-        const { default: Ocr } = await import('@gutenye/ocr-node')
-        return (await Ocr.create()) as unknown as OcrInstance
+        try {
+          const { default: Ocr } = await import('@gutenye/ocr-node')
+          return (await Ocr.create()) as unknown as OcrInstance
+        } catch (err) {
+          // A rejected promise must not be cached for the process lifetime:
+          // init can fail transiently (AV scanning freshly-installed model
+          // files, momentary FS pressure) and this engine lives inside a
+          // long-running Electron session. Clearing lets the next call
+          // retry instead of replaying a stale error forever.
+          ocrPromise = null
+          throw err
+        }
       })()
     }
     return ocrPromise

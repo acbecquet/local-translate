@@ -53,6 +53,24 @@ describe('createPPOcrEngine - lazy init', () => {
     expect(mocks.create).toHaveBeenCalledTimes(1)
     expect(mocks.detect).toHaveBeenCalledTimes(3)
   })
+
+  it('retries init on a later call after a failed first init instead of caching the rejection forever', async () => {
+    // Init can fail transiently (AV scanning model files, FS pressure) and
+    // the engine lives inside a long-running Electron session - a cached
+    // rejected promise would replay the same stale error for the rest of
+    // the process lifetime.
+    mocks.detect.mockResolvedValue([])
+    mocks.create
+      .mockRejectedValueOnce(new Error('transient: model file locked'))
+      .mockResolvedValueOnce({ detect: mocks.detect })
+    const engine = createPPOcrEngine()
+
+    await expect(engine.detectRegions(pngBuffer())).rejects.toThrow('transient: model file locked')
+    await expect(engine.detectRegions(pngBuffer())).resolves.toEqual([])
+
+    expect(mocks.create).toHaveBeenCalledTimes(2)
+    expect(mocks.detect).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('createPPOcrEngine - buffer-to-tempfile flow', () => {

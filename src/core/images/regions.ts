@@ -225,13 +225,26 @@ function sortReadingOrder(regions: TextRegion[]): TextRegion[] {
  *    characters (decision doc hallucination guard) - before merge, so a
  *    lone piece of garbage never contaminates a real neighbor's text.
  * 5. Merge overlapping/containing regions (plan point 3), on raw geometry.
- * 6. Dilate every surviving bbox (decision doc; see DILATION_PX).
- * 7. Clamp to image bounds; drop anything that clamps to a zero/negative
+ * 6. Sort into reading order (plan point 4) - BEFORE dilation, for the same
+ *    reason merge runs on raw geometry: dilation closes up to
+ *    2*DILATION_PX of real vertical gap, which would let the band sweep
+ *    chain visually separate rows into one band and destroy row order
+ *    (three tightly-spaced rows would come back column-major or reversed).
+ * 7. Dilate every surviving bbox (decision doc; see DILATION_PX) - a pure
+ *    order-preserving map, so running it after the sort changes nothing
+ *    about ordering.
+ * 8. Clamp to image bounds; drop anything that clamps to a zero/negative
  *    area box (plan point 1, second half - e.g. a region already entirely
  *    outside the image, or dilated past an edge with nothing left inside).
- * 8. Sort into reading order (plan point 4).
  * 9. Assign dense, stable ids 'r1'..'rN' (plan point 5) - last, so ids
  *    never depend on anything but the final surviving set and its order.
+ *
+ * Residual caveat on the band sweep: its running-max is transitive, so
+ * three regions whose RAW vertical extents genuinely chain-overlap still
+ * share a band even when the outer two never overlap directly. That is
+ * inherent to y-band reading order and acceptable for real page content;
+ * the ordering above only removes the case where dilation manufactured
+ * the chaining out of thin air.
  *
  * Source-language gating (only regions whose text is in the source
  * language get translated) is deliberately NOT part of this ladder: it
@@ -252,13 +265,13 @@ export function validateRegions(raw: TextRegion[], imgW: number, imgH: number): 
 
   regions = mergeOverlapping(regions)
 
+  regions = sortReadingOrder(regions)
+
   regions = regions.map((r) => ({ ...r, bbox: dilate(r.bbox, DILATION_PX) }))
 
   regions = regions
     .map((r) => ({ ...r, bbox: clampToImage(r.bbox, imgW, imgH) }))
     .filter((r) => r.bbox.w > 0 && r.bbox.h > 0)
-
-  regions = sortReadingOrder(regions)
 
   return regions.map((r, i) => ({ ...r, id: `r${i + 1}` }))
 }
