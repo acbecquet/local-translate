@@ -71,6 +71,23 @@ export interface TextboxShapeSpec {
   wordArt?: boolean
   /** 0-based indices into `text` whose paragraph is emitted as an `a:fld` (auto-field, e.g. slide number/date placeholder) instead of a plain `a:r` - exercises the adapter's fld-as-text-carrier handling. */
   fldParagraphs?: number[]
+  /**
+   * Adds the named EG_TextAutofit choice element (ECMA-376
+   * CT_TextBodyProperties) to `a:bodyPr` - Phase 3 polish-round Task B
+   * fixture support for spAutoFit-vs-normAutofit-vs-noAutofit behavior/
+   * regression tests. Omitted (default) emits a bare `<a:bodyPr/>` with no
+   * autofit choice at all - the shape used by every test written before
+   * this option existed.
+   */
+  autofit?: 'spAutoFit' | 'normAutofit' | 'noAutofit'
+  /**
+   * Omits `<a:ext>` from the shape's own `a:xfrm` (keeps `<a:off>`) -
+   * simulates a spAutoFit textbox PowerPoint hasn't cached a resolved size
+   * for (real-deck example: slide6's "TextBox 18", ext=null). Without this,
+   * `box.wEmu`/`box.hEmu` are always emitted, matching every real deck's
+   * usual state and every test written before this option existed.
+   */
+  omitExt?: boolean
 }
 
 export interface PlaceholderShapeSpec {
@@ -215,13 +232,16 @@ function xmlDecl(): string {
   return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
 }
 
-function xfrmXml(box: EmuBox): string {
-  return `<a:xfrm><a:off x="${box.xEmu}" y="${box.yEmu}"/><a:ext cx="${box.wEmu}" cy="${box.hEmu}"/></a:xfrm>`
+/** `omitExt` drops `<a:ext>` (keeping `<a:off>`) - see TextboxShapeSpec.omitExt. Every non-textbox caller passes no second argument, so its behavior is unchanged. */
+function xfrmXml(box: EmuBox, omitExt?: boolean): string {
+  const ext = omitExt ? '' : `<a:ext cx="${box.wEmu}" cy="${box.hEmu}"/>`
+  return `<a:xfrm><a:off x="${box.xEmu}" y="${box.yEmu}"/>${ext}</a:xfrm>`
 }
 
 function bodyPrXml(
   insetsEmu?: { l?: number; r?: number; t?: number; b?: number },
-  wordArt?: boolean
+  wordArt?: boolean,
+  autofit?: 'spAutoFit' | 'normAutofit' | 'noAutofit'
 ): string {
   const attrs = insetsEmu
     ? [
@@ -233,7 +253,9 @@ function bodyPrXml(
     : []
   const attrsStr = attrs.length ? ` ${attrs.join(' ')}` : ''
   const warp = wordArt ? '<a:prstTxWarp prst="textArchUp"><a:avLst/></a:prstTxWarp>' : ''
-  return warp ? `<a:bodyPr${attrsStr}>${warp}</a:bodyPr>` : `<a:bodyPr${attrsStr}/>`
+  const autofitEl = autofit ? `<a:${autofit}/>` : ''
+  const children = warp + autofitEl
+  return children ? `<a:bodyPr${attrsStr}>${children}</a:bodyPr>` : `<a:bodyPr${attrsStr}/>`
 }
 
 function relationshipsXml(
@@ -325,8 +347,8 @@ function buildShapeXml(
       return (
         `<p:sp><p:nvSpPr><p:cNvPr id="${id}" name="${escAttr(name)}"/>` +
         '<p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr/></p:nvSpPr>' +
-        `<p:spPr>${xfrmXml(shape.box)}<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>` +
-        `<p:txBody>${bodyPrXml(shape.insetsEmu, shape.wordArt)}<a:lstStyle/>` +
+        `<p:spPr>${xfrmXml(shape.box, shape.omitExt)}<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>` +
+        `<p:txBody>${bodyPrXml(shape.insetsEmu, shape.wordArt, shape.autofit)}<a:lstStyle/>` +
         paragraphsXml(shape.text, {
           fontPt: shape.fontPt,
           bold: shape.bold,

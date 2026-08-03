@@ -176,6 +176,21 @@ function fitsBox(lines: string[], sizePt: number, box: Box): boolean {
   return maxLineW <= box.wPt && totalH <= box.hPt
 }
 
+/**
+ * Widest of `lines` at `sizePt`/`font`, using the exact measurement
+ * machinery fit() itself runs internally (the same setFont/width calls
+ * fitsBox uses above) - for callers that need "how wide would this text
+ * actually render" without running the fit loop (e.g. the pptx adapter's
+ * spAutoFit box synthesis, which needs the ORIGINAL text's rendered width
+ * BEFORE any fit() call is made - that width becomes the box fit() is then
+ * given). `lines` are taken as literal, already-broken lines: this function
+ * never wraps them - a caller that wants wrapping should use fit() instead.
+ */
+export function measureWidestLine(lines: string[], sizePt: number, font: FontSpec): number {
+  setFont(sizePt, font)
+  return lines.length === 0 ? 0 : Math.max(...lines.map(width))
+}
+
 function layout(
   text: string,
   sizePt: number,

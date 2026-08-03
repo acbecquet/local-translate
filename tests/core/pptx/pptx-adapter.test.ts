@@ -10,6 +10,8 @@ import type { Element } from '@xmldom/xmldom'
 import { A_NS, elems, openPptx } from '../../../src/core/adapters/pptx/ooxml'
 import { PptxAdapter } from '../../../src/core/adapters/pptx/pptx-adapter'
 import { runPipeline } from '../../../src/core/pipeline'
+import { fit, measureWidestLine } from '../../../src/core/fit/fit-engine'
+import { registerBundledFonts } from '../../../src/core/fit/fonts'
 import type { TextSegment, TranslatedSegment } from '../../../src/core/segments'
 import {
   CONFIDENCE_FLOOR,
@@ -57,6 +59,10 @@ function rawMediaRegion(
 }
 
 const EMU_PER_PT = 12700
+
+// Real font metrics for the spAutoFit box-synthesis tests below (measureWidestLine/fit
+// need registered families - mirrors fit-engine.test.ts's own top-level call).
+registerBundledFonts()
 
 const tmpDirs: string[] = []
 afterEach(async () => {
@@ -879,6 +885,258 @@ describe('PptxAdapter.extract', () => {
   })
 })
 
+/**
+ * Phase 3 polish-round Task B: a spAutoFit ("resize shape to fit text")
+ * textbox's declared/inherited `a:ext` is PowerPoint's own cached
+ * last-computed size for the ORIGINAL text - not a binding constraint on a
+ * translated segment, since PowerPoint recomputes the shape's size from
+ * whatever text it actually holds. The binding constraint is the ORIGINAL
+ * text's own measured extent (the real deck bug: slide 6/14's "TextBox 18"
+ * has no explicit `a:ext` at all, and a naive geometry-box fit let a longer
+ * translation grow the recomputed shape and shove the rest of the layout).
+ */
+describe('PptxAdapter.extract - spAutoFit box synthesis', () => {
+  it("a spAutoFit shape with an explicit (stale) a:ext resolves its box from the ORIGINAL text's measured extent, NOT the shape geometry", async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Short'],
+              // A generously large declared box - if this were used (as a
+              // non-spAutoFit shape would), wPt would be in the thousands
+              // of pt; the synthesized box must ignore it entirely.
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT },
+              fontPt: 18,
+              name: 'TextBox 18',
+              autofit: 'spAutoFit'
+            }
+          ]
+        }
+      ]
+    })
+
+    const segments = await new PptxAdapter().extract(srcPath)
+    expect(segments).toHaveLength(1)
+    const [s] = segments
+
+    const expectedWidest = measureWidestLine(['Short'], 18, s.font)
+    // Same WRAP_SAFETY convention (0.96) the adapter already applies to
+    // every other box's width, for the same measure-vs-PowerPoint-render
+    // mismatch reason - doubly load-bearing here.
+    expect(s.box.wPt).toBeCloseTo(expectedWidest * 0.96, 6)
+    expect(s.box.hPt).toBeCloseTo(1 * 18 * 1.2, 6)
+    // Nowhere near the declared 5000pt-wide (minus insets) shape geometry -
+    // proof the shape's own a:ext was never consulted for this box.
+    expect(s.box.wPt).toBeLessThan(200)
+  })
+
+  it('a spAutoFit shape with NO explicit a:ext (ext=null, the real slide6/14 "TextBox 18" case) still resolves a real, bounded fit box - never SENTINEL_BOX', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Some original text'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT },
+              omitExt: true,
+              fontPt: 18,
+              name: 'TextBox 18',
+              autofit: 'spAutoFit'
+            }
+          ]
+        }
+      ]
+    })
+
+    const segments = await new PptxAdapter().extract(srcPath)
+    expect(segments).toHaveLength(1)
+    const [s] = segments
+
+    const expectedWidest = measureWidestLine(['Some original text'], 18, s.font)
+    expect(s.box.wPt).toBeCloseTo(expectedWidest * 0.96, 6)
+    expect(s.box.hPt).toBeCloseTo(1 * 18 * 1.2, 6)
+    // A real, tightly-bounded box - not the "never shrink" sentinel that
+    // an unresolvable geometry box (ext=null on a NON-spAutoFit shape)
+    // would fall back to.
+    expect(s.box.wPt).toBeLessThan(100_000)
+    expect(s.box.hPt).toBeLessThan(100_000)
+  })
+
+  it('multi-paragraph original: width = widest paragraph, height = paragraph count x size x 1.2', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Short', 'A noticeably longer second paragraph line', 'Mid length'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT },
+              fontPt: 20,
+              name: 'TextBox 18',
+              autofit: 'spAutoFit'
+            }
+          ]
+        }
+      ]
+    })
+
+    const segments = await new PptxAdapter().extract(srcPath)
+    const [s] = segments
+    expect(s.text.split('\n')).toHaveLength(3)
+
+    const expectedWidest = measureWidestLine(
+      ['Short', 'A noticeably longer second paragraph line', 'Mid length'],
+      20,
+      s.font
+    )
+    expect(s.box.wPt).toBeCloseTo(expectedWidest * 0.96, 6)
+    expect(s.box.hPt).toBeCloseTo(3 * 20 * 1.2, 6)
+  })
+
+  it("spAutoFit shape + LONGER translation: fittedSizePt shrinks until the translated block never exceeds the original's measured extent", async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Short'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT },
+              fontPt: 18,
+              name: 'TextBox 18',
+              autofit: 'spAutoFit'
+            }
+          ]
+        }
+      ]
+    })
+
+    const segments = await new PptxAdapter().extract(srcPath)
+    const [s] = segments
+    const originalWidest = measureWidestLine(s.text.split('\n'), s.font.sizePt, s.font)
+    const originalHeight = 1 * s.font.sizePt * 1.2
+
+    const longTranslation =
+      'This is a very much longer translated sentence that would never have fit at the original size'
+    const result = fit(longTranslation, s.box, s.font)
+
+    expect(result.fontSizePt).toBeLessThan(s.font.sizePt) // real shrink happened
+    const translatedWidest = measureWidestLine(result.lines, result.fontSizePt, s.font)
+    // The core guarantee: the fitted translation's own measured block never
+    // exceeds the ORIGINAL text's measured block, in either dimension -
+    // this is what keeps PowerPoint's recomputed spAutoFit shape from
+    // growing past its original size.
+    expect(translatedWidest).toBeLessThanOrEqual(originalWidest)
+    const translatedHeight = result.lines.length * result.fontSizePt * 1.2
+    expect(translatedHeight).toBeLessThanOrEqual(originalHeight + 1e-6)
+  })
+
+  it('spAutoFit shape + SHORTER translation: size is unchanged (no needless shrink)', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['A somewhat longer original sentence right here'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT },
+              fontPt: 18,
+              name: 'TextBox 18',
+              autofit: 'spAutoFit'
+            }
+          ]
+        }
+      ]
+    })
+
+    const segments = await new PptxAdapter().extract(srcPath)
+    const [s] = segments
+    const result = fit('Short', s.box, s.font)
+    expect(result.fontSizePt).toBe(s.font.sizePt)
+    expect(result.overflowed).toBe(false)
+  })
+
+  it('normAutofit shape: box computation is COMPLETELY unchanged (regression) - still the shape geometry box, not the text-measured extent', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['First paragraph.', 'Second paragraph.', 'Third paragraph.'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT },
+              fontPt: 18,
+              name: 'Body Text 1',
+              autofit: 'normAutofit'
+            }
+          ]
+        }
+      ]
+    })
+
+    const segments = await new PptxAdapter().extract(srcPath)
+    const [s] = segments
+    // Identical numbers to the plain-geometry extract test above (no autofit
+    // element at all) - normAutofit must never route through spAutoFit's
+    // text-measured box synthesis.
+    const insetW = 5000 - 7.2 - 7.2
+    expect(s.box.wPt).toBeCloseTo(insetW * 0.96, 6)
+    expect(s.box.hPt).toBeCloseTo(3000 - 3.6 - 3.6, 6)
+  })
+
+  it('noAutofit shape: box computation is COMPLETELY unchanged (regression) - still the shape geometry box', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['First paragraph.', 'Second paragraph.', 'Third paragraph.'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT },
+              fontPt: 18,
+              name: 'Body Text 1',
+              autofit: 'noAutofit'
+            }
+          ]
+        }
+      ]
+    })
+
+    const segments = await new PptxAdapter().extract(srcPath)
+    const [s] = segments
+    const insetW = 5000 - 7.2 - 7.2
+    expect(s.box.wPt).toBeCloseTo(insetW * 0.96, 6)
+    expect(s.box.hPt).toBeCloseTo(3000 - 3.6 - 3.6, 6)
+  })
+
+  it('shape with no autofit element at all (the pre-existing default): box computation is COMPLETELY unchanged (regression)', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['First paragraph.', 'Second paragraph.', 'Third paragraph.'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT },
+              fontPt: 18,
+              name: 'Body Text 1'
+            }
+          ]
+        }
+      ]
+    })
+
+    const segments = await new PptxAdapter().extract(srcPath)
+    const [s] = segments
+    const insetW = 5000 - 7.2 - 7.2
+    expect(s.box.wPt).toBeCloseTo(insetW * 0.96, 6)
+    expect(s.box.hPt).toBeCloseTo(3000 - 3.6 - 3.6, 6)
+  })
+})
+
 describe('PptxAdapter.collectSkips', () => {
   it('returns the unsupported-content skips recorded during the most recent extract() call, as {id, reason}', async () => {
     const srcPath = await writeDeck({
@@ -1292,6 +1550,43 @@ describe('PptxAdapter.apply', () => {
     const bodyPr = elems(doc, A_NS, 'bodyPr')[0]
     expect(elems(bodyPr, A_NS, 'spAutoFit')).toHaveLength(0)
     expect(elems(bodyPr, A_NS, 'normAutofit')).toHaveLength(1)
+  })
+
+  it('a gated (kept-original) segment in a spAutoFit shape is left completely untouched by apply(): translation === text means no fit pressure, so sz is never written and spAutoFit survives (interacts with polish A)', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Hello'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT },
+              fontPt: 18,
+              autofit: 'spAutoFit'
+            }
+          ]
+        }
+      ]
+    })
+
+    const srcDigests = await digestParts(await readFile(srcPath))
+
+    const adapter = new PptxAdapter()
+    const [seg] = await adapter.extract(srcPath)
+    // translation === text: exactly what a source-language-gated ("kept
+    // original") segment looks like by the time it reaches apply() - no
+    // translation ever happened, so there is no fit pressure at all.
+    const translated = makeTranslated(seg)
+
+    const outPath = path.join(path.dirname(srcPath), 'out.pptx')
+    await adapter.apply(srcPath, outPath, [translated])
+
+    const outDigests = await digestParts(await readFile(outPath))
+    // Zero-diff guarantee: not just "sz absent" but byte-identical to the
+    // source part - proves apply() never even reached writeTranslation/
+    // writeSize for this segment, so the spAutoFit element could not have
+    // been converted to normAutofit either.
+    expect(outDigests.get('ppt/slides/slide1.xml')).toBe(srcDigests.get('ppt/slides/slide1.xml'))
   })
 
   it('never touches sz when the fitted size equals the segment font size, even though the text did change', async () => {

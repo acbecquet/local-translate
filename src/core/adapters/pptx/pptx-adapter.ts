@@ -42,6 +42,7 @@ import {
   type PptxArchive
 } from './ooxml'
 import { groupChildScale, resolveShapeGeom, tableCellBoxes } from './geometry'
+import { measureWidestLine } from '../../fit/fit-engine'
 import {
   CONFIDENCE_FLOOR,
   validateRegions,
@@ -87,6 +88,16 @@ const WRAP_SAFETY = 0.96
  * whether to touch `sz` at all.
  */
 const SENTINEL_BOX: Box = { wPt: 1_000_000, hPt: 1_000_000 }
+
+/**
+ * Line-height factor used only by synthesizeSpAutoFitBox's height formula -
+ * mirrors fit-engine.ts's own LINE_HEIGHT_FACTOR (module-private there, so
+ * not importable - the same duplicated-constant approach
+ * MEDIA_ONE_LINE_HEIGHT_FACTOR below already takes, for the identical
+ * reason: a plain arithmetic constant carries none of the gating-logic
+ * divergence risk that would make a real shared import necessary).
+ */
+const SPAUTOFIT_LINE_HEIGHT_FACTOR = 1.2
 
 /**
  * Sentinel stored in a SmartArt drawing-part update map (see
@@ -607,22 +618,86 @@ function handleSp(
   const name = shapeName(shape)
   const id = uniqueId(`slide${ctx.slideN}/${pathPrefix}shape[name=${escId(name)}]/tb`, ctx.usedIds)
 
+  const fontSpec: FontSpec = {
+    family: font?.family ?? DEFAULT_FALLBACK_FONT_FAMILY,
+    sizePt: geom.fontPt ?? DEFAULT_FALLBACK_FONT_PT,
+    bold: font?.bold ?? false,
+    italic: font?.italic ?? false
+  }
+
+  // spAutoFit ("resize shape to fit text"): the shape's own geometry box
+  // (geom.box, whatever it resolved to - even null) is never the binding
+  // constraint - see synthesizeSpAutoFitBox's doc comment. normAutofit,
+  // noAutofit, and "no autofit element at all" all keep the pre-existing
+  // geometry-box behavior unchanged.
+  const box: Box =
+    geom.autofit === 'spAutoFit'
+      ? synthesizeSpAutoFitBox(text, fontSpec)
+      : geom.box
+        ? { wPt: geom.box.wPt * WRAP_SAFETY, hPt: geom.box.hPt }
+        : SENTINEL_BOX
+
   ctx.sites.push({
     id,
     kind: 'shape',
     context: roleForShape(shape),
     groupKey: `slide${ctx.slideN}`,
     text,
-    font: {
-      family: font?.family ?? DEFAULT_FALLBACK_FONT_FAMILY,
-      sizePt: geom.fontPt ?? DEFAULT_FALLBACK_FONT_PT,
-      bold: font?.bold ?? false,
-      italic: font?.italic ?? false
-    },
-    box: geom.box ? { wPt: geom.box.wPt * WRAP_SAFETY, hPt: geom.box.hPt } : SENTINEL_BOX,
+    font: fontSpec,
+    box,
     partPath: ctx.slidePath,
     bodyEl: txBody
   })
+}
+
+/**
+ * A spAutoFit ("resize shape to fit text") shape's declared/inherited
+ * `a:ext` - what resolveShapeGeom's `box` reports - is at best PowerPoint's
+ * own cached LAST-COMPUTED size for whatever text the shape held when it
+ * was last saved, and at worst (no explicit `a:ext` at all - a freshly
+ * inserted or never-resaved textbox, e.g. the real deck's slide6/14
+ * "TextBox 18") not even that. Either way it is not the binding constraint
+ * on a TRANSLATED segment: PowerPoint recomputes the shape's own size from
+ * whatever text it actually contains, every time it renders. The binding
+ * constraint is the ORIGINAL text's own measured extent - fit the
+ * translation into a box no larger than that and the shape PowerPoint
+ * recomputes can never grow past its original size, regardless of what
+ * `a:ext` (if any) currently says. Same treatment whether or not the shape
+ * has an explicit ext (see this function's only caller, handleSp) - an
+ * explicit ext is just as stale a snapshot as no ext at all.
+ *
+ * `text` is split on paragraph/explicit-break boundaries exactly as
+ * paragraphsText/paragraphText extract them - NOT re-wrapped against any
+ * box, since there is no box width here to wrap against (the box is what
+ * this function computes). Width is the widest such line measured at
+ * `font` - the exact measurement machinery fit-engine.ts's own fit() uses
+ * internally (see measureWidestLine's doc comment). Height is the line
+ * count times `font.sizePt` times the fit engine's own line-height model
+ * (SPAUTOFIT_LINE_HEIGHT_FACTOR - see its doc comment for why this is a
+ * duplicated constant, not an import). WRAP_SAFETY is applied to width,
+ * same as every other box handleSp hands to fit() (see WRAP_SAFETY's own
+ * doc comment) - doubly important here, since this box is the ceiling the
+ * whole no-growth guarantee rests on.
+ *
+ * Deliberately NOT scaled by groupScale: this box is derived purely from
+ * nominal-point-size text measurement, not from a shape `a:ext` - mirroring
+ * ShapeGeom.fontPt's own no-group-scaling rule (PowerPoint renders grouped
+ * text at nominal size regardless of the group's XML transform - see that
+ * field's doc comment), not resolveShapeGeom's separate ext-scaling rule,
+ * which simply doesn't apply here since no ext is consulted.
+ *
+ * Mixed per-run sizes within one shape: `font.sizePt` is the segment's
+ * single resolved size (the adapter's existing one-size-per-segment
+ * contract, unchanged by this function) - every line is measured at that
+ * one size even when the source paragraphs actually differ in size, the
+ * same approximation fit()'s own single-sizePt-per-segment contract already
+ * makes.
+ */
+function synthesizeSpAutoFitBox(text: string, font: FontSpec): Box {
+  const lines = text.split('\n')
+  const wPt = measureWidestLine(lines, font.sizePt, font) * WRAP_SAFETY
+  const hPt = lines.length * font.sizePt * SPAUTOFIT_LINE_HEIGHT_FACTOR
+  return { wPt, hPt }
 }
 
 function handlePic(pic: Element, pathPrefix: string, ctx: WalkCtx): void {

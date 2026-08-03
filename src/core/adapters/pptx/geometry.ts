@@ -69,6 +69,18 @@ export interface ResolvedBox {
   hPt: number
 }
 
+/**
+ * Which EG_TextAutofit choice (ECMA-376 CT_TextBodyProperties) a shape's
+ * `a:bodyPr` carries - 'spAutoFit' means PowerPoint resizes the SHAPE to
+ * hug its text at render time, which is the fact pptx-adapter.ts's handleSp
+ * needs to route a shape into text-measured (not shape-geometry) box
+ * synthesis (see ShapeGeom.autofit and synthesizeSpAutoFitBox there). null
+ * covers both "no bodyPr" and "bodyPr present but none of the three choice
+ * elements are" - both are reported identically since every caller so far
+ * only special-cases the explicit 'spAutoFit' value.
+ */
+export type AutofitMode = 'spAutoFit' | 'normAutofit' | 'noAutofit' | null
+
 export interface ShapeGeom {
   /**
    * null = no constraint resolvable (fit engine skipped, size preserved).
@@ -100,6 +112,8 @@ export interface ShapeGeom {
    * removed (see `box`'s doc comment above).
    */
   insetsPt: { l: number; r: number; t: number; b: number }
+  /** See AutofitMode's own doc comment. Reported as a plain fact - this module never decides what a caller does with it. */
+  autofit: AutofitMode
 }
 
 export interface ResolveShapeGeomOptions {
@@ -118,11 +132,12 @@ export function resolveShapeGeom(opts: ResolveShapeGeomOptions): ShapeGeom {
 
   const fontPt = resolveFontPt(shape)
   const insetsPt = readInsetsPt(shape, groupScale)
+  const autofit = resolveAutofitMode(shape)
 
   const ownExt = getOwnExtEmu(shape)
   const extEmu = ownExt ?? resolveInheritedExtEmu(shape, layoutDoc, masterDoc)
   if (!extEmu) {
-    return { box: null, fontPt, insetsPt }
+    return { box: null, fontPt, insetsPt, autofit }
   }
 
   const insetsEmu = readInsetsEmu(shape)
@@ -134,7 +149,7 @@ export function resolveShapeGeom(opts: ResolveShapeGeomOptions): ShapeGeom {
     hPt: (usableHEmu / EMU_PER_PT) * groupScale.sy
   }
 
-  return { box, fontPt, insetsPt }
+  return { box, fontPt, insetsPt, autofit }
 }
 
 /**
@@ -367,6 +382,17 @@ function resolveRawFontPt(shape: Element): number | null {
     if (fallback !== undefined) return fallback
   }
 
+  return null
+}
+
+/** See AutofitMode's doc comment for what this reports and why null covers two distinct XML states identically. */
+function resolveAutofitMode(shape: Element): AutofitMode {
+  const txBody = findTxBody(shape)
+  const bodyPr = txBody && childElems(txBody, A_NS, 'bodyPr')[0]
+  if (!bodyPr) return null
+  if (childElems(bodyPr, A_NS, 'spAutoFit')[0]) return 'spAutoFit'
+  if (childElems(bodyPr, A_NS, 'normAutofit')[0]) return 'normAutofit'
+  if (childElems(bodyPr, A_NS, 'noAutofit')[0]) return 'noAutofit'
   return null
 }
 
