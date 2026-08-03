@@ -19,7 +19,7 @@ import {
   measureWidestLine,
   wrapLines
 } from '../../../src/core/fit/fit-engine'
-import { registerBundledFonts } from '../../../src/core/fit/fonts'
+import { registerBundledFonts, resolveFamily } from '../../../src/core/fit/fonts'
 import type { TextSegment, TranslatedSegment } from '../../../src/core/segments'
 import {
   CONFIDENCE_FLOOR,
@@ -67,6 +67,18 @@ function rawMediaRegion(
 }
 
 const EMU_PER_PT = 12700
+
+/** Independent measurement helper (mirrors sizing.test.ts's own) - verifies
+ * collectMediaSegments's font.sizePt against a fresh measurement rather than
+ * checking pptx-adapter.ts's computation against itself. */
+const mediaMeasureCanvas = new Canvas(8, 8)
+const mediaMeasureCtx = mediaMeasureCanvas.getContext('2d')
+function mediaInkHeightAt(text: string, sizePt: number, family: string): number {
+  const { family: resolved } = resolveFamily(family)
+  mediaMeasureCtx.font = `${sizePt}px "${resolved}"`
+  const m = mediaMeasureCtx.measureText(text)
+  return m.actualBoundingBoxAscent + m.actualBoundingBoxDescent
+}
 
 // Real font metrics for the spAutoFit box-synthesis tests below (measureWidestLine/fit
 // need registered families - mirrors fit-engine.test.ts's own top-level call).
@@ -3195,6 +3207,34 @@ describe('embedded media - id/groupKey/context (behavior contract point 2)', () 
     const mediaSeg = segments.find((s) => s.kind === 'image-region')!
 
     expect(mediaSeg.groupKey).toBe('slide2') // the first slide that uses the shared part, not slide3
+  })
+})
+
+describe('embedded media - font sizing is ink-matched, not the dilated bbox (polish round Task C)', () => {
+  it('derives font.sizePt from the RAW pre-dilation ink height (inkBBox), not bbox.h / 1.2', async () => {
+    const png = await makePngBytes(200, 100, '#ffffff')
+    // Raw region h:30 -> dilated (DILATION_PX=2/side) bbox.h:34, inkBBox.h:30.
+    const engine = fakeMediaEngine([
+      {
+        bytes: png,
+        regions: [rawMediaRegion({ bbox: { x: 20, y: 20, w: 100, h: 30 }, text: 'Hello' })]
+      }
+    ])
+    const srcPath = await writeDeck({
+      slides: [{ shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: png }] }]
+    })
+
+    const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const segments = await adapter.extract(srcPath)
+    const mediaSeg = segments.find((s) => s.kind === 'image-region')!
+
+    // Measuring "Hello" back at the returned size must land within 2px of
+    // the RAW 30px ink target - not the dilated 34px bbox height.
+    expect(
+      Math.abs(mediaInkHeightAt('Hello', mediaSeg.font.sizePt, mediaSeg.font.family) - 30)
+    ).toBeLessThanOrEqual(2)
+    // And it must have moved off the old h/1.2 estimate (34/1.2 ~= 28.33).
+    expect(Math.abs(mediaSeg.font.sizePt - 34 / 1.2)).toBeGreaterThan(1)
   })
 })
 

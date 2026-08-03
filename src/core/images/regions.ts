@@ -18,8 +18,26 @@ export interface TextRegion {
   /** 'r1', 'r2', ... - stable ordering within one image. Only meaningful
    * after validateRegions has run; raw engine output may use any id. */
   id: string
-  /** Clamped to image bounds. */
+  /** Clamped to image bounds. The PAINT/FILL region: DILATION_PX added per
+   * side (see its doc comment) so the background-fill sampling and the
+   * repainted rect both cover the couple of stray/antialiased px just
+   * outside the original glyphs. NOT the size authority - see inkBBox. */
   bbox: RegionBBox
+  /**
+   * The merged, PRE-dilation bbox - validateRegions's surviving geometry
+   * exactly as detected/merged, before DILATION_PX ever touches it. This is
+   * the SIZE authority: a painted replacement's rendered ink height must
+   * match this box's height exactly (polish-round Task C - reusing the
+   * dilated `bbox` for sizing inflated small text worst, since +2px/side is
+   * a much bigger relative fudge on an 8px legend line than on a 40px
+   * headline). Populated by validateRegions on every surviving region;
+   * optional because engines/tests that build a TextRegion by hand (not via
+   * validateRegions) have no equivalent pre-dilation geometry to report.
+   * Downstream code MUST treat an absent inkBBox as inkBBox === bbox - i.e.
+   * fall back to the region's own (possibly dilated) box rather than
+   * assuming any particular ink extent.
+   */
+  inkBBox?: RegionBBox
   /** Source text as read by the engine. */
   text: string
   /** 0..1. */
@@ -230,9 +248,13 @@ function sortReadingOrder(regions: TextRegion[]): TextRegion[] {
  *    2*DILATION_PX of real vertical gap, which would let the band sweep
  *    chain visually separate rows into one band and destroy row order
  *    (three tightly-spaced rows would come back column-major or reversed).
- * 7. Dilate every surviving bbox (decision doc; see DILATION_PX) - a pure
- *    order-preserving map, so running it after the sort changes nothing
- *    about ordering.
+ * 7. Snapshot each surviving region's current (merged, pre-dilation) bbox
+ *    as inkBBox, THEN dilate bbox itself (decision doc; see DILATION_PX) -
+ *    a pure order-preserving map, so running it after the sort changes
+ *    nothing about ordering. inkBBox has to be captured in this same step,
+ *    before bbox is overwritten with the dilated value - it is the size
+ *    authority downstream sizing (sizing.ts's inkMatchedFontSizePt) uses
+ *    instead of the inflated dilated box (polish-round Task C).
  * 8. Clamp to image bounds; drop anything that clamps to a zero/negative
  *    area box (plan point 1, second half - e.g. a region already entirely
  *    outside the image, or dilated past an edge with nothing left inside).
@@ -267,7 +289,10 @@ export function validateRegions(raw: TextRegion[], imgW: number, imgH: number): 
 
   regions = sortReadingOrder(regions)
 
-  regions = regions.map((r) => ({ ...r, bbox: dilate(r.bbox, DILATION_PX) }))
+  // inkBBox: r.bbox reads the PRE-dilation box (r is never mutated by this
+  // map; the bbox: dilate(...) key below overwrites it in the OUTPUT object
+  // only), so both keys land correctly in one pass without a second map.
+  regions = regions.map((r) => ({ ...r, inkBBox: r.bbox, bbox: dilate(r.bbox, DILATION_PX) }))
 
   regions = regions
     .map((r) => ({ ...r, bbox: clampToImage(r.bbox, imgW, imgH) }))

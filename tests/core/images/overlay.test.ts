@@ -7,6 +7,8 @@ import {
   renderOverlay,
   type OverlayRegion
 } from '../../../src/core/images/overlay'
+import { DILATION_PX } from '../../../src/core/images/regions'
+import { inkMatchedFontSizePt } from '../../../src/core/images/sizing'
 
 registerBundledFonts()
 
@@ -62,6 +64,34 @@ function channelDelta(
 
 function magicMatches(buffer: Buffer, magic: number[]): boolean {
   return magic.every((byte, i) => buffer[i] === byte)
+}
+
+/** Tight pixel bounding box of every pixel in `region` whose color differs
+ * from `bg` by more than the fixed detection threshold shared with the
+ * other tests in this file (channelDelta > 40) - i.e. the actual rendered
+ * INK extent, read straight from pixels rather than from any font metric.
+ * Returns null when the region is pure background (no ink found at all). */
+function scanInkBBox(
+  decoded: Decoded,
+  region: { x: number; y: number; w: number; h: number },
+  bg: { r: number; g: number; b: number }
+): { minX: number; minY: number; maxX: number; maxY: number } | null {
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  for (let y = region.y; y < region.y + region.h; y++) {
+    for (let x = region.x; x < region.x + region.w; x++) {
+      const p = pixelAt(decoded, x, y)
+      if (channelDelta(p, bg) > 40) {
+        if (x < minX) minX = x
+        if (x > maxX) maxX = x
+        if (y < minY) minY = y
+        if (y > maxY) maxY = y
+      }
+    }
+  }
+  return minX === Infinity ? null : { minX, minY, maxX, maxY }
 }
 
 describe('renderOverlay - zero regions (behavior contract point 1)', () => {
@@ -346,6 +376,90 @@ describe('renderOverlay - CJK glyph rendering (behavior contract point 6)', () =
       }
     }
     expect(nonFillPixelCount).toBeGreaterThan(0)
+  })
+})
+
+describe('renderOverlay + inkMatchedFontSizePt - pixel-exact ink height (polish round Task C)', () => {
+  it("paints a translated line whose rendered ink-row extent is within 2px of the ORIGINAL text's, at a real (dilated) region geometry", async () => {
+    // Build the "source" image exactly the way a real screenshot/deck would
+    // arrive: an encoded PNG with real glyphs already drawn on it, at a size
+    // this test picks (26pt) but the code under test never gets told -
+    // it has to recover the original ink height purely from the image's own
+    // pixels, the same way regions.ts's inkBBox does from a detector's raw
+    // (pre-dilation) geometry.
+    const width = 320
+    const height = 150
+    const white = { r: 255, g: 255, b: 255 }
+    const origSizePt = 26
+    const originalText = 'Hello'
+
+    const srcCanvas = new Canvas(width, height)
+    const srcCtx = srcCanvas.getContext('2d')
+    srcCtx.fillStyle = '#ffffff'
+    srcCtx.fillRect(0, 0, width, height)
+    srcCtx.font = `${origSizePt}px "Noto Sans"`
+    srcCtx.fillStyle = '#000000'
+    srcCtx.textAlign = 'left'
+    srcCtx.textBaseline = 'top'
+    srcCtx.fillText(originalText, 40, 40)
+    const input = await srcCanvas.toBuffer('png')
+
+    // Recover the original's tight ink bbox by scanning pixels, not by
+    // trusting the draw call's own font metrics - this is what makes the
+    // eventual comparison below a true pixel test, not a metrics round trip.
+    const inputDecoded = await decode(input)
+    const origInk = scanInkBBox(inputDecoded, { x: 0, y: 0, w: width, h: height }, white)
+    expect(origInk).not.toBeNull()
+    const origInkHeightPx = origInk!.maxY - origInk!.minY + 1
+
+    // Mirrors regions.ts's own ladder: inkBBox is the raw (tight, pre-
+    // dilation) box; the PAINT/FILL bbox is inkBBox dilated by DILATION_PX
+    // per side, the real constant regions.ts uses, not a hand-picked number.
+    const rawBBox = {
+      x: origInk!.minX,
+      y: origInk!.minY,
+      w: origInk!.maxX - origInk!.minX + 1,
+      h: origInkHeightPx
+    }
+    const dilatedBBox = {
+      x: rawBBox.x - DILATION_PX,
+      y: rawBBox.y - DILATION_PX,
+      w: rawBBox.w + 2 * DILATION_PX,
+      h: rawBBox.h + 2 * DILATION_PX
+    }
+
+    // A genuinely different "translation" (not the same string) - proves
+    // this isn't just measuring the same text against itself.
+    const translation = 'Salut'
+    const font = { family: 'Noto Sans', sizePt: origInkHeightPx }
+    const fontSizePt = inkMatchedFontSizePt(translation, font, origInkHeightPx)
+
+    const region: OverlayRegion = {
+      bbox: dilatedBBox,
+      lines: [translation],
+      fontSizePt,
+      font: { family: 'Noto Sans', sizePt: fontSizePt }
+    }
+
+    const result = await renderOverlay(input, [region])
+    const outputDecoded = await decode(result.image)
+    // Scan a window generous enough to catch the painted glyphs even if
+    // their (differently-shaped) ink sits a little outside the original's
+    // exact rows, but still well clear of image edges.
+    const scanWindow = {
+      x: Math.max(0, dilatedBBox.x - 5),
+      y: Math.max(0, dilatedBBox.y - 10),
+      w: Math.min(width, dilatedBBox.w + 10),
+      h: Math.min(height, dilatedBBox.h + 20)
+    }
+    const paintedInk = scanInkBBox(outputDecoded, scanWindow, white)
+    expect(paintedInk).not.toBeNull()
+    const paintedInkHeightPx = paintedInk!.maxY - paintedInk!.minY + 1
+
+    // Charlie's "it really needs to be exact" requirement, as a pixel test:
+    // the painted replacement's rendered ink height must match the
+    // original's, not the dilated fill box's inflated height.
+    expect(Math.abs(paintedInkHeightPx - origInkHeightPx)).toBeLessThanOrEqual(2)
   })
 })
 

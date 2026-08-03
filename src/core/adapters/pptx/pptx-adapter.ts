@@ -57,6 +57,7 @@ import {
 } from '../../images/regions'
 import { renderOverlay, type OverlayRegion } from '../../images/overlay'
 import { containsCjk, isSourceLanguageRegion } from '../../images/gating'
+import { inkMatchedFontSizePt } from '../../images/sizing'
 
 /** DrawingML diagram (SmartArt) namespace - not part of ooxml.ts's exported constants (only a:/p:/r:/rels are). */
 const DGM_NS = 'http://schemas.openxmlformats.org/drawingml/2006/diagram'
@@ -98,10 +99,10 @@ const SENTINEL_BOX: Box = { wPt: 1_000_000, hPt: 1_000_000 }
 /**
  * Line-height factor used only by synthesizeSpAutoFitBox's height formula -
  * mirrors fit-engine.ts's own LINE_HEIGHT_FACTOR (module-private there, so
- * not importable - the same duplicated-constant approach
- * MEDIA_ONE_LINE_HEIGHT_FACTOR below already takes, for the identical
- * reason: a plain arithmetic constant carries none of the gating-logic
- * divergence risk that would make a real shared import necessary).
+ * not importable - the same low-risk duplicated-constant approach overlay.ts
+ * takes for the identical reason: a plain arithmetic constant carries none
+ * of the gating-logic divergence risk that would make a real shared import
+ * necessary).
  */
 const SPAUTOFIT_LINE_HEIGHT_FACTOR = 1.2
 
@@ -142,20 +143,6 @@ export interface PptxAdapterDeps {
 }
 
 const DEFAULT_PPTX_ADAPTER_DEPS: PptxAdapterDeps = { regionEngine: null, sourceLang: '' }
-
-/**
- * Mirrors image-adapter.ts's own ONE_LINE_HEIGHT_FACTOR (a module-private
- * constant there, so not importable): a detected region's bbox height IS
- * its rendered line height, and line height is fontSizePt * this factor
- * everywhere else in the codebase (fit-engine.ts's LINE_HEIGHT_FACTOR).
- * Kept as a separately-documented duplicate rather than a shared import -
- * the same low-risk mirroring overlay.ts already does for fit-engine's own
- * LINE_HEIGHT_FACTOR. The gating LOGIC (isSourceLanguageRegion/containsCjk,
- * imported below) is what plan Task 5 behavior contract point 7 requires
- * NOT to diverge; a plain arithmetic constant like this one carries no such
- * risk.
- */
-const MEDIA_ONE_LINE_HEIGHT_FACTOR = 1.2
 
 const MEDIA_NOTO_SANS = 'Noto Sans'
 const MEDIA_NOTO_SANS_CJK_SC = 'Noto Sans CJK SC'
@@ -552,13 +539,28 @@ async function collectMediaSegments(
 
       const id = uniqueId(rawId, usedIds)
       paintableById.set(id, { mediaPath, region })
+      const mediaFamily = containsCjk(region.text) ? MEDIA_NOTO_SANS_CJK_SC : MEDIA_NOTO_SANS
+      // SIZE authority is the PRE-dilation ink extent (regions.ts's
+      // inkBBox), not the dilated bbox used for painting/fill - mirrors
+      // image-adapter.ts's own extract() (polish-round Task C: replacement
+      // text must occupy only the original space, exactly). Falls back to
+      // the dilated bbox height when inkBBox is absent - the documented
+      // TextRegion.inkBBox compatibility contract (regions.ts).
+      const mediaInkHeightPx = region.inkBBox?.h ?? region.bbox.h
       segments.push({
         id,
         text: region.text,
         box: { wPt: region.bbox.w, hPt: region.bbox.h },
         font: {
-          family: containsCjk(region.text) ? MEDIA_NOTO_SANS_CJK_SC : MEDIA_NOTO_SANS,
-          sizePt: region.bbox.h / MEDIA_ONE_LINE_HEIGHT_FACTOR
+          family: mediaFamily,
+          // sizePt here is a required FontSpec field but unused by
+          // inkMatchedFontSizePt itself (it measures at each candidate size
+          // explicitly) - mediaInkHeightPx is a harmless placeholder.
+          sizePt: inkMatchedFontSizePt(
+            region.text,
+            { family: mediaFamily, sizePt: mediaInkHeightPx },
+            mediaInkHeightPx
+          )
         },
         context: 'embedded image text',
         groupKey,

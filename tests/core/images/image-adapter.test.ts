@@ -10,9 +10,24 @@ import {
   type RegionEngine,
   type TextRegion
 } from '../../../src/core/images/regions'
-import type { TranslatedSegment } from '../../../src/core/segments'
+import { registerBundledFonts, resolveFamily } from '../../../src/core/fit/fonts'
+import type { FontSpec, TranslatedSegment } from '../../../src/core/segments'
 import { runPipeline } from '../../../src/core/pipeline'
 import type { TranslationBackend } from '../../../src/core/translate/backend'
+
+registerBundledFonts()
+
+// Independent measurement helper (mirrors sizing.test.ts's own) - verifies
+// extract()'s font.sizePt against a fresh measurement rather than checking
+// image-adapter.ts's computation against itself.
+const measureCanvas = new Canvas(8, 8)
+const measureCtx = measureCanvas.getContext('2d')
+function inkHeightAt(text: string, sizePt: number, font: FontSpec): number {
+  const { family } = resolveFamily(font.family)
+  measureCtx.font = `${sizePt}px "${family}"`
+  const m = measureCtx.measureText(text)
+  return m.actualBoundingBoxAscent + m.actualBoundingBoxDescent
+}
 
 const tmpDirs: string[] = []
 afterEach(() => {
@@ -120,8 +135,16 @@ describe('extract() - paintable region field mapping (behavior contract point 1)
     // Raw bbox dilated by DILATION_PX (2px/side, regions.ts) - well inside
     // the 400x300 image so the final clamp is a no-op.
     expect(seg.box).toEqual({ wPt: 104, hPt: 34 })
-    expect(seg.font.sizePt).toBeCloseTo(34 / 1.2)
     expect(seg.font.family).toBe('Noto Sans')
+    // sizePt is now ink-matched to the RAW (pre-dilation) ink height - 30px
+    // (bbox.h before the +2px/side dilation), not the dilated bbox.h (34).
+    // Measuring "Hello" back at the returned size must land within 2px of
+    // that 30px target.
+    expect(Math.abs(inkHeightAt('Hello', seg.font.sizePt, seg.font) - 30)).toBeLessThanOrEqual(2)
+    // And it must have MOVED from the old h/1.2 estimate (34/1.2 ~= 28.33) -
+    // proving this is real ink measurement, not the old heuristic wearing a
+    // new name.
+    expect(Math.abs(seg.font.sizePt - 34 / 1.2)).toBeGreaterThan(1)
   })
 
   it('picks the CJK font family when the region text contains CJK, independent of the exact CJK source-language spelling', async () => {

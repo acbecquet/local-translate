@@ -16,22 +16,13 @@ import {
 } from '../../images/regions'
 import { renderOverlay, type OverlayRegion } from '../../images/overlay'
 import { containsCjk, isSourceLanguageRegion } from '../../images/gating'
+import { inkMatchedFontSizePt } from '../../images/sizing'
 
 export interface ImageAdapterOpts {
   /** This run's source language, passed straight into isSourceLanguageRegion
    * for every detected region (plan Task 4 behavior contract point 2). */
   sourceLang: string
 }
-
-/** One-line-region font size estimate (plan Task 4 behavior contract point
- * 1): a region's bbox height IS its rendered line height, and line height
- * is fontSizePt * lineHeightFactor everywhere else in this codebase
- * (fit-engine.ts's own LINE_HEIGHT_FACTOR, mirrored - not exported - by
- * overlay.ts too; see overlay.ts's doc comment on why it can't just import
- * fit-engine's). Multi-line regions are out of scope v1 - PP-OCR/VLM
- * detection emits one box per text line, never a merged paragraph box, so
- * "one line fills the whole box height" is always the right estimate here. */
-const ONE_LINE_HEIGHT_FACTOR = 1.2
 
 const NOTO_SANS = 'Noto Sans'
 const NOTO_SANS_CJK_SC = 'Noto Sans CJK SC'
@@ -103,13 +94,25 @@ export function createImageAdapter(engine: RegionEngine, opts: ImageAdapterOpts)
         }
 
         paintable.set(region.id, region)
+        const family = containsCjk(region.text) ? NOTO_SANS_CJK_SC : NOTO_SANS
+        // SIZE authority is the PRE-dilation ink extent (regions.ts's
+        // inkBBox), not the dilated bbox used for painting/fill below - see
+        // sizing.ts's own doc comment (polish-round Task C: replacement text
+        // must occupy only the original space, exactly). Falls back to the
+        // dilated bbox height when inkBBox is absent (a hand-built TextRegion
+        // from an engine/test that bypassed validateRegions) - the documented
+        // TextRegion.inkBBox compatibility contract (regions.ts).
+        const inkHeightPx = region.inkBBox?.h ?? region.bbox.h
         segments.push({
           id: region.id,
           text: region.text,
           box: { wPt: region.bbox.w, hPt: region.bbox.h },
           font: {
-            family: containsCjk(region.text) ? NOTO_SANS_CJK_SC : NOTO_SANS,
-            sizePt: region.bbox.h / ONE_LINE_HEIGHT_FACTOR
+            family,
+            // sizePt here is a required FontSpec field but unused by
+            // inkMatchedFontSizePt itself (it measures at each candidate
+            // size explicitly) - inkHeightPx is a harmless placeholder.
+            sizePt: inkMatchedFontSizePt(region.text, { family, sizePt: inkHeightPx }, inkHeightPx)
           },
           context: 'image text region',
           groupKey,

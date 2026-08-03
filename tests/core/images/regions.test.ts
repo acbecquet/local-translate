@@ -231,6 +231,52 @@ describe('validateRegions - dilation after merge, before clamp (decision doc: kn
   })
 })
 
+describe('validateRegions - inkBBox (pre-dilation size authority, polish round Task C)', () => {
+  it('populates inkBBox with the raw (pre-dilation) bbox on a solo surviving region, distinct from the dilated bbox', () => {
+    const solo = region({ bbox: { x: 10, y: 20, w: 60, h: 8 }, text: 'Legend' })
+
+    const result = validateRegions([solo], 500, 500)
+
+    expect(result).toHaveLength(1)
+    // Raw bbox, untouched by DILATION_PX.
+    expect(result[0].inkBBox).toEqual({ x: 10, y: 20, w: 60, h: 8 })
+    // The paint/fill bbox IS dilated - the two must differ, or this whole
+    // feature is a no-op.
+    expect(result[0].bbox).toEqual({ x: 8, y: 18, w: 64, h: 12 })
+    expect(result[0].inkBBox).not.toEqual(result[0].bbox)
+  })
+
+  it('merge case: inkBBox is the union of RAW geometry, not the dilated union', () => {
+    const left = region({ bbox: { x: 100, y: 100, w: 100, h: 20 }, text: 'Left' })
+    const right = region({ bbox: { x: 120, y: 100, w: 100, h: 20 }, text: 'Right' })
+    // Same IoU-triggering pair as the "merges two regions" test above
+    // (iou 0.667 > 0.5): union of raw geometry is {x:100,y:100,w:120,h:20}.
+
+    const result = validateRegions([left, right], 1000, 1000)
+
+    expect(result).toHaveLength(1)
+    expect(result[0].text).toBe('Left Right')
+    // Pre-dilation union - NOT {x:98,y:98,w:124,h:24} (that's the dilated
+    // bbox, asserted separately below; reusing it here would defeat the
+    // point of a separate ink authority).
+    expect(result[0].inkBBox).toEqual({ x: 100, y: 100, w: 120, h: 20 })
+    expect(result[0].bbox).toEqual({ x: 98, y: 98, w: 124, h: 24 })
+  })
+
+  it('compatibility: raw regions built without an inkBBox field (the normal engine-output shape - see the `region()` helper above, which never sets one) still produce a correctly-populated inkBBox on output; validateRegions never requires callers to supply one', () => {
+    // Every fixture in this entire file is built via `region()`, which never
+    // sets inkBBox - this test just makes that implicit assumption explicit
+    // for the one field this whole describe block is about.
+    const raw = region({ bbox: { x: 0, y: 0, w: 50, h: 20 }, text: 'NoInkBBoxInput' })
+    expect((raw as { inkBBox?: unknown }).inkBBox).toBeUndefined()
+
+    const result = validateRegions([raw], 1000, 1000)
+
+    expect(result).toHaveLength(1)
+    expect(result[0].inkBBox).toEqual({ x: 0, y: 0, w: 50, h: 20 })
+  })
+})
+
 describe('validateRegions - rotated flag passthrough', () => {
   it('preserves rotated:true on a surviving region that never merges with anything', () => {
     const solo = region({
