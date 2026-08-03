@@ -248,6 +248,56 @@ describe('runCli: exit codes and dependency injection', () => {
     expect(translateBatch).not.toHaveBeenCalled()
   })
 
+  it('warns when EVERY segment gated as not-source-language - the mislabeled-sourceLang shape', async () => {
+    const logs: string[] = []
+    vi.spyOn(console, 'log').mockImplementation((msg?: unknown) => {
+      logs.push(String(msg ?? ''))
+    })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const file = writeFixture([
+      seg({ id: 's1', text: '你好世界' }),
+      seg({ id: 's2', text: '电池测试' })
+    ])
+    const ensureOllama = vi
+      .fn()
+      .mockResolvedValue(fakeConnection(vi.fn().mockResolvedValue(undefined)))
+    const createBackend = vi.fn().mockReturnValue(fakeBackend({ translateBatch: vi.fn() }))
+
+    const code = await runCli([file, 'English', 'Chinese (Simplified)'], {
+      ensureOllama,
+      createBackend
+    })
+
+    expect(code).toBe(0)
+    expect(logs.some((l) => l.includes('WARNING') && l.includes('source language'))).toBe(true)
+  })
+
+  it('does NOT warn when only some segments gate as not-source-language', async () => {
+    const logs: string[] = []
+    vi.spyOn(console, 'log').mockImplementation((msg?: unknown) => {
+      logs.push(String(msg ?? ''))
+    })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    // One gated CJK segment, one numbers-only segment: mixed keep reasons,
+    // so the all-not-source-language warning must stay silent.
+    const file = writeFixture([
+      seg({ id: 's1', text: '你好世界' }),
+      seg({ id: 's2', text: '12345' })
+    ])
+    const ensureOllama = vi
+      .fn()
+      .mockResolvedValue(fakeConnection(vi.fn().mockResolvedValue(undefined)))
+    const createBackend = vi.fn().mockReturnValue(fakeBackend({ translateBatch: vi.fn() }))
+
+    const code = await runCli([file, 'English', 'Chinese (Simplified)'], {
+      ensureOllama,
+      createBackend
+    })
+
+    expect(code).toBe(0)
+    expect(logs.some((l) => l.includes('WARNING'))).toBe(false)
+  })
+
   it('returns 0, prints the report table to stdout, progress to stderr, and calls stop exactly once on success', async () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})

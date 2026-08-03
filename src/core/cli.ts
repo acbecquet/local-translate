@@ -5,13 +5,14 @@
 //
 // Exit codes:
 //   0 - ran, and at least one segment was translated, the doc had none, or
-//       every kept-original segment was legitimately untranslatable
-//       (numeric/symbol/whitespace-only content - never sent to the model
-//       in the first place, so it never having a `translation` isn't a
-//       failure of anything).
+//       every kept-original segment was legitimately kept without ever
+//       being sent to the model: untranslatable content (numeric/symbol/
+//       whitespace-only) or content not in the run's declared source
+//       language (see LEGITIMATE_KEEP_REASONS).
 //   1 - ran, but every segment fell back to its original text (total > 0
-//       and translated === 0) for a reason OTHER than skipped-untranslatable
-//       - or a usage/setup error before the pipeline could even start.
+//       and translated === 0) for a reason OTHER than one of those
+//       legitimate keeps - or a usage/setup error before the pipeline
+//       could even start.
 //   2 - Ollama could not be found or started (OllamaNotFoundError).
 //
 // `runCli()` does the actual work and always resolves to an exit code - it
@@ -119,6 +120,22 @@ function printReport(report: RunReport): void {
     for (const k of report.keptOriginal) {
       console.log(`    ${k.id.padEnd(28)} ${k.reason}`)
     }
+  }
+
+  // An all-untranslatable doc (a spec sheet of numbers) is a normal shape;
+  // a doc where EVERY segment gated as not-source-language is exactly the
+  // shape a mislabeled sourceLang argument produces - it still exits 0
+  // (each keep is individually legitimate), so this warning is the one
+  // signal separating "nothing to translate" from "wrong language flag".
+  if (
+    report.total > 0 &&
+    report.keptOriginal.length === report.total &&
+    report.keptOriginal.every((k) => k.reason === NOT_SOURCE_LANGUAGE_REASON)
+  ) {
+    console.log('')
+    console.log(
+      '  WARNING: every segment was kept because its text is not in the declared source language. If you expected translations, check the source language argument.'
+    )
   }
 
   if (report.overflowed.length > 0) {
