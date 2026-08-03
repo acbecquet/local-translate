@@ -4,13 +4,17 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Canvas, loadImage } from 'skia-canvas'
-import { createImageAdapter } from '../../../src/core/adapters/images/image-adapter'
+import {
+  _internals as imageAdapterInternals,
+  createImageAdapter
+} from '../../../src/core/adapters/images/image-adapter'
 import {
   CONFIDENCE_FLOOR,
   type RegionEngine,
   type TextRegion
 } from '../../../src/core/images/regions'
 import { registerBundledFonts, resolveFamily } from '../../../src/core/fit/fonts'
+import { _internals as fitInternals, fit } from '../../../src/core/fit/fit-engine'
 import type { FontSpec, TranslatedSegment } from '../../../src/core/segments'
 import { runPipeline } from '../../../src/core/pipeline'
 import type { TranslationBackend } from '../../../src/core/translate/backend'
@@ -117,6 +121,50 @@ function isWhite(p: { r: number; g: number; b: number }): boolean {
   return p.r === 255 && p.g === 255 && p.b === 255
 }
 
+function pixelAt(
+  decoded: { width: number; data: Uint8ClampedArray },
+  x: number,
+  y: number
+): { r: number; g: number; b: number } {
+  const idx = (y * decoded.width + x) * 4
+  return { r: decoded.data[idx], g: decoded.data[idx + 1], b: decoded.data[idx + 2] }
+}
+
+function channelDelta(
+  a: { r: number; g: number; b: number },
+  b: { r: number; g: number; b: number }
+): number {
+  return Math.max(Math.abs(a.r - b.r), Math.abs(a.g - b.g), Math.abs(a.b - b.b))
+}
+
+/** Tight pixel bounding box of every pixel in `region` whose color differs
+ * from `bg` by more than the detection threshold - the actual rendered INK
+ * extent, read straight from pixels rather than from any font metric.
+ * Mirrors tests/core/images/overlay.test.ts's identical helper. Returns null
+ * when the region is pure background (no ink found at all). */
+function scanInkBBox(
+  decoded: { width: number; data: Uint8ClampedArray },
+  region: { x: number; y: number; w: number; h: number },
+  bg: { r: number; g: number; b: number }
+): { minX: number; minY: number; maxX: number; maxY: number } | null {
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  for (let y = region.y; y < region.y + region.h; y++) {
+    for (let x = region.x; x < region.x + region.w; x++) {
+      const p = pixelAt(decoded, x, y)
+      if (channelDelta(p, bg) > 40) {
+        if (x < minX) minX = x
+        if (x > maxX) maxX = x
+        if (y < minY) minY = y
+        if (y > maxY) maxY = y
+      }
+    }
+  }
+  return minX === Infinity ? null : { minX, minY, maxX, maxY }
+}
+
 describe('extract() - paintable region field mapping (behavior contract point 1)', () => {
   it('maps a validated region to a TextSegment with id/kind/context/groupKey/box/font', async () => {
     const file = await writePng('photo.png', 400, 300)
@@ -133,8 +181,16 @@ describe('extract() - paintable region field mapping (behavior contract point 1)
     expect(seg.groupKey).toBe('photo.png')
     expect(seg.text).toBe('Hello')
     // Raw bbox dilated by DILATION_PX (2px/side, regions.ts) - well inside
-    // the 400x300 image so the final clamp is a no-op.
-    expect(seg.box).toEqual({ wPt: 104, hPt: 34 })
+    // the 400x300 image so the final clamp is a no-op. Width is the dilated
+    // bbox.w unchanged; height is a FIT BUDGET (Math.max(bbox.h,
+    // sizePt * FIT_LINE_HEIGHT_FACTOR)), not the dilated bbox.h itself - see
+    // image-adapter.ts's own doc comment on why (fit()'s height gate would
+    // otherwise shrink the ink-matched size straight back to the old
+    // bbox.h/1.2 heuristic).
+    expect(seg.box.wPt).toBe(104)
+    expect(seg.box.hPt).toBeCloseTo(
+      Math.max(34, seg.font.sizePt * imageAdapterInternals.FIT_LINE_HEIGHT_FACTOR)
+    )
     expect(seg.font.family).toBe('Noto Sans')
     // sizePt is now ink-matched to the RAW (pre-dilation) ink height - 30px
     // (bbox.h before the +2px/side dilation), not the dilated bbox.h (34).
@@ -145,6 +201,10 @@ describe('extract() - paintable region field mapping (behavior contract point 1)
     // proving this is real ink measurement, not the old heuristic wearing a
     // new name.
     expect(Math.abs(seg.font.sizePt - 34 / 1.2)).toBeGreaterThan(1)
+    // And the fit budget must be STRICTLY BIGGER than the dilated bbox.h -
+    // this is the exact regression the reviewer caught: if box.hPt were left
+    // as bbox.h, fit() would shrink the ink-matched size right back down.
+    expect(seg.box.hPt).toBeGreaterThan(34)
   })
 
   it('picks the CJK font family when the region text contains CJK, independent of the exact CJK source-language spelling', async () => {
@@ -436,5 +496,200 @@ describe('runPipeline end-to-end through the image adapter (behavior contract po
     const decoded = await decodeFile(report.outPath)
     // Dilated bbox {x:18,y:18,w:154,h:34} (2px/side growth, regions.ts).
     expect(regionRgb(decoded, 18, 18, 154, 34).some((p) => !isWhite(p))).toBe(true)
+  })
+})
+
+describe("extract() + fit() wiring - ink-matched size survives fit() (regression: box.hPt used to equal the dilated bbox.h, so fit()'s height gate always shrank it straight back to the old h/1.2 heuristic)", () => {
+  it('no width pressure: fittedSizePt equals the ink-matched font.sizePt exactly - fit() does not shrink it', async () => {
+    const file = await writePng('wiring-no-shrink.png', 400, 200, '#ffffff')
+    // Wide raw box (w:300) removes width as a constraint entirely - isolates
+    // the height-budget fix this test exists to guard. h:30 is the same
+    // ink-height fixture used by the sizing test above.
+    const engine = fakeEngine([rawRegion({ bbox: { x: 20, y: 20, w: 300, h: 30 }, text: 'Hello' })])
+    const adapter = createImageAdapter(engine, { sourceLang: 'English' })
+    const applySpy = vi.spyOn(adapter, 'apply')
+    const backend = fakeBackend({
+      translateBatch: vi
+        .fn()
+        .mockResolvedValue({ translations: [{ id: 'r1', translation: 'Bonjour' }] })
+    })
+
+    await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    expect(applySpy).toHaveBeenCalledTimes(1)
+    const translatedSegments = applySpy.mock.calls[0][2] as TranslatedSegment[]
+    const seg = translatedSegments.find((s) => s.id === 'r1')!
+    // fittedSizePt EQUALS the ink-matched candidate bit-for-bit - proof
+    // fit() accepted the starting size as-is instead of shrinking it.
+    expect(seg.fittedSizePt).toBe(seg.font.sizePt)
+    // And that candidate is still the (bigger) ink-matched size, not the old
+    // h/1.2 heuristic - otherwise the equality above would hold for the
+    // wrong reason.
+    expect(seg.font.sizePt).toBeGreaterThan(34 / 1.2 + 1)
+  })
+
+  it('genuine width overflow still shrinks: a too-narrow region forces fit() below the ink-matched candidate', async () => {
+    const file = await writePng('wiring-shrink.png', 300, 200, '#ffffff')
+    // Narrow raw box (w:20) - the ink-matched candidate (tens of pt) cannot
+    // lay out a multi-word translation within that width; the legitimate
+    // width-driven shrink path must still work.
+    const engine = fakeEngine([rawRegion({ bbox: { x: 20, y: 20, w: 20, h: 30 }, text: 'Hello' })])
+    const adapter = createImageAdapter(engine, { sourceLang: 'English' })
+    const applySpy = vi.spyOn(adapter, 'apply')
+    const backend = fakeBackend({
+      translateBatch: vi
+        .fn()
+        .mockResolvedValue({ translations: [{ id: 'r1', translation: 'Bonjour tout le monde' }] })
+    })
+
+    await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    const translatedSegments = applySpy.mock.calls[0][2] as TranslatedSegment[]
+    const seg = translatedSegments.find((s) => s.id === 'r1')!
+    expect(seg.fittedSizePt).toBeLessThan(seg.font.sizePt)
+  })
+})
+
+describe('runPipeline pixel-exactness through the full pipeline (closes the gap: earlier pixel tests bypassed fit())', () => {
+  it("paints a translated line through extract -> translate -> fit -> apply whose rendered ink-row extent is within 2px of the ORIGINAL text's", async () => {
+    const width = 320
+    const height = 150
+    const white = { r: 255, g: 255, b: 255 }
+    const origSizePt = 26
+    const originalText = 'Hello'
+
+    const srcCanvas = new Canvas(width, height)
+    const srcCtx = srcCanvas.getContext('2d')
+    srcCtx.fillStyle = '#ffffff'
+    srcCtx.fillRect(0, 0, width, height)
+    srcCtx.font = `${origSizePt}px "Noto Sans"`
+    srcCtx.fillStyle = '#000000'
+    srcCtx.textAlign = 'left'
+    srcCtx.textBaseline = 'top'
+    srcCtx.fillText(originalText, 40, 40)
+    const inputBuffer = await srcCanvas.toBuffer('png')
+
+    const dir = newTmpDir()
+    const file = path.join(dir, 'pipeline-pixel.png')
+    await writeFile(file, inputBuffer)
+
+    // Recover the original's tight ink bbox by scanning pixels (not by
+    // trusting the draw call's own font metrics) - mirrors
+    // tests/core/images/overlay.test.ts's identical scan, run here through
+    // the REAL pipeline (extract -> translate -> fit -> apply) instead of
+    // calling renderOverlay directly, so this closes exactly the gap the
+    // reviewer identified: every prior pixel test bypassed fit().
+    const inputDecoded = await decodeFile(file)
+    const origInk = scanInkBBox(inputDecoded, { x: 0, y: 0, w: width, h: height }, white)
+    expect(origInk).not.toBeNull()
+    const origInkHeightPx = origInk!.maxY - origInk!.minY + 1
+    const rawBBox = {
+      x: origInk!.minX,
+      y: origInk!.minY,
+      w: origInk!.maxX - origInk!.minX + 1,
+      h: origInkHeightPx
+    }
+
+    // A genuinely different "translation" - proves this isn't just measuring
+    // the same text against itself.
+    const translation = 'Salut'
+    const engine = fakeEngine([rawRegion({ bbox: rawBBox, text: originalText })])
+    const adapter = createImageAdapter(engine, { sourceLang: 'English' })
+    const backend = fakeBackend({
+      translateBatch: vi.fn().mockResolvedValue({ translations: [{ id: 'r1', translation }] })
+    })
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    const outputDecoded = await decodeFile(report.outPath)
+    const dilatedBBox = {
+      x: rawBBox.x - 2,
+      y: rawBBox.y - 2,
+      w: rawBBox.w + 4,
+      h: rawBBox.h + 4
+    }
+    const scanWindow = {
+      x: Math.max(0, dilatedBBox.x - 5),
+      y: Math.max(0, dilatedBBox.y - 10),
+      w: Math.min(width, dilatedBBox.w + 10),
+      h: Math.min(height, dilatedBBox.h + 20)
+    }
+    const paintedInk = scanInkBBox(outputDecoded, scanWindow, white)
+    expect(paintedInk).not.toBeNull()
+    const paintedInkHeightPx = paintedInk!.maxY - paintedInk!.minY + 1
+
+    // Charlie's "it really needs to be exact" requirement, driven through
+    // the FULL pipeline (including fit()) rather than calling renderOverlay
+    // directly - the painted replacement's rendered ink height must match
+    // the original's, not the dilated fill box's inflated height, and not
+    // whatever a defeated fit() would have shrunk it back down to.
+    expect(Math.abs(paintedInkHeightPx - origInkHeightPx)).toBeLessThanOrEqual(2)
+  })
+})
+
+describe('FIT_LINE_HEIGHT_FACTOR drift guard', () => {
+  // image-adapter.ts cannot import fit-engine.ts's LINE_HEIGHT_FACTOR
+  // (private, not exported) so it mirrors the value as
+  // FIT_LINE_HEIGHT_FACTOR - this test proves the mirrored value is exactly
+  // what fit-engine's own fitsBox() uses, by checking the fit/no-fit
+  // boundary it produces rather than comparing the numbers directly (the two
+  // modules have no shared import to do that). Mirrors
+  // tests/core/images/overlay.test.ts's and
+  // tests/core/pptx/pptx-adapter.test.ts's identical drift-guard blocks for
+  // their own copies of the same constant. Width is set huge so only the
+  // height term of fitsBox can decide the outcome.
+  it('matches the fit engine at the fit/no-fit height boundary', () => {
+    const font = { family: 'Noto Sans', sizePt: 20 }
+    const sizePt = 20
+    const lines = ['a', 'b', 'c']
+    const wPt = 100000
+    const mirrored = imageAdapterInternals.FIT_LINE_HEIGHT_FACTOR
+
+    const fitsAtBoundary = fitInternals.measuredFits(
+      lines,
+      sizePt,
+      { wPt, hPt: lines.length * sizePt * mirrored },
+      font
+    )
+    const failsJustBelow = fitInternals.measuredFits(
+      lines,
+      sizePt,
+      { wPt, hPt: lines.length * sizePt * mirrored - 0.01 },
+      font
+    )
+
+    expect(fitsAtBoundary).toBe(true)
+    expect(failsJustBelow).toBe(false)
+  })
+
+  // Sanity: fit() itself agrees text laid out at this factor's exact box
+  // height does not overflow, for an actual paragraph rather than a
+  // pre-built lines array (belt-and-suspenders against the two systems'
+  // layout functions disagreeing in some other way).
+  it('fit() does not report overflow for a box sized exactly at the mirrored factor', () => {
+    const mirrored = imageAdapterInternals.FIT_LINE_HEIGHT_FACTOR
+    const r = fit('Hi', { wPt: 300, hPt: 24 * mirrored }, { family: 'Noto Sans', sizePt: 24 })
+    expect(r.overflowed).toBe(false)
   })
 })

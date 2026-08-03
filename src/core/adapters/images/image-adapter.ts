@@ -27,6 +27,16 @@ export interface ImageAdapterOpts {
 const NOTO_SANS = 'Noto Sans'
 const NOTO_SANS_CJK_SC = 'Noto Sans CJK SC'
 
+/**
+ * Mirrors fit-engine.ts's own LINE_HEIGHT_FACTOR (module-private there, so
+ * not importable) - the same low-risk duplicated-constant approach
+ * overlay.ts and pptx-adapter.ts's SPAUTOFIT_LINE_HEIGHT_FACTOR already
+ * take. Used ONLY to size the fit BUDGET below (extract()'s emitted
+ * `box.hPt`), never for painting - overlay.ts still fills/paints the
+ * dilated `bbox` regardless of this value.
+ */
+const FIT_LINE_HEIGHT_FACTOR = 1.2
+
 /** `{ id, reason }` skip record shape shared with FormatAdapter.collectSkips()'s contract (adapter.ts). */
 interface Skip {
   id: string
@@ -103,17 +113,35 @@ export function createImageAdapter(engine: RegionEngine, opts: ImageAdapterOpts)
         // from an engine/test that bypassed validateRegions) - the documented
         // TextRegion.inkBBox compatibility contract (regions.ts).
         const inkHeightPx = region.inkBBox?.h ?? region.bbox.h
+        // sizePt here is a required FontSpec field but unused by
+        // inkMatchedFontSizePt itself (it measures at each candidate size
+        // explicitly) - inkHeightPx is a harmless placeholder.
+        const sizePt = inkMatchedFontSizePt(
+          region.text,
+          { family, sizePt: inkHeightPx },
+          inkHeightPx
+        )
+        // fit-engine.ts's height gate is `lines * sizePt * LINE_HEIGHT_FACTOR
+        // <= box.hPt` (pipeline.ts calls fit(translation, seg.box, seg.font)
+        // starting from THIS sizePt). Real ink-to-em ratios run well under
+        // fit's 1.2 line-height assumption, so sizePt * FIT_LINE_HEIGHT_FACTOR
+        // is almost always LARGER than the dilated bbox.h alone - passing
+        // bbox.h as box.hPt would make fit() immediately shrink back toward
+        // the old bbox.h/1.2 heuristic on essentially every single-line
+        // region, defeating ink-matching entirely (this was caught live: see
+        // this commit's own fix). box.hPt is therefore a fit BUDGET sized to
+        // accommodate the ink-matched size at fit's own line-height
+        // assumption - NOT the paint region (bbox stays the paint region;
+        // overlay.ts still fills/paints it exactly as before, untouched by
+        // this value). Math.max keeps the dilated bbox.h as an absolute
+        // floor (never claim less room than the real dilated region), though
+        // in practice the sizePt term dominates for any realistic ink ratio.
+        const fitHeightPt = Math.max(region.bbox.h, sizePt * FIT_LINE_HEIGHT_FACTOR)
         segments.push({
           id: region.id,
           text: region.text,
-          box: { wPt: region.bbox.w, hPt: region.bbox.h },
-          font: {
-            family,
-            // sizePt here is a required FontSpec field but unused by
-            // inkMatchedFontSizePt itself (it measures at each candidate
-            // size explicitly) - inkHeightPx is a harmless placeholder.
-            sizePt: inkMatchedFontSizePt(region.text, { family, sizePt: inkHeightPx }, inkHeightPx)
-          },
+          box: { wPt: region.bbox.w, hPt: fitHeightPt },
+          font: { family, sizePt },
           context: 'image text region',
           groupKey,
           kind: 'image-region'
@@ -174,3 +202,8 @@ export function createImageAdapter(engine: RegionEngine, opts: ImageAdapterOpts)
     }
   }
 }
+
+// Test-only visibility into FIT_LINE_HEIGHT_FACTOR (drift-guard test in
+// tests/core/images/image-adapter.test.ts) - not part of this module's real
+// interface, matching overlay.ts's/pptx-adapter.ts's own _internals convention.
+export const _internals = { FIT_LINE_HEIGHT_FACTOR }

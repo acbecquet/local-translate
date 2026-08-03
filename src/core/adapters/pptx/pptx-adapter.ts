@@ -97,12 +97,18 @@ const WRAP_SAFETY = 0.96
 const SENTINEL_BOX: Box = { wPt: 1_000_000, hPt: 1_000_000 }
 
 /**
- * Line-height factor used only by synthesizeSpAutoFitBox's height formula -
- * mirrors fit-engine.ts's own LINE_HEIGHT_FACTOR (module-private there, so
- * not importable - the same low-risk duplicated-constant approach overlay.ts
- * takes for the identical reason: a plain arithmetic constant carries none
- * of the gating-logic divergence risk that would make a real shared import
- * necessary).
+ * Line-height factor mirroring fit-engine.ts's own LINE_HEIGHT_FACTOR
+ * (module-private there, so not importable - the same low-risk
+ * duplicated-constant approach overlay.ts takes for the identical reason: a
+ * plain arithmetic constant carries none of the gating-logic divergence
+ * risk that would make a real shared import necessary). Two use sites, both
+ * "synthesize a box height compatible with fit()'s own line-height
+ * assumption" from a font size, never the reverse:
+ * - synthesizeSpAutoFitBox's height formula (spAutoFit shapes).
+ * - collectMediaSegments's box.hPt for embedded-image regions (polish-round
+ *   Task C: the ink-matched sizePt needs a box.hPt at least as large as
+ *   sizePt * this factor, or fit() shrinks it straight back toward the old
+ *   bbox.h/1.2 heuristic - see collectMediaSegments's own doc comment there).
  */
 const SPAUTOFIT_LINE_HEIGHT_FACTOR = 1.2
 
@@ -547,21 +553,38 @@ async function collectMediaSegments(
       // the dilated bbox height when inkBBox is absent - the documented
       // TextRegion.inkBBox compatibility contract (regions.ts).
       const mediaInkHeightPx = region.inkBBox?.h ?? region.bbox.h
+      // sizePt here is a required FontSpec field but unused by
+      // inkMatchedFontSizePt itself (it measures at each candidate size
+      // explicitly) - mediaInkHeightPx is a harmless placeholder.
+      const mediaSizePt = inkMatchedFontSizePt(
+        region.text,
+        { family: mediaFamily, sizePt: mediaInkHeightPx },
+        mediaInkHeightPx
+      )
+      // fit-engine.ts's height gate is `lines * sizePt * LINE_HEIGHT_FACTOR
+      // <= box.hPt` (PptxAdapter.apply eventually reaches pipeline.ts's
+      // fit(translation, seg.box, seg.font), starting from THIS sizePt).
+      // Real ink-to-em ratios run well under fit's 1.2 line-height
+      // assumption, so mediaSizePt * SPAUTOFIT_LINE_HEIGHT_FACTOR is almost
+      // always LARGER than the dilated bbox.h alone - passing bbox.h as
+      // box.hPt would make fit() immediately shrink back toward the old
+      // bbox.h/1.2 heuristic on essentially every single-line region,
+      // defeating ink-matching entirely (caught live: see this commit's own
+      // fix). box.hPt is therefore a fit BUDGET sized to accommodate the
+      // ink-matched size at fit's own line-height assumption - NOT the paint
+      // region (region.bbox stays the paint region; overlay.ts's apply()
+      // path still fills/paints it exactly as before, untouched by this
+      // value). Reuses this file's OWN SPAUTOFIT_LINE_HEIGHT_FACTOR rather
+      // than a third duplicate constant - synthesizeSpAutoFitBox already
+      // does this exact job (a fit-compatible box height from a font size)
+      // for spAutoFit shapes; Math.max keeps the dilated bbox.h as an
+      // absolute floor, though in practice the sizePt term dominates.
+      const mediaFitHeightPt = Math.max(region.bbox.h, mediaSizePt * SPAUTOFIT_LINE_HEIGHT_FACTOR)
       segments.push({
         id,
         text: region.text,
-        box: { wPt: region.bbox.w, hPt: region.bbox.h },
-        font: {
-          family: mediaFamily,
-          // sizePt here is a required FontSpec field but unused by
-          // inkMatchedFontSizePt itself (it measures at each candidate size
-          // explicitly) - mediaInkHeightPx is a harmless placeholder.
-          sizePt: inkMatchedFontSizePt(
-            region.text,
-            { family: mediaFamily, sizePt: mediaInkHeightPx },
-            mediaInkHeightPx
-          )
-        },
+        box: { wPt: region.bbox.w, hPt: mediaFitHeightPt },
+        font: { family: mediaFamily, sizePt: mediaSizePt },
         context: 'embedded image text',
         groupKey,
         kind: 'image-region'

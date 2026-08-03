@@ -3235,6 +3235,88 @@ describe('embedded media - font sizing is ink-matched, not the dilated bbox (pol
     ).toBeLessThanOrEqual(2)
     // And it must have moved off the old h/1.2 estimate (34/1.2 ~= 28.33).
     expect(Math.abs(mediaSeg.font.sizePt - 34 / 1.2)).toBeGreaterThan(1)
+    // box.hPt is a FIT BUDGET (Math.max(dilated bbox.h, sizePt *
+    // SPAUTOFIT_LINE_HEIGHT_FACTOR)), not the dilated bbox.h itself - see
+    // collectMediaSegments's own doc comment on why (otherwise fit() shrinks
+    // the ink-matched size straight back to the old heuristic).
+    expect(mediaSeg.box.wPt).toBe(104)
+    expect(mediaSeg.box.hPt).toBeCloseTo(
+      Math.max(34, mediaSeg.font.sizePt * pptxInternals.SPAUTOFIT_LINE_HEIGHT_FACTOR)
+    )
+    expect(mediaSeg.box.hPt).toBeGreaterThan(34)
+  })
+})
+
+describe('embedded media - fit() wiring does not defeat ink-matched sizing (regression: box.hPt used to equal the dilated bbox.h, so fit() always shrank back to the old h/1.2 heuristic)', () => {
+  it('no width pressure: fittedSizePt equals the ink-matched font.sizePt exactly - fit() does not shrink it', async () => {
+    const png = await makePngBytes(400, 200, '#ffffff')
+    // Raw region w:300 (wide) removes width as a constraint entirely -
+    // isolates the height-budget fix this test exists to guard. h:30 is the
+    // same ink-height fixture as the sizing test above.
+    const engine = fakeMediaEngine([
+      {
+        bytes: png,
+        regions: [rawMediaRegion({ bbox: { x: 20, y: 20, w: 300, h: 30 }, text: 'Hello' })]
+      }
+    ])
+    const srcPath = await writeDeck({
+      slides: [{ shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: png }] }]
+    })
+
+    const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const applySpy = vi.spyOn(adapter, 'apply')
+
+    await runPipeline({
+      file: srcPath,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend: translateBackend(() => 'Bonjour')
+    })
+
+    expect(applySpy).toHaveBeenCalledTimes(1)
+    const translatedSegments = applySpy.mock.calls[0][2] as TranslatedSegment[]
+    const seg = translatedSegments.find((s) => s.kind === 'image-region')!
+    // fittedSizePt EQUALS the ink-matched candidate bit-for-bit - proof
+    // fit() accepted the starting size as-is instead of shrinking it.
+    expect(seg.fittedSizePt).toBe(seg.font.sizePt)
+    // And that candidate is still the (bigger) ink-matched size, not the old
+    // h/1.2 heuristic - otherwise the equality above would hold for the
+    // wrong reason.
+    expect(seg.font.sizePt).toBeGreaterThan(34 / 1.2 + 1)
+  })
+
+  it('genuine width overflow still shrinks: a too-narrow region forces fit() below the ink-matched candidate', async () => {
+    const png = await makePngBytes(200, 100, '#ffffff')
+    // Narrow raw region (w:20) - the ink-matched candidate (tens of pt)
+    // cannot lay out a multi-word translation within that width; the
+    // legitimate width-driven shrink path must still work.
+    const engine = fakeMediaEngine([
+      {
+        bytes: png,
+        regions: [rawMediaRegion({ bbox: { x: 20, y: 20, w: 20, h: 30 }, text: 'Hello' })]
+      }
+    ])
+    const srcPath = await writeDeck({
+      slides: [{ shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: png }] }]
+    })
+
+    const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const applySpy = vi.spyOn(adapter, 'apply')
+
+    await runPipeline({
+      file: srcPath,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend: translateBackend(() => 'Bonjour tout le monde')
+    })
+
+    const translatedSegments = applySpy.mock.calls[0][2] as TranslatedSegment[]
+    const seg = translatedSegments.find((s) => s.kind === 'image-region')!
+    expect(seg.fittedSizePt).toBeLessThan(seg.font.sizePt)
   })
 })
 
