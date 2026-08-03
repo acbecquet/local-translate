@@ -38,6 +38,13 @@ import { iou, type RegionBBox, type RegionEngine, type TextRegion } from './regi
 // unjustified second number.
 const ROTATION_OVERLAP_IOU_THRESHOLD = 0.3
 
+// Minimum elongation (long side / short side) for an ORPHAN rotated-pass
+// survivor - one with zero overlap against every normal-pass region. Real
+// vertical axis titles are long narrow runs; PP-OCR hallucinations on
+// sideways/blank content are not reliably shaped that way (reviewer-
+// prescribed guard, polish round E).
+const ORPHAN_MIN_ASPECT = 2
+
 /**
  * Rotates `img` (dimensions W x H) 90 degrees CLOCKWISE into a new W x H -
  * swapped-to-H-x-W PNG buffer. Drawn via translate-to-new-center + rotate +
@@ -249,7 +256,23 @@ export function withRotationPasses(engine: RegionEngine): RegionEngine {
       const notOverlappingNormal = [...cwMapped, ...ccwMapped].filter(
         (candidate) => !normalRegions.some((normal) => overlapsAbove(candidate.bbox, normal.bbox))
       )
-      const survivors = dropLowerConfidenceOverlaps(notOverlappingNormal)
+      // Orphan guard: a rotated-pass candidate with ZERO overlap against any
+      // normal-pass region is content nothing else ever corroborated - the
+      // highest-risk shape for a hallucinated rotated paint (three passes
+      // triple the detector's chances to invent text in blank areas, and a
+      // wrongly painted ROTATED region is maximum-visibility damage). Real
+      // rotated text (vertical axis titles) is characteristically an
+      // elongated run, so orphans must additionally be elongated; candidates
+      // with SOME normal-pass overlap (IoU in (0, threshold]) have partial
+      // corroboration and pass as before.
+      const guarded = notOverlappingNormal.filter((candidate) => {
+        const touchesNormal = normalRegions.some((normal) => iou(candidate.bbox, normal.bbox) > 0)
+        if (touchesNormal) return true
+        const { w: bw, h: bh } = candidate.bbox
+        const aspect = Math.max(bw, bh) / Math.max(1, Math.min(bw, bh))
+        return aspect >= ORPHAN_MIN_ASPECT
+      })
+      const survivors = dropLowerConfidenceOverlaps(guarded)
 
       return [...normalRegions, ...survivors]
     }
@@ -261,6 +284,7 @@ export function withRotationPasses(engine: RegionEngine): RegionEngine {
 // _internals convention.
 export const _internals = {
   ROTATION_OVERLAP_IOU_THRESHOLD,
+  ORPHAN_MIN_ASPECT,
   mapCwBBoxToOriginal,
   mapCcwBBoxToOriginal,
   dropLowerConfidenceOverlaps

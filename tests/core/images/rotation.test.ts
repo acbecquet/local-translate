@@ -141,6 +141,70 @@ describe('withRotationPasses - non-overlapping rotated regions survive with the 
   })
 })
 
+describe('withRotationPasses - orphan aspect guard (review finding: uncorroborated rotated paints)', () => {
+  it('drops a square-ish rotated-pass orphan (zero normal-pass overlap, aspect < 2) - the hallucination shape', async () => {
+    // W=200,H=150. Orphan original-frame footprint {x:20,y:20,w:30,h:40}:
+    // aspect 40/30 = 1.33 < 2, and no normal-pass region exists at all, so
+    // nothing ever corroborated it - exactly the shape a detector invents on
+    // sideways/blank content. Forward CW map at H=150: {x:110,y:20,w:40,h:30}.
+    const buffer = await solidPng(200, 150)
+    const squarishOrphan = rawRegion({
+      bbox: { x: 110, y: 20, w: 40, h: 30 },
+      text: 'ghost text',
+      confidence: 0.9
+    })
+    const { engine } = sequenceEngine([], [squarishOrphan], [])
+
+    const result = await withRotationPasses(engine).detectRegions(buffer)
+
+    expect(result).toHaveLength(0)
+  })
+
+  it('keeps an elongated rotated-pass orphan (aspect >= 2) - the real vertical-title shape', async () => {
+    // Same setup, but the orphan's original-frame footprint {x:10,y:10,w:8,h:60}
+    // has aspect 60/8 = 7.5 - characteristically a vertical axis title.
+    const buffer = await solidPng(200, 150)
+    const elongatedOrphan = rawRegion({
+      bbox: { x: 80, y: 10, w: 60, h: 8 },
+      text: 'Y Axis',
+      confidence: 0.9
+    })
+    const { engine } = sequenceEngine([], [elongatedOrphan], [])
+
+    const result = await withRotationPasses(engine).detectRegions(buffer)
+
+    expect(result).toHaveLength(1)
+    expect(result[0].rotation).toBe(-90)
+  })
+
+  it('keeps a non-elongated rotated candidate that PARTIALLY overlaps normal-pass content (IoU in (0, threshold]) - partial corroboration exempts it from the guard', async () => {
+    // Normal region at {x:50,y:50,w:80,h:20}. Rotated candidate's
+    // original-frame footprint {x:120,y:55,w:30,h:30}: intersection with the
+    // normal region is x:[120,130] * y:[55,70] = 150, union = 1600+900-150 =
+    // 2350, IoU ~ 0.064 - above zero (touches real content) but below the
+    // 0.3 drop threshold, and aspect 1.0 < 2. The guard must not drop it.
+    const buffer = await solidPng(200, 150)
+    const normalRegion = rawRegion({
+      bbox: { x: 50, y: 50, w: 80, h: 20 },
+      text: 'Chart Title',
+      confidence: 0.9
+    })
+    // Forward CW map of {x:120,y:55,w:30,h:30} at H=150: newX = H-y-h = 65,
+    // newY = x = 120 -> CW-frame {x:65,y:120,w:30,h:30}.
+    const touchingCandidate = rawRegion({
+      bbox: { x: 65, y: 120, w: 30, h: 30 },
+      text: 'unit mark',
+      confidence: 0.9
+    })
+    const { engine } = sequenceEngine([normalRegion], [touchingCandidate], [])
+
+    const result = await withRotationPasses(engine).detectRegions(buffer)
+
+    expect(result).toHaveLength(2)
+    expect(result.find((r) => r.text === 'unit mark')?.rotation).toBe(-90)
+  })
+})
+
 describe('withRotationPasses - rotated-pass-vs-rotated-pass dedup keeps the higher confidence (design point 2)', () => {
   it('drops the lower-confidence rotated candidate when a CW-pass and a CCW-pass region map to overlapping original bboxes', async () => {
     // Both candidates map back to the SAME original bbox {x:10,y:10,w:8,
