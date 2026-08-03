@@ -3,7 +3,11 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import type { BatchRequest } from '../../../src/core/translate/backend'
-import { buildPrompt } from '../../../src/core/translate/prompts'
+import {
+  buildFallbackPrompt,
+  buildPrompt,
+  buildRetryPrompt
+} from '../../../src/core/translate/prompts'
 
 // Mock the `ollama` npm client, not our own modules: OllamaBackend calls
 // `new Ollama({ host })` and then `.chat()/.list()/.pull()` on the
@@ -167,6 +171,128 @@ describe('buildPrompt', () => {
     const rendered = buildPrompt(request)
     expect(rendered.text).toBe(`System: ${rendered.system}\nUser: ${rendered.user}`)
     expect(JSON.parse(rendered.user)).toEqual([{ id: 's1', text: 'Hello' }])
+  })
+
+  // Regression pin (polish-round Task D): the first-attempt group prompt
+  // must stay byte-identical to before this task's changes, since the 311
+  // segments that already translated fine on the first attempt must not be
+  // put at risk by anti-echo wording that belongs on the retry/fallback
+  // rungs only. Any intentional future change to the first-attempt prompt
+  // must update this string deliberately, not as a side effect of touching
+  // buildRetryPrompt/buildFallbackPrompt.
+  it('regression pin: exact byte-for-byte template text, unchanged by the retry/fallback anti-echo wording', () => {
+    const request = req({
+      sourceLang: 'English',
+      targetLang: 'Chinese',
+      groupContext: 'Slide 3 textbox',
+      segments: [{ id: 's1', text: '1-22 Batch User-5 ROSIN' }]
+    })
+    const rendered = buildPrompt(request)
+
+    expect(rendered.text).toBe(
+      'System: You are a professional translator for internal business documents.\n' +
+        'Translate each segment from English to Chinese.\n' +
+        'Rules: return ONLY the JSON demanded by the schema; translate every segment independently; ' +
+        'preserve line breaks inside segments; do not translate numbers, codes, or proper nouns that ' +
+        'have no Chinese equivalent; glossary (must-use): (none).\n' +
+        'Document context: Slide 3 textbox\n' +
+        'User: ' +
+        JSON.stringify([{ id: 's1', text: '1-22 Batch User-5 ROSIN' }])
+    )
+  })
+})
+
+// --- prompts.ts: retry-rung anti-echo nudge (polish-round Task D) --------
+
+describe('buildRetryPrompt', () => {
+  it('is the first-attempt system prompt plus exactly one added anti-echo sentence, no worked example', () => {
+    const request = req({ sourceLang: 'English', targetLang: 'Chinese' })
+    const base = buildPrompt(request)
+    const retry = buildRetryPrompt(request)
+
+    expect(retry.system.startsWith(base.system)).toBe(true)
+    const added = retry.system.slice(base.system.length).trim()
+    expect(added.length).toBeGreaterThan(0)
+    // Exactly one sentence: exactly one terminating period, and that
+    // period is the sentence's last character.
+    expect(added.indexOf('.')).toBe(added.length - 1)
+
+    // The cheap nudge names the failure mode and the target language, but
+    // deliberately carries no worked example (that's the fallback rung's
+    // more expensive last resort, not the cheaper retry nudge).
+    expect(added).toContain('Chinese')
+    expect(added.toLowerCase()).toContain('source text unchanged')
+    expect(retry.system).not.toContain('Worked example')
+    expect(retry.system).not.toContain('2-10 Batch User-3 RESIN')
+  })
+
+  it('user message and transcript gluing are unaffected, only the system message changes', () => {
+    const request = req()
+    const retry = buildRetryPrompt(request)
+    expect(retry.text).toBe(`System: ${retry.system}\nUser: ${retry.user}`)
+    expect(JSON.parse(retry.user)).toEqual([{ id: 's1', text: 'Hello' }])
+  })
+
+  it('parameterizes the added sentence by target language, not hardcoded to any one language', () => {
+    const en = buildRetryPrompt(req({ sourceLang: 'English', targetLang: 'Chinese' }))
+    const fr = buildRetryPrompt(req({ sourceLang: 'English', targetLang: 'French' }))
+    expect(en.system).toContain('Chinese')
+    expect(en.system).not.toContain('French')
+    expect(fr.system).toContain('French')
+    expect(fr.system).not.toContain('Chinese')
+  })
+})
+
+// --- prompts.ts: per-segment fallback anti-echo hardening (Task D) -------
+
+describe('buildFallbackPrompt', () => {
+  it('contains an explicit anti-echo instruction naming source-unchanged as a failure mode', () => {
+    const request = req({ sourceLang: 'English', targetLang: 'Chinese' })
+    const fallback = buildFallbackPrompt(request)
+
+    expect(fallback.system.startsWith(buildPrompt(request).system)).toBe(true)
+    expect(fallback.system.toLowerCase()).toContain('source text unchanged')
+    expect(fallback.system.toLowerCase()).toContain('failure')
+  })
+
+  it('contains a worked example translating a terse mixed alphanumeric label', () => {
+    const request = req({ sourceLang: 'English', targetLang: 'Chinese' })
+    const fallback = buildFallbackPrompt(request)
+
+    expect(fallback.system).toContain('Worked example')
+    expect(fallback.system).toContain('2-10 Batch User-3 RESIN')
+    // The worked example calls out which tokens stay as-is (the code and
+    // the brand name) versus which words get translated.
+    expect(fallback.system).toContain('2-10')
+    expect(fallback.system).toContain('RESIN')
+  })
+
+  it('names the target language in both the anti-echo instruction and the worked example, without hardcoding Chinese in the template', () => {
+    const zh = buildFallbackPrompt(req({ sourceLang: 'English', targetLang: 'Chinese' }))
+    const fr = buildFallbackPrompt(req({ sourceLang: 'English', targetLang: 'French' }))
+
+    expect(zh.system).toContain('Chinese')
+    expect(zh.system).not.toContain('French')
+    expect(fr.system).toContain('French')
+    expect(fr.system).not.toContain('Chinese')
+
+    // The worked example itself is present regardless of target language -
+    // it is a generic template, not a per-language special case.
+    expect(zh.system).toContain('2-10 Batch User-3 RESIN')
+    expect(fr.system).toContain('2-10 Batch User-3 RESIN')
+  })
+
+  it('mentions keeping genuinely untranslatable tokens such as product codes and brand names as-is', () => {
+    const request = req({ sourceLang: 'English', targetLang: 'Chinese' })
+    const fallback = buildFallbackPrompt(request)
+    expect(fallback.system).toContain('HTHH-1')
+  })
+
+  it('user message and transcript gluing are unaffected, only the system message changes', () => {
+    const request = req()
+    const fallback = buildFallbackPrompt(request)
+    expect(fallback.text).toBe(`System: ${fallback.system}\nUser: ${fallback.user}`)
+    expect(JSON.parse(fallback.user)).toEqual([{ id: 's1', text: 'Hello' }])
   })
 })
 
@@ -375,6 +501,73 @@ describe('OllamaBackend.translateBatch', () => {
 
     expect(res.translations).toEqual([{ id: 's1', translation: 'Bonjour' }])
     expect(mocks.chat.mock.calls[0][0]).toMatchObject({ think: true })
+  })
+})
+
+// --- translateBatch: ladder wiring uses the right prompt at each rung -----
+// (polish-round Task D: the ladder STRUCTURE is unchanged - same number of
+// calls, same retry-then-per-segment-fallback order - only which prompt
+// text gets sent at each rung changes.)
+
+describe('OllamaBackend.translateBatch: prompt selection per ladder rung', () => {
+  it('sends the plain first-attempt prompt on attempt 1, the retry-nudge prompt on the whole-group retry, and the fallback anti-echo prompt on the per-segment fallback', async () => {
+    await seedCaps(appDataDir, 'test-model', { structuredWithThinkOff: true })
+    const request = req({
+      sourceLang: 'English',
+      targetLang: 'Chinese',
+      segments: [{ id: 's1', text: '1-22 Batch User-5 ROSIN' }]
+    })
+
+    // Attempt 1 (whole group): echoes the source, unresolved.
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse(
+        JSON.stringify({ translations: [{ id: 's1', translation: '1-22 Batch User-5 ROSIN' }] })
+      )
+    )
+    // Attempt 2 (whole-group retry): echoes again, still unresolved.
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse(
+        JSON.stringify({ translations: [{ id: 's1', translation: '1-22 Batch User-5 ROSIN' }] })
+      )
+    )
+    // Per-segment fallback: finally translates.
+    mocks.chat.mockResolvedValueOnce(
+      chatResponse(
+        JSON.stringify({ translations: [{ id: 's1', translation: '1-22批 用户5 ROSIN' }] })
+      )
+    )
+
+    const backend = new OllamaBackend({
+      baseUrl: 'http://127.0.0.1:1',
+      appDataDir,
+      retryDelayMs: 0
+    })
+    const res = await backend.translateBatch(request)
+
+    expect(res.translations).toEqual([{ id: 's1', translation: '1-22批 用户5 ROSIN' }])
+    expect(mocks.chat).toHaveBeenCalledTimes(3)
+
+    const systemContentAt = (callIndex: number): string =>
+      mocks.chat.mock.calls[callIndex][0].messages[0].content
+
+    const attempt1System = systemContentAt(0)
+    const retrySystem = systemContentAt(1)
+    const fallbackSystem = systemContentAt(2)
+
+    // Attempt 1: exactly the unchanged first-attempt prompt, no anti-echo wording at all.
+    expect(attempt1System).not.toContain('source text unchanged')
+    expect(attempt1System).not.toContain('Worked example')
+
+    // Retry: the one added nudge sentence, but no worked example.
+    expect(retrySystem).toContain('source text unchanged')
+    expect(retrySystem).not.toContain('Worked example')
+    expect(retrySystem.startsWith(attempt1System)).toBe(true)
+
+    // Per-segment fallback: full anti-echo instruction plus worked example.
+    expect(fallbackSystem).toContain('source text unchanged')
+    expect(fallbackSystem).toContain('failure')
+    expect(fallbackSystem).toContain('Worked example')
+    expect(fallbackSystem).toContain('2-10 Batch User-3 RESIN')
   })
 })
 

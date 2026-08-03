@@ -10,7 +10,7 @@ import type {
   TranslationBackend
 } from '../backend'
 import { type ValidationFailure, validateBatch } from '../batching'
-import { buildPrompt } from '../prompts'
+import { buildFallbackPrompt, buildPrompt, buildRetryPrompt, type RenderedPrompt } from '../prompts'
 
 const DEFAULT_RETRY_DELAY_MS = 500
 const CAPS_FILE_NAME = 'model-caps.json'
@@ -89,6 +89,26 @@ function delay(ms: number): Promise<void> {
 }
 
 /**
+ * Which rung of the validation ladder a given attemptGroup()/callChat() call
+ * is for - selects which of prompts.ts's three prompt builders gets used
+ * (see selectPrompt below). Purely a prompt-selection knob: it does not
+ * change the ladder's structure (same calls, same order) at all.
+ */
+type PromptStage = 'initial' | 'retry' | 'fallback'
+
+/** Maps a ladder rung to its prompt builder from prompts.ts. */
+function selectPrompt(stage: PromptStage, req: BatchRequest): RenderedPrompt {
+  switch (stage) {
+    case 'initial':
+      return buildPrompt(req)
+    case 'retry':
+      return buildRetryPrompt(req)
+    case 'fallback':
+      return buildFallbackPrompt(req)
+  }
+}
+
+/**
  * TranslationBackend implementation backed by a local Ollama server.
  * translateBatch() runs the validation ladder from the task brief:
  *   1. ollama.chat with `format` set to the batch JSON schema and thinking
@@ -97,7 +117,11 @@ function delay(ms: number): Promise<void> {
  *   3. On any failure: retry the whole group once; any segments still
  *      unresolved after that go through one per-segment call each; any
  *      still unresolved after THAT are simply absent from the response -
- *      the caller (pipeline) is expected to keep the original text.
+ *      the caller (pipeline) is expected to keep the original text. Each
+ *      rung sends progressively more insistent anti-echo wording (see
+ *      selectPrompt/prompts.ts) - the ladder's STRUCTURE (call count, order,
+ *      retry-then-per-segment-fallback) is unaffected by which prompt text
+ *      gets sent.
  *   4. Model capability (`structuredWithThinkOff`) is probed once per
  *      model and cached in `<appDataDir>/model-caps.json`, both across
  *      calls on this instance and across process restarts.
@@ -192,7 +216,7 @@ export class OllamaBackend implements TranslationBackend {
     // is what gets surfaced in BatchResponse.failures.
     const reasonById = new Map<string, ValidationFailure | 'error'>()
 
-    const attempt1 = await this.attemptGroup(req, caps)
+    const attempt1 = await this.attemptGroup(req, caps, 'initial')
     addCall(attempt1.usage)
     for (const o of attempt1.ok) okById.set(o.id, o)
     for (const f of attempt1.failed) reasonById.set(f.id, f.reason)
@@ -202,7 +226,7 @@ export class OllamaBackend implements TranslationBackend {
     if (unresolvedIds.length > 0) {
       usage.retries += 1
       await delay(this.retryDelayMs)
-      const attempt2 = await this.attemptGroup(req, caps)
+      const attempt2 = await this.attemptGroup(req, caps, 'retry')
       addCall(attempt2.usage)
       for (const o of attempt2.ok) {
         if (!okById.has(o.id)) {
@@ -223,7 +247,7 @@ export class OllamaBackend implements TranslationBackend {
         if (!seg) continue
         usage.perSegmentFallbacks += 1
         const singleReq: BatchRequest = { ...req, segments: [seg] }
-        const attempt = await this.attemptGroup(singleReq, caps)
+        const attempt = await this.attemptGroup(singleReq, caps, 'fallback')
         addCall(attempt.usage)
         const solved = attempt.ok.find((o) => o.id === id)
         if (solved) {
@@ -252,16 +276,17 @@ export class OllamaBackend implements TranslationBackend {
     return failures.length > 0 ? { translations, failures, usage } : { translations, usage }
   }
 
-  /** One ollama.chat call for `req`, parsed and validated. Never throws - a transport-level failure becomes an all-'error' failure list (and a null `usage`, since no response came back to read telemetry from), an unparseable/schema-invalid response becomes an all-'parse' one (with `usage` still populated - the model DID respond and spend real compute, even though its output was unusable). */
+  /** One ollama.chat call for `req`, parsed and validated. Never throws - a transport-level failure becomes an all-'error' failure list (and a null `usage`, since no response came back to read telemetry from), an unparseable/schema-invalid response becomes an all-'parse' one (with `usage` still populated - the model DID respond and spend real compute, even though its output was unusable). `stage` only selects which prompt (see selectPrompt) gets sent - it never changes this method's own logic. */
   private async attemptGroup(
     req: BatchRequest,
-    caps: ModelCaps
+    caps: ModelCaps,
+    stage: PromptStage
   ): Promise<{
     ok: TranslatedEntry[]
     failed: { id: string; reason: ValidationFailure | 'error' }[]
     usage: CallUsage | null
   }> {
-    const raw = await this.callChat(req, caps)
+    const raw = await this.callChat(req, caps, stage)
     if (raw.kind !== 'ok') {
       return {
         ok: [],
@@ -285,13 +310,14 @@ export class OllamaBackend implements TranslationBackend {
    */
   private async callChat(
     req: BatchRequest,
-    caps: ModelCaps
+    caps: ModelCaps,
+    stage: PromptStage
   ): Promise<
     | { kind: 'ok'; translations: TranslatedEntry[]; usage: CallUsage }
     | { kind: 'parse'; usage: CallUsage }
     | { kind: 'error' }
   > {
-    const prompt = buildPrompt(req)
+    const prompt = selectPrompt(stage, req)
     let res: Awaited<ReturnType<Ollama['chat']>>
     try {
       res = await this.client.chat({

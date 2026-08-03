@@ -232,4 +232,22 @@ describe('validateBatch', () => {
     const result = validateBatch(request, [{ id: 's1', translation: 'Bonjour' }])
     expect(result.ok).toEqual([{ id: 's1', translation: 'Bonjour' }])
   })
+
+  // Polish-round Task D verification: a terse mixed alphanumeric label
+  // (from the live EN->ZH gate run, "1-22 Batch User-5 ROSIN" on slide 3)
+  // where only the translatable words changed and the code/brand tokens
+  // were correctly kept as-is must NOT be flagged as echo - the strings
+  // differ, so isEcho's normalize-then-compare already passes this case.
+  // This test exists to confirm that (not to change echo detection, which
+  // is out of scope for this task).
+  it('does not flag a translation that differs from source only by keeping code/brand tokens unchanged', () => {
+    const request = req({
+      sourceLang: 'en',
+      targetLang: 'zh',
+      segments: [{ id: 's1', text: '1-22 Batch User-5 ROSIN' }]
+    })
+    const result = validateBatch(request, [{ id: 's1', translation: '1-22批 用户5 ROSIN' }])
+    expect(result.ok).toEqual([{ id: 's1', translation: '1-22批 用户5 ROSIN' }])
+    expect(result.failed).toEqual([])
+  })
 })
