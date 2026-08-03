@@ -92,9 +92,15 @@ function fallbackAntiEchoInstructions(targetLang: string): string {
     `This applies even to short labels, codes, and technical fragments - they must still be rendered ` +
     `in ${targetLang}: translate every translatable word, and keep only genuinely untranslatable ` +
     `tokens (product codes like "HTHH-1", proper-noun brand names) exactly as they appear in the source.\n` +
-    `Worked example: given the label "2-10 Batch User-3 RESIN", a correct ${targetLang} translation ` +
-    `renders "Batch" and "User" in ${targetLang} while keeping the code "2-10" and the brand name ` +
-    `"RESIN" unchanged, producing a mixed string rather than a verbatim copy of the source label.`
+    // The keep-token in the example is an ACRONYM brand (MPX), deliberately
+    // not a real dictionary word in caps: an all-caps real word (RESIN,
+    // ROSIN) is usually still translatable, and an example that kept one
+    // would teach the model to preserve exactly the tokens Charlie's gate
+    // feedback wants translated.
+    `Worked example: given the label "2-10 Batch User-3 MPX", a correct ${targetLang} translation ` +
+    `renders "Batch" and "User" in ${targetLang} while keeping the code "2-10" and the brand acronym ` +
+    `"MPX" unchanged, producing a mixed string rather than a verbatim copy of the source label. ` +
+    `An ordinary dictionary word is still translatable even when written in capital letters.`
   )
 }
 

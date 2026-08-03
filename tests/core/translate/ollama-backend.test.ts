@@ -223,7 +223,7 @@ describe('buildRetryPrompt', () => {
     expect(added).toContain('Chinese')
     expect(added.toLowerCase()).toContain('source text unchanged')
     expect(retry.system).not.toContain('Worked example')
-    expect(retry.system).not.toContain('2-10 Batch User-3 RESIN')
+    expect(retry.system).not.toContain('2-10 Batch User-3 MPX')
   })
 
   it('user message and transcript gluing are unaffected, only the system message changes', () => {
@@ -260,11 +260,11 @@ describe('buildFallbackPrompt', () => {
     const fallback = buildFallbackPrompt(request)
 
     expect(fallback.system).toContain('Worked example')
-    expect(fallback.system).toContain('2-10 Batch User-3 RESIN')
+    expect(fallback.system).toContain('2-10 Batch User-3 MPX')
     // The worked example calls out which tokens stay as-is (the code and
     // the brand name) versus which words get translated.
     expect(fallback.system).toContain('2-10')
-    expect(fallback.system).toContain('RESIN')
+    expect(fallback.system).toContain('MPX')
   })
 
   it('names the target language in both the anti-echo instruction and the worked example, without hardcoding Chinese in the template', () => {
@@ -278,8 +278,8 @@ describe('buildFallbackPrompt', () => {
 
     // The worked example itself is present regardless of target language -
     // it is a generic template, not a per-language special case.
-    expect(zh.system).toContain('2-10 Batch User-3 RESIN')
-    expect(fr.system).toContain('2-10 Batch User-3 RESIN')
+    expect(zh.system).toContain('2-10 Batch User-3 MPX')
+    expect(fr.system).toContain('2-10 Batch User-3 MPX')
   })
 
   it('mentions keeping genuinely untranslatable tokens such as product codes and brand names as-is', () => {
@@ -567,7 +567,7 @@ describe('OllamaBackend.translateBatch: prompt selection per ladder rung', () =>
     expect(fallbackSystem).toContain('source text unchanged')
     expect(fallbackSystem).toContain('failure')
     expect(fallbackSystem).toContain('Worked example')
-    expect(fallbackSystem).toContain('2-10 Batch User-3 RESIN')
+    expect(fallbackSystem).toContain('2-10 Batch User-3 MPX')
   })
 })
 
