@@ -305,3 +305,32 @@ describe('validateRegions - rotated flag passthrough', () => {
     expect(result[0].rotated).toBe(true)
   })
 })
+
+describe('validateRegions - rotation angle passthrough (polish round Task E)', () => {
+  it('preserves a known rotation angle on a surviving region that never merges with anything', () => {
+    const solo = region({
+      bbox: { x: 10, y: 10, w: 50, h: 20 },
+      text: 'Vertical',
+      rotation: -90
+    })
+
+    const result = validateRegions([solo], 1000, 1000)
+
+    expect(result).toHaveLength(1)
+    expect(result[0].rotation).toBe(-90)
+  })
+
+  it('carries a rotation angle through a merge (defensive: rotation.ts already resolves rotated-pass overlaps before this ladder runs, but the angle must not be silently dropped if it ever does merge)', () => {
+    const straight = region({ bbox: { x: 100, y: 100, w: 100, h: 20 }, text: 'Left' })
+    const rotated = region({
+      bbox: { x: 120, y: 100, w: 100, h: 20 },
+      text: 'Right',
+      rotation: 90
+    })
+
+    const result = validateRegions([straight, rotated], 1000, 1000)
+
+    expect(result).toHaveLength(1)
+    expect(result[0].rotation).toBe(90)
+  })
+})

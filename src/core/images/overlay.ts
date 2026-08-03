@@ -16,6 +16,14 @@ export interface OverlayRegion {
   /** family/bold/italic used; colorHex is ignored - text color is always
    * sampled from the image, never taken from the source font spec. */
   font: FontSpec
+  /**
+   * Polish round Task E: 90 or -90 paints this region's text ROTATED in
+   * place, at the SAME size, occupying only `bbox` (still the plain,
+   * unrotated footprint rect - it IS the region's real-world footprint, see
+   * paintRotatedLines). Absent or 0 paints normally (unchanged from every
+   * prior behavior of this module).
+   */
+  rotation?: 0 | 90 | -90
 }
 
 export interface OverlayResult {
@@ -244,6 +252,77 @@ function setFont(ctx: CanvasRenderingContext2D, sizePt: number, font: FontSpec):
   ctx.font = `${style}${weight}${sizePt}px "${family}"`
 }
 
+/**
+ * Left-aligned, vertically-centered-as-a-block line layout - the algorithm
+ * every region (rotated or not) is painted with. Shared by paintRegion
+ * (draws directly in `box`, the canvas's absolute coordinates) and
+ * paintRotatedLines (draws in a LOCAL box after a translate+rotate, so the
+ * exact same layout math ends up running along the rotated frame's own axes
+ * instead - see paintRotatedLines's doc comment). ctx.font/fillStyle/
+ * textAlign/textBaseline must already be set by the caller.
+ */
+function drawLinesInBox(
+  ctx: CanvasRenderingContext2D,
+  box: RegionBBox,
+  lines: string[],
+  fontSizePt: number
+): void {
+  const lineHeightPx = fontSizePt * LINE_HEIGHT_FACTOR
+  const totalTextH = lines.length * lineHeightPx
+  const startY = box.y + (box.h - totalTextH) / 2
+  lines.forEach((line, i) => {
+    ctx.fillText(line, box.x, startY + i * lineHeightPx)
+  })
+}
+
+/**
+ * Paints rotated (+-90 degree) text. `inner` stays the plain, UNROTATED
+ * bbox - it is the region's real-world footprint (already filled by the
+ * caller) - only the DRAWING transforms.
+ *
+ * Recipe (plan-locked for this feature): translate the origin to `inner`'s
+ * center, rotate by the region's own angle, then lay out lines with
+ * drawLinesInBox in a LOCAL box whose width/height are `inner`'s SWAPPED
+ * (localBox.w = inner.h, the text's run length; localBox.h = inner.w, the
+ * ink-thickness axis) - because after the rotation, the local frame's
+ * "horizontal" direction (where drawLinesInBox lays text out left-to-right)
+ * IS the run-length direction in the original image, exactly mirroring
+ * sizing.ts's own sizingAxesFor swap (same reasoning, applied at paint time
+ * instead of measurement time). ctx.save/restore isolates the transform so
+ * later regions in the same renderOverlay call are unaffected.
+ *
+ * Sign convention: `rotation` is passed DIRECTLY as the ctx.rotate() angle
+ * in degrees (converted to radians here) - rotation: -90 rotates the canvas
+ * counterclockwise (as seen on screen; skia-canvas/HTML canvas's rotate()
+ * treats a positive angle as clockwise since y increases downward), which
+ * sends text laid out along local +x (the run length) toward the ORIGINAL
+ * frame's bottom-to-top direction and turns each glyph 90 degrees
+ * counterclockwise from upright - i.e. tilt your head left to read it
+ * normally, the common vertical chart-axis-title style. rotation: 90 is the
+ * mirror image: top-to-bottom reading, each glyph turned 90 degrees
+ * clockwise from upright. Proven (not just asserted) by
+ * tests/core/images/overlay.test.ts's rotated-paint pixel tests, which scan
+ * actual painted pixels for both signs.
+ */
+function paintRotatedLines(
+  ctx: CanvasRenderingContext2D,
+  inner: RegionBBox,
+  rotation: 90 | -90,
+  lines: string[],
+  fontSizePt: number
+): void {
+  const cx = inner.x + inner.w / 2
+  const cy = inner.y + inner.h / 2
+  const angleRad = (rotation * Math.PI) / 180
+
+  ctx.save()
+  ctx.translate(cx, cy)
+  ctx.rotate(angleRad)
+  const localBox: RegionBBox = { x: -inner.h / 2, y: -inner.w / 2, w: inner.h, h: inner.w }
+  drawLinesInBox(ctx, localBox, lines, fontSizePt)
+  ctx.restore()
+}
+
 function paintRegion(
   ctx: CanvasRenderingContext2D,
   region: OverlayRegion,
@@ -272,12 +351,11 @@ function paintRegion(
   ctx.textAlign = 'left'
   ctx.textBaseline = 'top'
 
-  const lineHeightPx = region.fontSizePt * LINE_HEIGHT_FACTOR
-  const totalTextH = region.lines.length * lineHeightPx
-  const startY = inner.y + (inner.h - totalTextH) / 2
-  region.lines.forEach((line, i) => {
-    ctx.fillText(line, inner.x, startY + i * lineHeightPx)
-  })
+  if (region.rotation === 90 || region.rotation === -90) {
+    paintRotatedLines(ctx, inner, region.rotation, region.lines, region.fontSizePt)
+  } else {
+    drawLinesInBox(ctx, inner, region.lines, region.fontSizePt)
+  }
 }
 
 /**

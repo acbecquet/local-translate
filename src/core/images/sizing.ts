@@ -32,6 +32,7 @@
 // font-size measurement - bundling them would blur gating.ts's single job.
 import type { FontSpec } from '../segments'
 import { measureCtx, registerBundledFonts, resolveFamily } from '../fit/fonts'
+import type { RegionBBox } from './regions'
 
 /** Returned when the target ink height is degenerate (<= 0) - matches
  * fit-engine.ts's own FLOOR_PT, so a size this function can never usefully
@@ -132,4 +133,57 @@ export function inkMatchedFontSizePt(text: string, font: FontSpec, inkHeightPx: 
   }
 
   return (lo + hi) / 2
+}
+
+/**
+ * {ink height target, fit-box width, fit-box height floor} for one region,
+ * accounting for rotation (polish round Task E: rotated +-90 text regions).
+ * Centralizes the axis pick so image-adapter.ts's extract() and
+ * pptx-adapter.ts's collectMediaSegments compute this identically instead of
+ * each inlining their own copy of the swap - the two adapters must never
+ * size a rotated region differently from one another, same reasoning as
+ * gating.ts's isSourceLanguageRegion/containsCjk being a single shared
+ * import rather than two implementations.
+ *
+ * Horizontal text (rotation absent, or 0): unchanged from pre-rotation-
+ * support behavior - ink height target is inkBBox.h (or bbox.h when no
+ * inkBBox was supplied, per TextRegion.inkBBox's own compatibility
+ * contract), fit width is bbox.w, fit height floor is bbox.h.
+ *
+ * Rotated +-90 text: the axes swap, because rotation.ts's coordinate mapping
+ * itself swaps width/height when it maps a rotated-pass detection back into
+ * the original frame (a vertical axis title's ORIGINAL bbox is tall and
+ * narrow: its HEIGHT is the text's run length, its WIDTH is the ink
+ * thickness - the axis a horizontal line's ink normally occupies vertically
+ * shows up horizontally here instead). So:
+ *   - ink height target = inkBBox.w (the narrow axis is where the rotated-
+ *     reading-frame "ink height" - stroke thickness - actually lives).
+ *   - fit-box width = bbox.h (the tall axis is the text's run length, i.e.
+ *     what fit()'s wrap/measure logic must treat as "width" to lay out the
+ *     rotated line correctly).
+ *   - fit-box height floor = bbox.w (mirrors the non-rotated case's
+ *     Math.max(bbox.h, sizePt * lineHeightFactor) floor, just on the swapped
+ *     axis) - the caller still takes Math.max(this floor, sizePt *
+ *     FIT_LINE_HEIGHT_FACTOR) once sizePt is known from inkMatchedFontSizePt,
+ *     exactly as the non-rotated case already does (see image-adapter.ts's
+ *     own doc comment on why box.hPt must be a FIT BUDGET, not the bare
+ *     bbox dimension, or fit() shrinks the ink-matched size straight back
+ *     down).
+ */
+export interface SizingAxes {
+  inkHeightPx: number
+  fitBoxWPt: number
+  fitBoxHPtFloor: number
+}
+
+export function sizingAxesFor(region: {
+  bbox: RegionBBox
+  inkBBox?: RegionBBox
+  rotation?: 0 | 90 | -90
+}): SizingAxes {
+  const inkBBox = region.inkBBox ?? region.bbox
+  if (region.rotation === 90 || region.rotation === -90) {
+    return { inkHeightPx: inkBBox.w, fitBoxWPt: region.bbox.h, fitBoxHPtFloor: region.bbox.w }
+  }
+  return { inkHeightPx: inkBBox.h, fitBoxWPt: region.bbox.w, fitBoxHPtFloor: region.bbox.h }
 }

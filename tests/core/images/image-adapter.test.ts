@@ -348,6 +348,101 @@ describe('extract() - confidence and rotation gating (behavior contract point 3)
   })
 })
 
+describe('extract() - rotated-with-angle regions are paintable (polish round Task E)', () => {
+  it('produces a segment (not a skip) for a region carrying a known rotation angle, with sizing axes swapped', async () => {
+    const file = await writePng('rotated-angle.png', 400, 300)
+    const engine = fakeEngine([
+      rawRegion({ bbox: { x: 20, y: 20, w: 20, h: 100 }, text: 'VerticalAxis', rotation: -90 })
+    ])
+    const adapter = createImageAdapter(engine, { sourceLang: 'English' })
+
+    const segments = await adapter.extract(file)
+
+    expect(segments).toHaveLength(1)
+    expect(adapter.collectSkips?.()).toEqual([])
+    const [seg] = segments
+    // Dilated bbox (DILATION_PX=2/side, regions.ts): {x:18,y:18,w:24,h:104}.
+    // Sizing axes swap for rotation +-90 (sizing.ts's sizingAxesFor): fit box
+    // width = dilated bbox.h (the run length) = 104, NOT bbox.w (24).
+    expect(seg.box.wPt).toBe(104)
+    // Ink target = raw (pre-dilation) inkBBox.w = 20, NOT inkBBox.h (100) -
+    // measuring the text back at the returned size must land within 2px of
+    // that 20px target.
+    expect(
+      Math.abs(inkHeightAt('VerticalAxis', seg.font.sizePt, seg.font) - 20)
+    ).toBeLessThanOrEqual(2)
+  })
+
+  it('treats a region with BOTH rotated:true and a rotation angle as paintable - rotation, not rotated, decides', async () => {
+    const file = await writePng('rotated-both-flags.png', 400, 300)
+    const engine = fakeEngine([
+      rawRegion({
+        bbox: { x: 20, y: 20, w: 20, h: 100 },
+        text: 'VerticalAxis',
+        rotated: true,
+        rotation: 90
+      })
+    ])
+    const adapter = createImageAdapter(engine, { sourceLang: 'English' })
+
+    const segments = await adapter.extract(file)
+
+    expect(segments).toHaveLength(1)
+    expect(adapter.collectSkips?.()).toEqual([])
+  })
+})
+
+describe('apply() - rotated-with-angle regions paint through the rotated overlay path (polish round Task E)', () => {
+  it('paints a tall-narrow ink footprint matching the rotated bbox orientation, through the FULL pipeline (extract -> translate -> fit -> apply), proving rotation reaches renderOverlay with a realistically fit()-shrunk size', async () => {
+    // Routed through runPipeline rather than a hand-built TranslatedSegment
+    // (mirrors "runPipeline pixel-exactness through the full pipeline"
+    // above): calling apply() directly with fittedSizePt forced equal to the
+    // raw ink-matched font.sizePt would skip fit()'s own shrink-to-width
+    // step, and the ink-matched size for this fixture's text genuinely does
+    // not fit the run-length budget (fitBoxWPt = dilated bbox.h) without
+    // fit() shrinking it - exactly the scenario fit() exists to handle.
+    const file = await writePng('rotated-paint.png', 300, 300, '#ffffff')
+    const bbox = { x: 100, y: 20, w: 40, h: 200 } // tall/narrow - a real vertical-axis-title shape
+    const engine = fakeEngine([rawRegion({ bbox, text: 'VerticalAxis', rotation: -90 })])
+    const adapter = createImageAdapter(engine, { sourceLang: 'English' })
+    const backend = fakeBackend({
+      translateBatch: vi
+        .fn()
+        .mockResolvedValue({ translations: [{ id: 'r1', translation: 'AxeVertical' }] })
+    })
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    const decoded = await decodeFile(report.outPath)
+    const dilated = { x: bbox.x - 2, y: bbox.y - 2, w: bbox.w + 4, h: bbox.h + 4 }
+    const scanWindow = {
+      x: dilated.x - 5,
+      y: dilated.y - 5,
+      w: dilated.w + 10,
+      h: dilated.h + 10
+    }
+    const ink = scanInkBBox(decoded, scanWindow, { r: 255, g: 255, b: 255 })
+    expect(ink).not.toBeNull()
+    const inkW = ink!.maxX - ink!.minX + 1
+    const inkH = ink!.maxY - ink!.minY + 1
+    // Tall, not wide - proves the paint path actually rotated the text onto
+    // the vertical run-length axis instead of drawing it horizontally.
+    expect(inkH).toBeGreaterThan(inkW)
+    // Contained within (a couple px slack around) the dilated bbox.
+    expect(ink!.minX).toBeGreaterThanOrEqual(dilated.x - 2)
+    expect(ink!.maxX).toBeLessThanOrEqual(dilated.x + dilated.w + 2)
+    expect(ink!.minY).toBeGreaterThanOrEqual(dilated.y - 2)
+    expect(ink!.maxY).toBeLessThanOrEqual(dilated.y + dilated.h + 2)
+  })
+})
+
 describe('apply() - keptOriginal/missing not painted, cache keyed by path (behavior contract point 4)', () => {
   it('throws a clear error when called without a prior extract() on the same path', async () => {
     const file = await writePng('never-extracted.png', 200, 200)

@@ -463,6 +463,119 @@ describe('renderOverlay + inkMatchedFontSizePt - pixel-exact ink height (polish 
   })
 })
 
+describe('renderOverlay - rotated (+-90) text paints a tall-narrow ink footprint (polish round Task E)', () => {
+  it.each([-90, 90] as const)(
+    'rotation %d: painted ink is tall (not wide), contained in bbox, and its X-extent (the rotated-frame "ink height" axis) matches the ink-matched target within 2px',
+    async (rotation) => {
+      const width = 200
+      const height = 320
+      const white = { r: 255, g: 255, b: 255 }
+      const input = await solidImageBuffer(width, height, '#ffffff', 'png')
+
+      // A tall/narrow bbox - the shape every real vertical axis-title region
+      // has in the ORIGINAL frame (run length along y, ink thickness along
+      // x) - see sizing.ts's sizingAxesFor for why this axis pairing is
+      // exactly what a rotated region's real bbox looks like.
+      const bbox = { x: 70, y: 30, w: 60, h: 260 }
+      const targetInkWidthPx = 24 // stands in for inkBBox.w - the rotated-frame "ink height" target
+      const font = { family: 'Noto Sans', sizePt: targetInkWidthPx }
+      const fontSizePt = inkMatchedFontSizePt('Vertical Axis', font, targetInkWidthPx)
+
+      const region: OverlayRegion = {
+        bbox,
+        lines: ['Vertical Axis'],
+        fontSizePt,
+        font: { family: 'Noto Sans', sizePt: fontSizePt },
+        rotation
+      }
+
+      const result = await renderOverlay(input, [region])
+      const decoded = await decode(result.image)
+      const ink = scanInkBBox(
+        decoded,
+        { x: bbox.x - 10, y: bbox.y - 10, w: bbox.w + 20, h: bbox.h + 20 },
+        white
+      )
+      expect(ink).not.toBeNull()
+
+      const inkW = ink!.maxX - ink!.minX + 1
+      const inkH = ink!.maxY - ink!.minY + 1
+
+      // Aspect: tall, not wide - proves the text was actually rotated onto
+      // the vertical run-length axis instead of being drawn horizontally
+      // into a squashed box.
+      expect(inkH).toBeGreaterThan(inkW)
+
+      // Containment: painted ink stays within the bbox (a couple px slack
+      // for antialiasing/ascender-descender rounding).
+      expect(ink!.minX).toBeGreaterThanOrEqual(bbox.x - 2)
+      expect(ink!.maxX).toBeLessThanOrEqual(bbox.x + bbox.w + 2)
+      expect(ink!.minY).toBeGreaterThanOrEqual(bbox.y - 2)
+      expect(ink!.maxY).toBeLessThanOrEqual(bbox.y + bbox.h + 2)
+
+      // Ink-extent within 2px of the region's "height axis" target: the
+      // rotated-frame ink height (sizing.ts's swap target, inkBBox.w) shows
+      // up as the ABSOLUTE-frame X-extent once painted - the whole point of
+      // the rotation is that the run-length axis (bbox.h) and the
+      // ink-thickness axis (bbox.w) trade places between the two frames.
+      expect(Math.abs(inkW - targetInkWidthPx)).toBeLessThanOrEqual(2)
+    }
+  )
+
+  it('proves the sign convention: rotation -90 stacks earlier lines toward -X, rotation 90 stacks them toward +X (mirror images of each other)', async () => {
+    // Two lines, one much longer than the other, so each occupies a
+    // distinguishable "column" (a narrow band along the ABSOLUTE X axis -
+    // the ink-thickness/line-stacking direction for rotated text, per
+    // overlay.ts's paintRotatedLines doc comment) once painted - the longer
+    // line's column carries far more ink than the shorter line's column,
+    // so whichever half of the bbox has more ink pixels identifies where
+    // the FIRST (topmost-in-local-frame) line landed.
+    const width = 200
+    const height = 260
+    const white = { r: 255, g: 255, b: 255 }
+    const bbox = { x: 60, y: 30, w: 80, h: 200 }
+    const lines = ['A Considerably Longer First Line', 'B']
+    const fontSizePt = 16
+
+    async function inkCountInHalf(rotation: 90 | -90, side: 'left' | 'right'): Promise<number> {
+      const input = await solidImageBuffer(width, height, '#ffffff', 'png')
+      const region: OverlayRegion = {
+        bbox,
+        lines,
+        fontSizePt,
+        font: { family: 'Noto Sans', sizePt: fontSizePt },
+        rotation
+      }
+      const result = await renderOverlay(input, [region])
+      const decoded = await decode(result.image)
+      const halfW = bbox.w / 2
+      const x = side === 'left' ? bbox.x : bbox.x + halfW
+      let count = 0
+      for (let yy = bbox.y; yy < bbox.y + bbox.h; yy++) {
+        for (let xx = x; xx < x + halfW; xx++) {
+          if (channelDelta(pixelAt(decoded, xx, yy), white) > 40) count++
+        }
+      }
+      return count
+    }
+
+    const minus90Left = await inkCountInHalf(-90, 'left')
+    const minus90Right = await inkCountInHalf(-90, 'right')
+    const plus90Left = await inkCountInHalf(90, 'left')
+    const plus90Right = await inkCountInHalf(90, 'right')
+
+    // rotation -90: local (lx,ly) -> global-offset (ly,-lx) (canvas rotate()
+    // convention, positive angle clockwise on screen). The first, longer
+    // line sits at the smaller local-y - the corresponding global-x offset
+    // is smaller too, so its heavier ink column lands on the LEFT.
+    expect(minus90Left).toBeGreaterThan(minus90Right)
+    // rotation 90: local (lx,ly) -> global-offset (-ly,lx) - the sign flips,
+    // so the same first/longer line's heavier ink column lands on the
+    // RIGHT instead - the mirror image of the -90 case.
+    expect(plus90Right).toBeGreaterThan(plus90Left)
+  })
+})
+
 describe('LINE_HEIGHT_FACTOR drift guard', () => {
   // overlay.ts cannot import fit-engine.ts's LINE_HEIGHT_FACTOR (private, not
   // exported) so it mirrors the value - this test proves the mirrored value

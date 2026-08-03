@@ -18,6 +18,7 @@ import { adapterFor, type FormatAdapter } from '../core/adapters/adapter'
 import { buildAdapters } from '../core/adapters/registry'
 import { DEFAULT_MODEL } from '../core/defaults'
 import { createPPOcrEngine } from '../core/images/engines/ppocr'
+import { withRotationPasses } from '../core/images/rotation'
 import { runPipeline as realRunPipeline, type PipelineOpts, type RunReport } from '../core/pipeline'
 import type { TranslationBackend } from '../core/translate/backend'
 import {
@@ -76,7 +77,11 @@ function defaultDeps(): TranslateServiceDeps {
   // every run() call across this service's lifetime reuses the SAME
   // RegionEngine (and therefore the same lazily-loaded PP-OCR ONNX
   // session) rather than paying init cost again per file.
-  const regionEngine = createPPOcrEngine()
+  // withRotationPasses (polish round Task E) wraps the engine so vertical/
+  // rotated chart-axis-style text also gets detected instead of only ever
+  // being flagged rotated-and-skipped - see its own module doc comment
+  // (core/images/rotation.ts).
+  const regionEngine = withRotationPasses(createPPOcrEngine())
   return {
     adapters: (sourceLang) => buildAdapters({ regionEngine, sourceLang }),
     ensureOllama: realEnsureOllama,

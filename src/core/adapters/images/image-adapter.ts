@@ -16,7 +16,7 @@ import {
 } from '../../images/regions'
 import { renderOverlay, type OverlayRegion } from '../../images/overlay'
 import { containsCjk, isSourceLanguageRegion } from '../../images/gating'
-import { inkMatchedFontSizePt } from '../../images/sizing'
+import { inkMatchedFontSizePt, sizingAxesFor } from '../../images/sizing'
 
 export interface ImageAdapterOpts {
   /** This run's source language, passed straight into isSourceLanguageRegion
@@ -98,49 +98,59 @@ export function createImageAdapter(engine: RegionEngine, opts: ImageAdapterOpts)
           skips.push({ id: region.id, reason: 'low-confidence region' })
           continue
         }
-        if (region.rotated) {
+        // A rotated region is only paintable once it carries a known
+        // rotation ANGLE (from withRotationPasses/rotation.ts - it actually
+        // read the text upright in a rotated copy of the image). `rotated:
+        // true` WITHOUT an angle is the in-place skew guess the spike doc
+        // proved unreliable to size/paint from - that keeps the original,
+        // conservative skip path (TextRegion.rotated's own doc comment,
+        // regions.ts).
+        if (region.rotated && !region.rotation) {
           skips.push({ id: region.id, reason: 'rotated region' })
           continue
         }
 
         paintable.set(region.id, region)
         const family = containsCjk(region.text) ? NOTO_SANS_CJK_SC : NOTO_SANS
-        // SIZE authority is the PRE-dilation ink extent (regions.ts's
-        // inkBBox), not the dilated bbox used for painting/fill below - see
-        // sizing.ts's own doc comment (polish-round Task C: replacement text
-        // must occupy only the original space, exactly). Falls back to the
-        // dilated bbox height when inkBBox is absent (a hand-built TextRegion
-        // from an engine/test that bypassed validateRegions) - the documented
-        // TextRegion.inkBBox compatibility contract (regions.ts).
-        const inkHeightPx = region.inkBBox?.h ?? region.bbox.h
+        // {ink height target, fit box width, fit box height floor} - swapped
+        // for a rotated (+-90) region since its text reads along the bbox's
+        // HEIGHT (the run length) with ink thickness along its WIDTH; see
+        // sizing.ts's sizingAxesFor for the full derivation. Horizontal
+        // regions (the pre-rotation-support case) get back exactly what this
+        // block used to compute inline: ink height = inkBBox.h (falling back
+        // to the dilated bbox.h when inkBBox is absent, per the documented
+        // TextRegion.inkBBox compatibility contract), fit width = bbox.w, fit
+        // height floor = bbox.h.
+        const axes = sizingAxesFor(region)
         // sizePt here is a required FontSpec field but unused by
         // inkMatchedFontSizePt itself (it measures at each candidate size
-        // explicitly) - inkHeightPx is a harmless placeholder.
+        // explicitly) - axes.inkHeightPx is a harmless placeholder.
         const sizePt = inkMatchedFontSizePt(
           region.text,
-          { family, sizePt: inkHeightPx },
-          inkHeightPx
+          { family, sizePt: axes.inkHeightPx },
+          axes.inkHeightPx
         )
         // fit-engine.ts's height gate is `lines * sizePt * LINE_HEIGHT_FACTOR
         // <= box.hPt` (pipeline.ts calls fit(translation, seg.box, seg.font)
         // starting from THIS sizePt). Real ink-to-em ratios run well under
         // fit's 1.2 line-height assumption, so sizePt * FIT_LINE_HEIGHT_FACTOR
-        // is almost always LARGER than the dilated bbox.h alone - passing
-        // bbox.h as box.hPt would make fit() immediately shrink back toward
-        // the old bbox.h/1.2 heuristic on essentially every single-line
-        // region, defeating ink-matching entirely (this was caught live: see
-        // this commit's own fix). box.hPt is therefore a fit BUDGET sized to
-        // accommodate the ink-matched size at fit's own line-height
-        // assumption - NOT the paint region (bbox stays the paint region;
-        // overlay.ts still fills/paints it exactly as before, untouched by
-        // this value). Math.max keeps the dilated bbox.h as an absolute
-        // floor (never claim less room than the real dilated region), though
-        // in practice the sizePt term dominates for any realistic ink ratio.
-        const fitHeightPt = Math.max(region.bbox.h, sizePt * FIT_LINE_HEIGHT_FACTOR)
+        // is almost always LARGER than the fit height floor alone - passing
+        // the floor alone as box.hPt would make fit() immediately shrink back
+        // toward the old bbox.h/1.2 heuristic on essentially every single-
+        // line region, defeating ink-matching entirely (this was caught
+        // live: see this commit's own fix). box.hPt is therefore a fit
+        // BUDGET sized to accommodate the ink-matched size at fit's own
+        // line-height assumption - NOT the paint region (bbox stays the
+        // paint region; overlay.ts still fills/paints it exactly as before,
+        // untouched by this value). Math.max keeps the fit height floor as
+        // an absolute floor (never claim less room than the real dilated
+        // region), though in practice the sizePt term dominates for any
+        // realistic ink ratio.
+        const fitHeightPt = Math.max(axes.fitBoxHPtFloor, sizePt * FIT_LINE_HEIGHT_FACTOR)
         segments.push({
           id: region.id,
           text: region.text,
-          box: { wPt: region.bbox.w, hPt: fitHeightPt },
+          box: { wPt: axes.fitBoxWPt, hPt: fitHeightPt },
           font: { family, sizePt },
           context: 'image text region',
           groupKey,
@@ -192,7 +202,8 @@ export function createImageAdapter(engine: RegionEngine, opts: ImageAdapterOpts)
           bbox: region.bbox,
           lines: seg.fittedLines,
           fontSizePt: seg.fittedSizePt,
-          font: seg.font
+          font: seg.font,
+          rotation: region.rotation
         })
       }
 

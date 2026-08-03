@@ -5,7 +5,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import JSZip from 'jszip'
-import { Canvas } from 'skia-canvas'
+import { Canvas, loadImage } from 'skia-canvas'
 import type { Element } from '@xmldom/xmldom'
 import { A_NS, P_NS, elems, openPptx } from '../../../src/core/adapters/pptx/ooxml'
 import {
@@ -3599,6 +3599,173 @@ describe('embedded media - confidence/rotated gating mirrors image-adapter.ts (b
     const skips = adapter.collectSkips!()
     expect(skips).toHaveLength(1)
     expect(skips[0].reason).toBe('rotated region')
+  })
+})
+
+describe('embedded media - rotated-with-angle regions are paintable (polish round Task E)', () => {
+  it('produces a segment (not a skip) for a media region with a known rotation angle, sizing axes swapped', async () => {
+    const png = await makePngBytes(300, 300, '#ffffff')
+    const engine = fakeMediaEngine([
+      {
+        bytes: png,
+        regions: [
+          rawMediaRegion({
+            bbox: { x: 100, y: 20, w: 40, h: 200 },
+            text: 'VerticalAxis',
+            rotation: -90
+          })
+        ]
+      }
+    ])
+    const srcPath = await writeDeck({
+      slides: [{ shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: png }] }]
+    })
+
+    const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const segments = await adapter.extract(srcPath)
+    const mediaSegs = segments.filter((s) => s.kind === 'image-region')
+
+    expect(mediaSegs).toHaveLength(1)
+    expect(adapter.collectSkips!()).toEqual([])
+    // Raw region dilated (DILATION_PX=2/side) to {x:98,y:18,w:44,h:204}.
+    // Sizing axes swap for rotation +-90 (sizing.ts's sizingAxesFor): fit
+    // box width = dilated bbox.h (the text's run length), not bbox.w.
+    expect(mediaSegs[0].box.wPt).toBe(204)
+  })
+
+  it('treats a media region with BOTH rotated:true and a rotation angle as paintable - rotation, not rotated, decides (mirrors image-adapter.ts)', async () => {
+    const png = await makePngBytes(300, 300, '#ffffff')
+    const engine = fakeMediaEngine([
+      {
+        bytes: png,
+        regions: [
+          rawMediaRegion({
+            bbox: { x: 100, y: 20, w: 40, h: 200 },
+            text: 'VerticalAxis',
+            rotated: true,
+            rotation: 90
+          })
+        ]
+      }
+    ])
+    const srcPath = await writeDeck({
+      slides: [{ shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: png }] }]
+    })
+
+    const adapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const segments = await adapter.extract(srcPath)
+
+    expect(segments.filter((s) => s.kind === 'image-region')).toHaveLength(1)
+    expect(adapter.collectSkips!()).toEqual([])
+  })
+})
+
+describe('embedded media - rotated-region parity with image-adapter.ts (polish round Task E)', () => {
+  it('extract(): identical sizing axes (box.wPt, ink-matched font.sizePt) as image-adapter.ts for the same rotated region', async () => {
+    const png = await makePngBytes(300, 300, '#ffffff')
+    const region = rawMediaRegion({
+      bbox: { x: 100, y: 20, w: 40, h: 200 },
+      text: 'VerticalAxis',
+      rotation: -90
+    })
+    const engine = fakeMediaEngine([{ bytes: png, regions: [region] }])
+
+    const srcPath = await writeDeck({
+      slides: [{ shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: png }] }]
+    })
+    const pptxAdapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const pptxSegments = await pptxAdapter.extract(srcPath)
+    const pptxSeg = pptxSegments.find((s) => s.kind === 'image-region')!
+
+    const { createImageAdapter } = await import('../../../src/core/adapters/images/image-adapter')
+    const imgFile = await writeStandaloneImage(png)
+    const imageAdapter = createImageAdapter(engine, { sourceLang: 'English' })
+    const imageSegments = await imageAdapter.extract(imgFile)
+    const imageSeg = imageSegments[0]
+
+    expect(pptxSeg.box.wPt).toBe(imageSeg.box.wPt)
+    expect(pptxSeg.font.sizePt).toBeCloseTo(imageSeg.font.sizePt)
+  })
+
+  it('apply(): paints a rotated media region into the SAME tall-narrow ink footprint as the standalone image adapter, via real end-to-end runs of both', async () => {
+    const png = await makePngBytes(300, 300, '#ffffff')
+    const bbox = { x: 100, y: 20, w: 40, h: 200 }
+    const region = rawMediaRegion({ bbox, text: 'VerticalAxis', rotation: -90 })
+    const engine = fakeMediaEngine([{ bytes: png, regions: [region] }])
+
+    const srcPath = await writeDeck({
+      slides: [{ shapes: [{ kind: 'picture', box: PIC_BOX, mediaBytes: png }] }]
+    })
+    const pptxAdapter = new PptxAdapter({ regionEngine: engine, sourceLang: 'English' })
+    const pptxReport = await runPipeline({
+      file: srcPath,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter: pptxAdapter,
+      backend: translateBackend(() => 'AxeVertical')
+    })
+    const outZip = await JSZip.loadAsync(await readFile(pptxReport.outPath))
+    const mediaEntry = Object.values(outZip.files).find(
+      (f) => !f.dir && f.name.startsWith('ppt/media/')
+    )!
+    const pptxMediaBuffer = await mediaEntry.async('nodebuffer')
+
+    const { createImageAdapter } = await import('../../../src/core/adapters/images/image-adapter')
+    const imgFile = await writeStandaloneImage(png)
+    const imageAdapter = createImageAdapter(engine, { sourceLang: 'English' })
+    const imageReport = await runPipeline({
+      file: imgFile,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter: imageAdapter,
+      backend: translateBackend(() => 'AxeVertical')
+    })
+    const imageOutBuffer = await readFile(imageReport.outPath)
+
+    async function inkFootprint(
+      buffer: Buffer
+    ): Promise<{ minX: number; minY: number; maxX: number; maxY: number; w: number; h: number }> {
+      const img = await loadImage(buffer)
+      const canvas = new Canvas(img.width, img.height)
+      const ctx = canvas.getContext('2d')
+      ctx.drawImage(img, 0, 0)
+      const data = ctx.getImageData(0, 0, img.width, img.height).data
+      const white = { r: 255, g: 255, b: 255 }
+      let minX = Infinity
+      let minY = Infinity
+      let maxX = -Infinity
+      let maxY = -Infinity
+      const scan = { x: bbox.x - 10, y: bbox.y - 10, w: bbox.w + 20, h: bbox.h + 20 }
+      for (let y = scan.y; y < scan.y + scan.h; y++) {
+        for (let x = scan.x; x < scan.x + scan.w; x++) {
+          const idx = (y * img.width + x) * 4
+          const delta = Math.max(
+            Math.abs(data[idx] - white.r),
+            Math.abs(data[idx + 1] - white.g),
+            Math.abs(data[idx + 2] - white.b)
+          )
+          if (delta > 40) {
+            if (x < minX) minX = x
+            if (x > maxX) maxX = x
+            if (y < minY) minY = y
+            if (y > maxY) maxY = y
+          }
+        }
+      }
+      return { minX, minY, maxX, maxY, w: maxX - minX + 1, h: maxY - minY + 1 }
+    }
+
+    const pptxInk = await inkFootprint(pptxMediaBuffer)
+    const imageInk = await inkFootprint(imageOutBuffer)
+
+    expect(pptxInk.h).toBeGreaterThan(pptxInk.w) // tall-narrow via the pptx media path
+    expect(imageInk.h).toBeGreaterThan(imageInk.w) // tall-narrow via the standalone image path
+    // Parity: both paths paint the SAME rotated region (same source bytes,
+    // same translation) through the same renderOverlay call underneath both
+    // adapters, so their painted ink extents must match exactly.
+    expect(pptxInk).toEqual(imageInk)
   })
 })
 

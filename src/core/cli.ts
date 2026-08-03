@@ -28,6 +28,7 @@ import { adapterFor } from './adapters/adapter'
 import { buildAdapters } from './adapters/registry'
 import { DEFAULT_MODEL } from './defaults'
 import { createPPOcrEngine } from './images/engines/ppocr'
+import { withRotationPasses } from './images/rotation'
 import {
   NOT_SOURCE_LANGUAGE_REASON,
   runPipeline,
@@ -276,7 +277,12 @@ export async function runCli(argv: string[], deps: CliDeps = defaultDeps): Promi
   // Ollama) so an unsupported file extension still fails fast without ever
   // touching Ollama - the same property this file already guaranteed before
   // image support existed.
-  const regionEngine = createPPOcrEngine()
+  // withRotationPasses (polish round Task E) wraps the engine so vertical/
+  // rotated chart-axis-style text also gets detected (via extra rotated-copy
+  // passes) instead of only ever being flagged rotated-and-skipped - see its
+  // own module doc comment (images/rotation.ts) for why this must rotate the
+  // IMAGE rather than trust an in-place read.
+  const regionEngine = withRotationPasses(createPPOcrEngine())
   const adapters = buildAdapters({ regionEngine, sourceLang: args.sourceLang })
   const adapter = adapterFor(args.file, adapters)
   if (!adapter) {

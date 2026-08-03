@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { Canvas } from 'skia-canvas'
 import { registerBundledFonts, resolveFamily } from '../../../src/core/fit/fonts'
-import { inkMatchedFontSizePt } from '../../../src/core/images/sizing'
+import { inkMatchedFontSizePt, sizingAxesFor } from '../../../src/core/images/sizing'
 import type { FontSpec } from '../../../src/core/segments'
 
 registerBundledFonts()
@@ -104,5 +104,63 @@ describe('inkMatchedFontSizePt - degenerate input never throws or hangs', () => 
   it('terminates (does not hang) for whitespace-only text, which never gains ink height', () => {
     const font: FontSpec = { family: 'Noto Sans', sizePt: 0 }
     expect(() => inkMatchedFontSizePt('   ', font, 20)).not.toThrow()
+  })
+})
+
+describe('sizingAxesFor - horizontal text (rotation absent/0), unchanged from pre-rotation-support behavior', () => {
+  it('picks inkBBox.h as the ink target, bbox.w as the fit width, bbox.h as the fit height floor', () => {
+    const region = {
+      bbox: { x: 0, y: 0, w: 120, h: 34 },
+      inkBBox: { x: 2, y: 2, w: 116, h: 30 }
+    }
+
+    expect(sizingAxesFor(region)).toEqual({ inkHeightPx: 30, fitBoxWPt: 120, fitBoxHPtFloor: 34 })
+  })
+
+  it('falls back to bbox when inkBBox is absent (TextRegion.inkBBox compatibility contract)', () => {
+    const region = { bbox: { x: 0, y: 0, w: 120, h: 34 } }
+
+    expect(sizingAxesFor(region)).toEqual({ inkHeightPx: 34, fitBoxWPt: 120, fitBoxHPtFloor: 34 })
+  })
+
+  it('treats rotation: 0 identically to rotation absent', () => {
+    const region = {
+      bbox: { x: 0, y: 0, w: 120, h: 34 },
+      inkBBox: { x: 2, y: 2, w: 116, h: 30 },
+      rotation: 0 as const
+    }
+
+    expect(sizingAxesFor(region)).toEqual({ inkHeightPx: 30, fitBoxWPt: 120, fitBoxHPtFloor: 34 })
+  })
+})
+
+describe('sizingAxesFor - rotated +-90 text: axes swap (polish round Task E)', () => {
+  it('rotation -90: ink target = inkBBox.w, fit width = bbox.h, fit height floor = bbox.w', () => {
+    // A tall/narrow vertical-axis-title shape: bbox.h (220) is the run
+    // length, bbox.w (40) is the ink-thickness axis - the opposite of a
+    // horizontal region's usual (wide, short) shape.
+    const region = {
+      bbox: { x: 10, y: 10, w: 40, h: 220 },
+      inkBBox: { x: 14, y: 14, w: 32, h: 212 },
+      rotation: -90 as const
+    }
+
+    expect(sizingAxesFor(region)).toEqual({ inkHeightPx: 32, fitBoxWPt: 220, fitBoxHPtFloor: 40 })
+  })
+
+  it('rotation 90: same axis swap as -90 (the swap depends only on |rotation| = 90, not its sign)', () => {
+    const region = {
+      bbox: { x: 10, y: 10, w: 40, h: 220 },
+      inkBBox: { x: 14, y: 14, w: 32, h: 212 },
+      rotation: 90 as const
+    }
+
+    expect(sizingAxesFor(region)).toEqual({ inkHeightPx: 32, fitBoxWPt: 220, fitBoxHPtFloor: 40 })
+  })
+
+  it('falls back to bbox when inkBBox is absent, still swapped for rotation -90', () => {
+    const region = { bbox: { x: 10, y: 10, w: 40, h: 220 }, rotation: -90 as const }
+
+    expect(sizingAxesFor(region)).toEqual({ inkHeightPx: 40, fitBoxWPt: 220, fitBoxHPtFloor: 40 })
   })
 })

@@ -42,10 +42,35 @@ export interface TextRegion {
   text: string
   /** 0..1. */
   confidence: number
-  /** true -> caller must skip-with-log, never paint. Rotated/vertical text
-   * is out of scope v1 (plan Global Constraints). Absent when the engine
-   * cannot determine rotation at all (no detection polygon exposed). */
+  /** true -> this region's own detection polygon looks skewed (an engine's
+   * in-place rotation guess - e.g. ppocr.ts's isRotated on the NORMAL,
+   * unrotated pass). By itself this means "caller must skip-with-log, never
+   * paint": the decision doc's spike found PP-OCR GARBLES strongly rotated
+   * text read in place, so an in-place skew guess is never trustworthy
+   * enough to size/paint from. Absent when the engine cannot determine
+   * rotation at all (no detection polygon exposed).
+   *
+   * Superseded by `rotation` below whenever that field is present: a region
+   * that also carries a known 90/-90 rotation angle (from
+   * withRotationPasses - rotation.ts) IS paintable regardless of what this
+   * flag says, because that angle came from actually reading the text
+   * upright in a rotated copy of the image, not from guessing at an in-place
+   * skew. Only `rotated: true` WITHOUT a `rotation` angle means skip - see
+   * rotation.ts's own module doc comment for the full policy.
+   */
   rotated?: boolean
+  /**
+   * Known rotation of this region's text relative to horizontal, populated
+   * only by withRotationPasses (rotation.ts): 90 means the text reads
+   * top-to-bottom (each glyph turned 90 degrees clockwise from upright);
+   * -90 means it reads bottom-to-top (each glyph turned 90 degrees
+   * counterclockwise from upright - the common vertical chart-axis-title
+   * style). Absent for ordinary horizontal text AND for text whose rotation
+   * is merely suspected (see `rotated` above) - this field is only ever set
+   * from a rotated-pass detection that actually read the text upright, never
+   * guessed from in-place polygon skew.
+   */
+  rotation?: 0 | 90 | -90
 }
 
 export interface RegionEngine {
@@ -111,7 +136,11 @@ function intersectionArea(a: RegionBBox, b: RegionBBox): number {
   return ix * iy
 }
 
-function iou(a: RegionBBox, b: RegionBBox): number {
+/** Exported for rotation.ts's own overlap-based dedup (rotated-pass regions
+ * vs normal-pass regions, and rotated-pass regions vs each other) - the same
+ * IoU math, not a second implementation, so the two modules can never
+ * disagree about what "overlapping" means. */
+export function iou(a: RegionBBox, b: RegionBBox): number {
   const inter = intersectionArea(a, b)
   if (inter <= 0) return 0
   const union = bboxArea(a) + bboxArea(b) - inter
@@ -174,7 +203,20 @@ function mergeOverlapping(regions: TextRegion[]): TextRegion[] {
           bbox: unionBBox(current[i].bbox, current[j].bbox),
           text: `${first.text} ${second.text}`,
           confidence: Math.min(current[i].confidence, current[j].confidence),
-          rotated: current[i].rotated || current[j].rotated ? true : undefined
+          rotated: current[i].rotated || current[j].rotated ? true : undefined,
+          // Carries a known rotation angle through a merge exactly like
+          // `rotated` above, so a region that survives merged still counts
+          // as paintable-rotated rather than silently losing the angle. In
+          // practice this rarely fires: rotation.ts's own dedup already
+          // resolves any rotated-pass pair whose overlap would meet ITS
+          // (lower) 0.3 IoU threshold before this ladder ever runs, and this
+          // ladder's own merge threshold (0.5 IoU / 0.8 containment) is
+          // strictly higher - so two DIFFERENT-orientation rotated regions
+          // should never both survive to reach here overlapping enough to
+          // merge. Guards the case anyway rather than assuming it can't
+          // happen: `first.rotation ?? second.rotation` prefers whichever
+          // constituent has an angle (both should agree when this does fire).
+          rotation: first.rotation ?? second.rotation
         }
         current = [
           ...current.slice(0, i),

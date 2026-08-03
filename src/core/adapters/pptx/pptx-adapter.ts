@@ -57,7 +57,7 @@ import {
 } from '../../images/regions'
 import { renderOverlay, type OverlayRegion } from '../../images/overlay'
 import { containsCjk, isSourceLanguageRegion } from '../../images/gating'
-import { inkMatchedFontSizePt } from '../../images/sizing'
+import { inkMatchedFontSizePt, sizingAxesFor } from '../../images/sizing'
 
 /** DrawingML diagram (SmartArt) namespace - not part of ooxml.ts's exported constants (only a:/p:/r:/rels are). */
 const DGM_NS = 'http://schemas.openxmlformats.org/drawingml/2006/diagram'
@@ -346,7 +346,8 @@ export class PptxAdapter implements FormatAdapter {
         bbox: mediaEntry.region.bbox,
         lines: seg.fittedLines,
         fontSizePt: seg.fittedSizePt,
-        font: seg.font
+        font: seg.font,
+        rotation: mediaEntry.region.rotation
       })
       overlaysByMediaPath.set(mediaEntry.mediaPath, overlayRegions)
     }
@@ -538,7 +539,12 @@ async function collectMediaSegments(
         onSkip?.(rawId, 'low-confidence region', name)
         continue
       }
-      if (region.rotated) {
+      // A rotated media region is only paintable once it carries a known
+      // rotation ANGLE (from withRotationPasses/rotation.ts) - mirrors
+      // image-adapter.ts's own extract() gating exactly (behavior contract
+      // point 7). `rotated: true` WITHOUT an angle keeps the original,
+      // conservative skip path.
+      if (region.rotated && !region.rotation) {
         onSkip?.(rawId, 'rotated region', name)
         continue
       }
@@ -546,29 +552,31 @@ async function collectMediaSegments(
       const id = uniqueId(rawId, usedIds)
       paintableById.set(id, { mediaPath, region })
       const mediaFamily = containsCjk(region.text) ? MEDIA_NOTO_SANS_CJK_SC : MEDIA_NOTO_SANS
-      // SIZE authority is the PRE-dilation ink extent (regions.ts's
-      // inkBBox), not the dilated bbox used for painting/fill - mirrors
-      // image-adapter.ts's own extract() (polish-round Task C: replacement
-      // text must occupy only the original space, exactly). Falls back to
-      // the dilated bbox height when inkBBox is absent - the documented
-      // TextRegion.inkBBox compatibility contract (regions.ts).
-      const mediaInkHeightPx = region.inkBBox?.h ?? region.bbox.h
+      // {ink height target, fit box width, fit box height floor} - swapped
+      // for a rotated (+-90) region (sizing.ts's sizingAxesFor); mirrors
+      // image-adapter.ts's own extract() so the two adapters can never size
+      // a rotated region differently from one another. Horizontal regions
+      // get back exactly what this block used to compute inline: ink height
+      // = inkBBox.h (falling back to the dilated bbox.h when inkBBox is
+      // absent, per TextRegion.inkBBox's documented compatibility contract),
+      // fit width = bbox.w, fit height floor = bbox.h.
+      const mediaAxes = sizingAxesFor(region)
       // sizePt here is a required FontSpec field but unused by
       // inkMatchedFontSizePt itself (it measures at each candidate size
-      // explicitly) - mediaInkHeightPx is a harmless placeholder.
+      // explicitly) - mediaAxes.inkHeightPx is a harmless placeholder.
       const mediaSizePt = inkMatchedFontSizePt(
         region.text,
-        { family: mediaFamily, sizePt: mediaInkHeightPx },
-        mediaInkHeightPx
+        { family: mediaFamily, sizePt: mediaAxes.inkHeightPx },
+        mediaAxes.inkHeightPx
       )
       // fit-engine.ts's height gate is `lines * sizePt * LINE_HEIGHT_FACTOR
       // <= box.hPt` (PptxAdapter.apply eventually reaches pipeline.ts's
       // fit(translation, seg.box, seg.font), starting from THIS sizePt).
       // Real ink-to-em ratios run well under fit's 1.2 line-height
       // assumption, so mediaSizePt * SPAUTOFIT_LINE_HEIGHT_FACTOR is almost
-      // always LARGER than the dilated bbox.h alone - passing bbox.h as
-      // box.hPt would make fit() immediately shrink back toward the old
-      // bbox.h/1.2 heuristic on essentially every single-line region,
+      // always LARGER than the fit height floor alone - passing the floor
+      // alone as box.hPt would make fit() immediately shrink back toward the
+      // old bbox.h/1.2 heuristic on essentially every single-line region,
       // defeating ink-matching entirely (caught live: see this commit's own
       // fix). box.hPt is therefore a fit BUDGET sized to accommodate the
       // ink-matched size at fit's own line-height assumption - NOT the paint
@@ -577,13 +585,16 @@ async function collectMediaSegments(
       // value). Reuses this file's OWN SPAUTOFIT_LINE_HEIGHT_FACTOR rather
       // than a third duplicate constant - synthesizeSpAutoFitBox already
       // does this exact job (a fit-compatible box height from a font size)
-      // for spAutoFit shapes; Math.max keeps the dilated bbox.h as an
+      // for spAutoFit shapes; Math.max keeps the fit height floor as an
       // absolute floor, though in practice the sizePt term dominates.
-      const mediaFitHeightPt = Math.max(region.bbox.h, mediaSizePt * SPAUTOFIT_LINE_HEIGHT_FACTOR)
+      const mediaFitHeightPt = Math.max(
+        mediaAxes.fitBoxHPtFloor,
+        mediaSizePt * SPAUTOFIT_LINE_HEIGHT_FACTOR
+      )
       segments.push({
         id,
         text: region.text,
-        box: { wPt: region.bbox.w, hPt: mediaFitHeightPt },
+        box: { wPt: mediaAxes.fitBoxWPt, hPt: mediaFitHeightPt },
         font: { family: mediaFamily, sizePt: mediaSizePt },
         context: 'embedded image text',
         groupKey,
