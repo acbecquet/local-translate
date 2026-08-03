@@ -27,7 +27,12 @@ import { adapterFor } from './adapters/adapter'
 import { buildAdapters } from './adapters/registry'
 import { DEFAULT_MODEL } from './defaults'
 import { createPPOcrEngine } from './images/engines/ppocr'
-import { runPipeline, UNTRANSLATABLE_REASON, type RunReport } from './pipeline'
+import {
+  NOT_SOURCE_LANGUAGE_REASON,
+  runPipeline,
+  UNTRANSLATABLE_REASON,
+  type RunReport
+} from './pipeline'
 import {
   ensureOllama as realEnsureOllama,
   OllamaNotFoundError,
@@ -182,18 +187,33 @@ function printError(err: unknown): void {
 }
 
 /**
+ * Reasons a kept-original segment was legitimately never sent to the model
+ * in the first place, rather than failing to translate: either it had
+ * nothing translatable to act on (UNTRANSLATABLE_REASON - numbers/symbols/
+ * whitespace) or its text isn't in the run's source language
+ * (NOT_SOURCE_LANGUAGE_REASON - e.g. an already-translated textbox left
+ * over in a mixed-language deck). Both are expected passthroughs, not
+ * failures.
+ */
+const LEGITIMATE_KEEP_REASONS: ReadonlySet<string> = new Set([
+  UNTRANSLATABLE_REASON,
+  NOT_SOURCE_LANGUAGE_REASON
+])
+
+/**
  * A run has genuinely failed (exit 1) only when nothing was translated AND
- * at least one kept-original segment was kept for a reason other than
- * being legitimately untranslatable in the first place. A document that's
- * entirely numbers/symbols/whitespace - e.g. a spec sheet of dimensions -
- * has translated === 0 with total > 0, but every one of those segments was
- * correctly never sent to the model (see UNTRANSLATABLE_REASON in
- * pipeline.ts), so that run succeeded at doing exactly what it should
- * have and must not be reported as a failure.
+ * at least one kept-original segment was kept for a reason other than one of
+ * LEGITIMATE_KEEP_REASONS above. A document that's entirely
+ * numbers/symbols/whitespace (a spec sheet of dimensions), or entirely
+ * content already in the target language (a deck the source-language gate
+ * correctly left untouched), has translated === 0 with total > 0, but every
+ * one of those segments was correctly never sent to the model, so that run
+ * succeeded at doing exactly what it should have and must not be reported
+ * as a failure.
  */
 function isFailedRun(report: RunReport): boolean {
   if (report.translated > 0 || report.total === 0) return false
-  return report.keptOriginal.some((k) => k.reason !== UNTRANSLATABLE_REASON)
+  return report.keptOriginal.some((k) => !LEGITIMATE_KEEP_REASONS.has(k.reason))
 }
 
 /**

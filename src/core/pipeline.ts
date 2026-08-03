@@ -8,6 +8,7 @@ import path from 'node:path'
 import type { FormatAdapter } from './adapters/adapter'
 import { fit } from './fit/fit-engine'
 import { registerBundledFonts } from './fit/fonts'
+import { isSourceLanguageRegion } from './images/gating'
 import type { TextSegment, TranslatedSegment } from './segments'
 import type { TranslationBackend } from './translate/backend'
 import { groupSegments, hasTranslatableContent } from './translate/batching'
@@ -93,6 +94,24 @@ const UNEXPLAINED_ABSENCE_REASON = 'no-translation'
  * recognize this specific, expected reason without duplicating the string.
  */
 export const UNTRANSLATABLE_REASON = 'skipped-untranslatable'
+
+/**
+ * Reason recorded for a TEXT segment the per-segment source-language gate
+ * (isSourceLanguageRegion, images/gating.ts) rejects before it ever reaches
+ * groupSegments/the backend - a segment whose text isn't in the run's
+ * source language is legitimate leave-alone content (e.g. an already-
+ * translated textbox left over in a mixed-language deck), not something to
+ * send through translation. Image adapters already apply this same gate at
+ * extract() time (no segment is ever created for a gated-out region, so
+ * they never reach the pipeline at all); this reason exists for the second,
+ * pipeline-level net that catches ordinary TEXT segments (pptx text boxes
+ * and anything else extract() turns into a segment), which had no gate of
+ * their own before Phase 3 polish Task A - the gap that let an EN->ZH run
+ * paraphrase already-Chinese textboxes in a real deck. Exported for the
+ * same reason as UNTRANSLATABLE_REASON: callers recognize this specific,
+ * expected reason without duplicating the string.
+ */
+export const NOT_SOURCE_LANGUAGE_REASON = 'not-source-language'
 
 export async function runPipeline(opts: PipelineOpts): Promise<RunReport> {
   const start = Date.now()
@@ -248,13 +267,30 @@ interface UsageTotals {
 
 /**
  * Groups translatable segments and calls the backend once per group.
- * Untranslatable segments (dropped by groupSegments) are recorded in
- * `keptOriginal` up front and never reach the backend. Any segment that
- * comes back from a group's BatchResponse without a validated translation -
- * whether explicitly listed in `failures` or simply absent - is also
- * recorded in `keptOriginal`, with the backend's reported reason when one
- * was given. Also aggregates BatchResponse.usage (when the backend reports
- * it) across every group into the returned `usage` totals.
+ * Two kinds of segment are excluded from grouping and recorded in
+ * `keptOriginal` up front, before groupSegments/the backend ever see them:
+ *
+ * 1. Segments whose text isn't in the run's source language
+ *    (!isSourceLanguageRegion(opts.sourceLang, seg.text) - reason
+ *    NOT_SOURCE_LANGUAGE_REASON). Checked FIRST, ahead of the untranslatable
+ *    check below: a segment can satisfy both (e.g. a pure-digit segment
+ *    under a CJK source has a 0% CJK ratio, which fails the language gate,
+ *    AND has no \p{L} letters, which would separately fail
+ *    hasTranslatableContent) and must land in `keptOriginal` exactly once,
+ *    not twice - language mismatch is the more specific, more actionable
+ *    reason (it says WHY the content shouldn't be touched; "untranslatable"
+ *    is just "nothing for a model to act on"), so it takes precedence and
+ *    the untranslatable check below only ever sees segments that already
+ *    passed the language gate.
+ * 2. Untranslatable segments (numeric/symbol/whitespace-only -
+ *    hasTranslatableContent false - reason UNTRANSLATABLE_REASON), dropped
+ *    by groupSegments internally too; recorded here for reporting.
+ *
+ * Any segment that comes back from a group's BatchResponse without a
+ * validated translation - whether explicitly listed in `failures` or simply
+ * absent - is also recorded in `keptOriginal`, with the backend's reported
+ * reason when one was given. Also aggregates BatchResponse.usage (when the
+ * backend reports it) across every group into the returned `usage` totals.
  */
 async function translateSegments(
   opts: PipelineOpts,
@@ -277,13 +313,23 @@ async function translateSegments(
     evalDurationMs: 0
   }
 
+  const languageGated = new Set<string>()
   for (const seg of segments) {
+    if (!isSourceLanguageRegion(opts.sourceLang, seg.text)) {
+      languageGated.add(seg.id)
+      keptOriginal.push({ id: seg.id, reason: NOT_SOURCE_LANGUAGE_REASON })
+    }
+  }
+
+  const inSourceLanguage = segments.filter((seg) => !languageGated.has(seg.id))
+
+  for (const seg of inSourceLanguage) {
     if (!hasTranslatableContent(seg.text)) {
       keptOriginal.push({ id: seg.id, reason: UNTRANSLATABLE_REASON })
     }
   }
 
-  const groups = groupSegments(segments)
+  const groups = groupSegments(inSourceLanguage)
   const totalToTranslate = groups.reduce((n, g) => n + g.length, 0)
   if (groups.length === 0) {
     opts.onProgress?.(0, 0, 'translate')

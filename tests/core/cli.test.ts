@@ -227,6 +227,27 @@ describe('runCli: exit codes and dependency injection', () => {
     expect(translateBatch).not.toHaveBeenCalled()
   })
 
+  it('returns 0 for a document whose only segment is already in the target language, legitimately kept as not-source-language', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    // English source, CJK-heavy text: the per-segment source-language gate
+    // (pipeline.ts) rejects it before the backend ever sees it - not a
+    // failure, exactly like the all-numeric case above.
+    const file = writeFixture([seg({ id: 's1', text: '你好世界' })])
+    const stop = vi.fn().mockResolvedValue(undefined)
+    const ensureOllama = vi.fn().mockResolvedValue(fakeConnection(stop))
+    const translateBatch = vi.fn()
+    const createBackend = vi.fn().mockReturnValue(fakeBackend({ translateBatch }))
+
+    const code = await runCli([file, 'English', 'Chinese (Simplified)'], {
+      ensureOllama,
+      createBackend
+    })
+
+    expect(code).toBe(0)
+    expect(translateBatch).not.toHaveBeenCalled()
+  })
+
   it('returns 0, prints the report table to stdout, progress to stderr, and calls stop exactly once on success', async () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})

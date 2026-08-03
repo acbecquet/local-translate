@@ -124,12 +124,17 @@ describe('extract() - paintable region field mapping (behavior contract point 1)
     expect(seg.font.family).toBe('Noto Sans')
   })
 
-  it('picks the CJK font family when the region text contains CJK, independent of source language', async () => {
+  it('picks the CJK font family when the region text contains CJK, independent of the exact CJK source-language spelling', async () => {
+    // sourceLang must itself be CJK here (Japanese, not Chinese/Korean) - a
+    // CJK-heavy region under a non-CJK source is gated out before font
+    // selection ever runs (source-language gating, tested below), so this
+    // still proves font selection depends only on the region's own text
+    // (containsCjk), never on which CJK source-language string was passed.
     const file = await writePng('photo2.png', 400, 300)
     const engine = fakeEngine([
       rawRegion({ bbox: { x: 20, y: 20, w: 100, h: 30 }, text: '你好世界' })
     ])
-    const adapter = createImageAdapter(engine, { sourceLang: 'English' })
+    const adapter = createImageAdapter(engine, { sourceLang: 'Japanese' })
 
     const [seg] = await adapter.extract(file)
 
@@ -178,10 +183,23 @@ describe('extract() - source-language gating (behavior contract point 2)', () =>
     expect(segments[0].text).toBe('你好世界')
   })
 
-  it('keeps every region under a non-CJK source language, including CJK text (v1: no filtering)', async () => {
+  it('drops a CJK-heavy region under a non-CJK source language (v2: symmetric gating - a script that cannot be the declared source language is left untouched, same reasoning as the CJK-source/latin-text case above)', async () => {
     const file = await writePng('deck3.png', 400, 300)
     const engine = fakeEngine([
       rawRegion({ bbox: { x: 20, y: 20, w: 100, h: 30 }, text: '你好世界' })
+    ])
+    const adapter = createImageAdapter(engine, { sourceLang: 'English' })
+
+    const segments = await adapter.extract(file)
+
+    expect(segments).toEqual([])
+    expect(adapter.collectSkips?.()).toEqual([])
+  })
+
+  it('keeps a non-CJK region under a non-CJK source language: no script signal to gate on', async () => {
+    const file = await writePng('deck4.png', 400, 300)
+    const engine = fakeEngine([
+      rawRegion({ bbox: { x: 20, y: 20, w: 100, h: 30 }, text: 'Model X200' })
     ])
     const adapter = createImageAdapter(engine, { sourceLang: 'English' })
 

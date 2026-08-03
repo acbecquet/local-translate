@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { runPipeline } from '../../src/core/pipeline'
+import { runPipeline, NOT_SOURCE_LANGUAGE_REASON } from '../../src/core/pipeline'
 import { FakeAdapter } from '../../src/core/adapters/fake/fake-adapter'
 import type { FormatAdapter } from '../../src/core/adapters/adapter'
 import type { TextSegment } from '../../src/core/segments'
@@ -727,5 +727,183 @@ describe('runPipeline: RunReport.stats', () => {
     for (const v of Object.values(report.stats)) {
       if (typeof v === 'number') expect(Number.isFinite(v)).toBe(true)
     }
+  })
+})
+
+describe('runPipeline: per-segment source-language gate', () => {
+  it('en source + CJK segment: gated as not-source-language before grouping, never reaches the backend, translation stays byte-identical', async () => {
+    const cjk = seg({ id: 's1', text: '你好世界', context: 'doc' })
+    const { file } = writeFixture([cjk])
+
+    const translateBatch = vi.fn(async (req: BatchRequest) => ({
+      translations: req.segments.map((s) => ({ id: s.id, translation: `[${s.text}]` }))
+    }))
+    const backend: TranslationBackend = {
+      listModels: vi.fn().mockResolvedValue([]),
+      pullModel: vi.fn().mockResolvedValue(undefined),
+      translateBatch
+    }
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'Chinese (Simplified)',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    expect(report.total).toBe(1)
+    expect(report.translated).toBe(0)
+    expect(report.keptOriginal).toEqual([{ id: 's1', reason: NOT_SOURCE_LANGUAGE_REASON }])
+    expect(translateBatch).not.toHaveBeenCalled()
+
+    const applied = readApplied(report.outPath)
+    expect(applied.segments[0]).toMatchObject({ translation: '你好世界' })
+  })
+
+  it('zh source + latin segment: gated as not-source-language before grouping, never reaches the backend, translation stays byte-identical', async () => {
+    const latin = seg({ id: 's1', text: 'Model X200 Instructions', context: 'doc' })
+    const { file } = writeFixture([latin])
+
+    const translateBatch = vi.fn(async (req: BatchRequest) => ({
+      translations: req.segments.map((s) => ({ id: s.id, translation: `[${s.text}]` }))
+    }))
+    const backend: TranslationBackend = {
+      listModels: vi.fn().mockResolvedValue([]),
+      pullModel: vi.fn().mockResolvedValue(undefined),
+      translateBatch
+    }
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'Chinese (Simplified)',
+      targetLang: 'English',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    expect(report.keptOriginal).toEqual([{ id: 's1', reason: NOT_SOURCE_LANGUAGE_REASON }])
+    expect(translateBatch).not.toHaveBeenCalled()
+
+    const applied = readApplied(report.outPath)
+    expect(applied.segments[0]).toMatchObject({ translation: 'Model X200 Instructions' })
+  })
+
+  it('zh source + CJK segment: passes the language gate and is translated normally', async () => {
+    const cjk = seg({ id: 's1', text: '你好世界的问候语', context: 'doc' })
+    const { file } = writeFixture([cjk])
+
+    const backend = makeBackend((req) => ({
+      translations: req.segments.map((s) => ({ id: s.id, translation: 'Hello world greeting' }))
+    }))
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'Chinese (Simplified)',
+      targetLang: 'English',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    expect(report.translated).toBe(1)
+    expect(report.keptOriginal).toEqual([])
+
+    const applied = readApplied(report.outPath)
+    expect(applied.segments[0]).toMatchObject({ translation: 'Hello world greeting' })
+  })
+
+  it('mixed batch: a language-gated segment is excluded from the group sent to the backend, but still counted in report totals', async () => {
+    const english = seg({ id: 's1', text: 'Hello there', context: 'doc' })
+    const cjk = seg({ id: 's2', text: '你好世界', context: 'doc' })
+    const { file } = writeFixture([english, cjk])
+
+    const translateBatch = vi.fn(async (req: BatchRequest) => ({
+      translations: req.segments.map((s) => ({ id: s.id, translation: `[${s.text}]` }))
+    }))
+    const backend: TranslationBackend = {
+      listModels: vi.fn().mockResolvedValue([]),
+      pullModel: vi.fn().mockResolvedValue(undefined),
+      translateBatch
+    }
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'Chinese (Simplified)',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    expect(report.total).toBe(2)
+    expect(report.translated).toBe(1)
+    expect(report.keptOriginal).toEqual([{ id: 's2', reason: NOT_SOURCE_LANGUAGE_REASON }])
+    expect(report.total).toBe(report.translated + report.keptOriginal.length)
+
+    expect(translateBatch).toHaveBeenCalledTimes(1)
+    const sentIds = translateBatch.mock.calls[0][0].segments.map((s: { id: string }) => s.id)
+    expect(sentIds).toEqual(['s1'])
+  })
+
+  it('precedence: a segment that is BOTH not-source-language and numbers-only gets exactly one reason - the language gate runs first', async () => {
+    // '12345' under a Chinese source: 0% CJK ratio -> fails the language
+    // gate (not-source-language); it also has no \p{L} letters -> would
+    // separately fail hasTranslatableContent (skipped-untranslatable). Only
+    // one reason must be recorded, and it must be the language-gate one,
+    // since a segment excluded by language never even reaches the
+    // untranslatable check (see translateSegments in pipeline.ts).
+    const numeric = seg({ id: 's1', text: '12345', context: 'doc' })
+    const { file } = writeFixture([numeric])
+
+    const translateBatch = vi.fn()
+    const backend: TranslationBackend = {
+      listModels: vi.fn().mockResolvedValue([]),
+      pullModel: vi.fn().mockResolvedValue(undefined),
+      translateBatch
+    }
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'Chinese (Simplified)',
+      targetLang: 'English',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    expect(report.keptOriginal).toEqual([{ id: 's1', reason: NOT_SOURCE_LANGUAGE_REASON }])
+    expect(translateBatch).not.toHaveBeenCalled()
+  })
+
+  it('fit still runs for a gated segment: fittedSizePt matches the original size (no resize), since translation === original text', async () => {
+    const cjk = seg({
+      id: 's1',
+      text: '你好',
+      context: 'doc',
+      font: { family: 'Noto Sans', sizePt: 18 }
+    })
+    const { file } = writeFixture([cjk])
+
+    const backend = makeBackend((req) => ({
+      translations: req.segments.map((s) => ({ id: s.id, translation: `[${s.text}]` }))
+    }))
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'Chinese (Simplified)',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    expect(report.keptOriginal).toEqual([{ id: 's1', reason: NOT_SOURCE_LANGUAGE_REASON }])
+    expect(report.overflowed).toEqual([])
+
+    const applied = readApplied(report.outPath)
+    expect(applied.segments[0]).toMatchObject({ fittedSizePt: 18, translation: '你好' })
   })
 })

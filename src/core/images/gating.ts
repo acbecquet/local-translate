@@ -42,23 +42,39 @@ export function containsCjk(text: string): boolean {
 
 /**
  * True when `text` should be translated for a run whose source language is
- * `sourceLang` - the single shared gate every region-detecting adapter
- * applies identically, so a region gated out by one adapter is gated out by
- * every other given the same inputs (no copy-paste divergence).
+ * `sourceLang` - the single shared gate every region-detecting adapter (and,
+ * since Phase 3 polish Task A, the per-segment TEXT pipeline gate in
+ * pipeline.ts) applies identically, so content gated out by one call site is
+ * gated out by every other given the same inputs (no copy-paste divergence).
  *
- * v1 rule (plan Global Constraints - "Source-language gating"): only a CJK
- * source language (zh/ja/ko) actually filters anything, requiring at least
- * CJK_TEXT_RATIO_THRESHOLD of the region's non-space characters to be
- * CJK-scripted; a pure-Latin region (a logo, a part number) under a CJK
- * source is left untouched - no segment, no skip, legitimate leave-alone
- * content. Any OTHER source language (English, Spanish, ...) accepts every
- * region without filtering: detecting "is this text actually written in
- * English" from script alone isn't possible the way CJK-vs-Latin is, so v1
- * doesn't attempt it. The resulting risk (an en-source deck's foreign-
- * script logo getting translated) is an explicit Charlie-eyeball item at
- * the phase gate, not something this function tries to solve.
+ * v2 rule, symmetric on script alone: CJK-vs-Latin is the only script
+ * distinction this function can reliably detect (telling "is this actually
+ * English" from "is this actually Spanish" isn't possible from characters
+ * alone), so it compares whether sourceLang is CJK-scripted (zh/ja/ko)
+ * against whether text itself is CJK-scripted (>= CJK_TEXT_RATIO_THRESHOLD
+ * of non-space chars) and accepts only when the two agree:
+ *   - CJK source, CJK-heavy text -> accept (ordinary case).
+ *   - CJK source, Latin-heavy text -> reject (a logo, a part number -
+ *     legitimate leave-alone content under a CJK source).
+ *   - non-CJK source, CJK-heavy text -> reject (v1 left this case
+ *     unfiltered - see history below - which is exactly the failure mode a
+ *     live EN->ZH gate run hit: a mixed-language deck's already-Chinese
+ *     content got "translated" (paraphrased) under an English source
+ *     because nothing gated it. CJK script under a non-CJK source is just as
+ *     clear a signal as Latin script under a CJK source, so it's now
+ *     rejected the same way.)
+ *   - non-CJK source, non-CJK text (e.g. English source, Spanish text) ->
+ *     accept - no script-level signal either way, so this remains
+ *     translatable exactly as v1 left it; v2 only closes the CJK-detectable
+ *     half of the gap, not the general "which Latin language is this"
+ *     problem (still not solvable from script alone).
+ *
+ * (History: v1 shipped only the CJK-source half of this symmetry; fixed in
+ * Phase 3 polish Task A after that exact gap corrupted already-translated
+ * content in a real deck.)
  */
 export function isSourceLanguageRegion(sourceLang: string, text: string): boolean {
-  if (!CJK_SOURCE_LANG_RE.test(sourceLang)) return true
-  return cjkRatio(text) >= CJK_TEXT_RATIO_THRESHOLD
+  const sourceIsCjk = CJK_SOURCE_LANG_RE.test(sourceLang)
+  const textIsCjk = cjkRatio(text) >= CJK_TEXT_RATIO_THRESHOLD
+  return sourceIsCjk === textIsCjk
 }

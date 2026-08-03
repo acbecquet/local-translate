@@ -27,8 +27,11 @@ describe('isSourceLanguageRegion', () => {
     expect(isSourceLanguageRegion('Japanese', 'A B C D E F G 你好世')).toBe(true)
   })
 
-  it('accepts every region under a non-CJK source language, including CJK text (v1: no filtering)', () => {
-    expect(isSourceLanguageRegion('English', '你好世界')).toBe(true)
+  it('rejects a CJK-heavy region under a non-CJK source language (v2: symmetric with the CJK-source/latin-text case - a script that cannot be the declared source language is foreign content)', () => {
+    expect(isSourceLanguageRegion('English', '你好世界')).toBe(false)
+  })
+
+  it('accepts a non-CJK region under a non-CJK source language: no script signal either way, so it is left as translatable', () => {
     expect(isSourceLanguageRegion('Spanish', 'Model X200')).toBe(true)
   })
 

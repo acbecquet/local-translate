@@ -136,13 +136,20 @@ interface RoundTrip {
 /** extract -> mock-translate (via runPipeline) -> apply -> re-extract. */
 async function roundTrip(
   srcPath: string,
-  translateFn: (text: string) => string = mockTranslate
+  translateFn: (text: string) => string = mockTranslate,
+  // Most callers exercise pure structural round-tripping (shape kinds,
+  // grouping, notes, tables...) where the actual language is incidental, so
+  // 'English' is a safe default - but a genuinely CJK-content deck needs a
+  // CJK sourceLang here too, or the pipeline's per-segment source-language
+  // gate (pipeline.ts) correctly rejects it as not-source-language and
+  // translateFn never runs on it.
+  sourceLang: string = 'English'
 ): Promise<RoundTrip> {
   const adapter = new PptxAdapter()
   const originalSegments = await adapter.extract(srcPath)
   const report = await runPipeline({
     file: srcPath,
-    sourceLang: 'English',
+    sourceLang,
     targetLang: 'French',
     model: 'test-model',
     adapter,
@@ -2133,7 +2140,15 @@ describe('PptxAdapter round-trip', () => {
       ]
     })
 
-    const { outPath, originalSegments, reExtracted } = await roundTrip(srcPath)
+    // All-Chinese content needs a CJK sourceLang - the pipeline's
+    // per-segment source-language gate would otherwise correctly reject
+    // this as not-source-language under the default 'English', and
+    // translateFn would never run on it (defeating this test's purpose).
+    const { outPath, originalSegments, reExtracted } = await roundTrip(
+      srcPath,
+      mockTranslate,
+      'Chinese (Simplified)'
+    )
     expect(originalSegments).toHaveLength(1)
     const reById = byId(reExtracted)
     expect(reById.get(originalSegments[0].id)!.text).toBe(mockTranslate(originalSegments[0].text))
@@ -2337,8 +2352,16 @@ describe('PptxAdapter round-trip', () => {
         {
           shapes: [
             {
+              // Plain English content, not CJK: this test's whole deck
+              // shares one runPipeline call under sourceLang 'English' (see
+              // roundTrip) to prove every shape kind round-trips together -
+              // CJK content specifically (a different source language) has
+              // its own dedicated round-trip test above ("CJK-heavy deck")
+              // rather than being mixed into a single-sourceLang fixture,
+              // since the pipeline's per-segment source-language gate would
+              // otherwise correctly - but here undesirably - reject it.
               kind: 'textbox',
-              text: ['第二张幻灯片的中文内容'],
+              text: ['Second slide content'],
               box: { xEmu: 0, yEmu: 0, wEmu: 4000 * EMU_PER_PT, hEmu: 1500 * EMU_PER_PT }
             }
           ]
@@ -3049,7 +3072,7 @@ describe('embedded media - gating parity with image-adapter.ts (behavior contrac
     const cases: { sourceLang: string; text: string; expectKept: boolean }[] = [
       { sourceLang: 'Chinese (Simplified)', text: '你好世界的问候语', expectKept: true },
       { sourceLang: 'Chinese (Simplified)', text: 'Model X200', expectKept: false },
-      { sourceLang: 'English', text: '你好世界的问候语', expectKept: true }, // v1: non-CJK source doesn't filter
+      { sourceLang: 'English', text: '你好世界的问候语', expectKept: false }, // v2: symmetric gating - CJK-heavy text can't be English-source content
       { sourceLang: 'English', text: 'Model X200', expectKept: true }
     ]
 
