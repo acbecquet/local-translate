@@ -7,10 +7,18 @@ import path from 'node:path'
 import JSZip from 'jszip'
 import { Canvas } from 'skia-canvas'
 import type { Element } from '@xmldom/xmldom'
-import { A_NS, elems, openPptx } from '../../../src/core/adapters/pptx/ooxml'
-import { PptxAdapter } from '../../../src/core/adapters/pptx/pptx-adapter'
+import { A_NS, P_NS, elems, openPptx } from '../../../src/core/adapters/pptx/ooxml'
+import {
+  PptxAdapter,
+  _internals as pptxInternals
+} from '../../../src/core/adapters/pptx/pptx-adapter'
 import { runPipeline } from '../../../src/core/pipeline'
-import { fit, measureWidestLine } from '../../../src/core/fit/fit-engine'
+import {
+  _internals as fitInternals,
+  fit,
+  measureWidestLine,
+  wrapLines
+} from '../../../src/core/fit/fit-engine'
 import { registerBundledFonts } from '../../../src/core/fit/fonts'
 import type { TextSegment, TranslatedSegment } from '../../../src/core/segments'
 import {
@@ -890,13 +898,69 @@ describe('PptxAdapter.extract', () => {
  * textbox's declared/inherited `a:ext` is PowerPoint's own cached
  * last-computed size for the ORIGINAL text - not a binding constraint on a
  * translated segment, since PowerPoint recomputes the shape's size from
- * whatever text it actually holds. The binding constraint is the ORIGINAL
- * text's own measured extent (the real deck bug: slide 6/14's "TextBox 18"
- * has no explicit `a:ext` at all, and a naive geometry-box fit let a longer
- * translation grow the recomputed shape and shove the rest of the layout).
+ * whatever text it actually holds.
+ *
+ * Per ECMA-376, spAutoFit only ever recomputes the shape's HEIGHT.
+ * `@wrap="square"` (the spec default, applying whenever the attribute is
+ * absent) keeps the WIDTH fixed at whatever's declared/inherited and wraps
+ * text at it, same as any other shape - so with a real width known, that
+ * width IS the real constraint, and the height ceiling must be the
+ * ORIGINAL text's TRUE WRAPPED line count at that width, not its raw
+ * (unwrapped) paragraph count. `@wrap="none"` lets text run past the
+ * declared width on one line instead of wrapping - the only case where the
+ * declared width genuinely isn't a constraint. The real deck bug (slide
+ * 6/14's "TextBox 18") combines the default wrap="square" with NO explicit
+ * `a:ext` at all: with no width to wrap against either, a naive
+ * geometry-box fit let a longer translation grow the recomputed shape and
+ * shove the rest of the layout.
  */
 describe('PptxAdapter.extract - spAutoFit box synthesis', () => {
-  it("a spAutoFit shape with an explicit (stale) a:ext resolves its box from the ORIGINAL text's measured extent, NOT the shape geometry", async () => {
+  it('wrap="square" (the default) with a real declared ext: width ceiling is the shape\'s REAL width, height ceiling is the ORIGINAL text\'s TRUE WRAPPED line count at that width', async () => {
+    // Narrow enough that this one paragraph genuinely wraps to more than one
+    // visual line - the raw (unwrapped) paragraph count would under-count
+    // this as 1 line, exactly the bug CRITICAL 1 exists to prevent.
+    const original =
+      'This paragraph is deliberately long enough that it will wrap onto more than one visual line at this narrow width'
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: [original],
+              box: { xEmu: 0, yEmu: 0, wEmu: 150 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT },
+              fontPt: 18,
+              name: 'TextBox 18',
+              autofit: 'spAutoFit'
+              // wrap omitted: exercises the spec default, 'square'.
+            }
+          ]
+        }
+      ]
+    })
+
+    const segments = await new PptxAdapter().extract(srcPath)
+    const [s] = segments
+
+    const insetW = 150 - 7.2 - 7.2 // default lIns/rIns, before WRAP_SAFETY
+    expect(s.box.wPt).toBeCloseTo(insetW * 0.96, 6) // the shape's REAL width, not a text-measured one
+
+    const wrapped = wrapLines(s.text, 18, insetW, s.font)
+    expect(wrapped.length).toBeGreaterThan(1) // sanity: this paragraph genuinely wraps at this width
+    expect(s.box.hPt).toBeCloseTo(wrapped.length * 18 * 1.2, 6)
+
+    // A translation roughly double the original's length must shrink enough
+    // that its re-wrapped line count AT THE SAME FIXED WIDTH still fits the
+    // original's wrapped height - the exact guarantee CRITICAL 1 restores.
+    const longer = `${original} ${original}`
+    const result = fit(longer, s.box, s.font)
+    expect(result.overflowed).toBe(false)
+    expect(result.fontSizePt).toBeLessThan(18)
+    const rewrapped = wrapLines(longer, result.fontSizePt, s.box.wPt, s.font)
+    expect(rewrapped.length * result.fontSizePt * 1.2).toBeLessThanOrEqual(s.box.hPt + 1e-6)
+  })
+
+  it('wrap="none": keeps the raw, unwrapped-per-paragraph text-measured model even with a real declared ext (current pre-wrap-awareness behavior)', async () => {
     const srcPath = await writeDeck({
       slides: [
         {
@@ -904,13 +968,14 @@ describe('PptxAdapter.extract - spAutoFit box synthesis', () => {
             {
               kind: 'textbox',
               text: ['Short'],
-              // A generously large declared box - if this were used (as a
-              // non-spAutoFit shape would), wPt would be in the thousands
-              // of pt; the synthesized box must ignore it entirely.
+              // A generously large declared box - wrap="none" means this
+              // width is never the binding constraint either way, so the
+              // synthesized box must ignore it entirely.
               box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT },
               fontPt: 18,
               name: 'TextBox 18',
-              autofit: 'spAutoFit'
+              autofit: 'spAutoFit',
+              wrap: 'none'
             }
           ]
         }
@@ -930,9 +995,20 @@ describe('PptxAdapter.extract - spAutoFit box synthesis', () => {
     // Nowhere near the declared 5000pt-wide (minus insets) shape geometry -
     // proof the shape's own a:ext was never consulted for this box.
     expect(s.box.wPt).toBeLessThan(200)
+
+    const longTranslation =
+      'This is a very much longer translated sentence that would never have fit at the original size'
+    const result = fit(longTranslation, s.box, s.font)
+    expect(result.fontSizePt).toBeLessThan(18) // real shrink happened
+    const translatedWidest = measureWidestLine(result.lines, result.fontSizePt, s.font)
+    // The core guarantee: the fitted translation's own measured block never
+    // exceeds the ORIGINAL text's measured block - this is what keeps
+    // PowerPoint's recomputed spAutoFit shape from growing past its
+    // original size.
+    expect(translatedWidest).toBeLessThanOrEqual(expectedWidest)
   })
 
-  it('a spAutoFit shape with NO explicit a:ext (ext=null, the real slide6/14 "TextBox 18" case) still resolves a real, bounded fit box - never SENTINEL_BOX', async () => {
+  it('a spAutoFit shape with NO explicit a:ext (ext=null, the real slide6/14 "TextBox 18" case) still resolves a real, bounded fit box - never SENTINEL_BOX - regardless of wrap', async () => {
     const srcPath = await writeDeck({
       slides: [
         {
@@ -945,6 +1021,10 @@ describe('PptxAdapter.extract - spAutoFit box synthesis', () => {
               fontPt: 18,
               name: 'TextBox 18',
               autofit: 'spAutoFit'
+              // wrap omitted (defaults to 'square') - with no ext there is
+              // no width to wrap the original against either way, so this
+              // still falls back to the raw per-paragraph model, same as
+              // wrap="none" above.
             }
           ]
         }
@@ -965,7 +1045,7 @@ describe('PptxAdapter.extract - spAutoFit box synthesis', () => {
     expect(s.box.hPt).toBeLessThan(100_000)
   })
 
-  it('multi-paragraph original: width = widest paragraph, height = paragraph count x size x 1.2', async () => {
+  it('multi-paragraph original with wrap="none": width = widest RAW paragraph, height = raw paragraph count x size x 1.2', async () => {
     const srcPath = await writeDeck({
       slides: [
         {
@@ -976,7 +1056,8 @@ describe('PptxAdapter.extract - spAutoFit box synthesis', () => {
               box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT },
               fontPt: 20,
               name: 'TextBox 18',
-              autofit: 'spAutoFit'
+              autofit: 'spAutoFit',
+              wrap: 'none'
             }
           ]
         }
@@ -994,44 +1075,6 @@ describe('PptxAdapter.extract - spAutoFit box synthesis', () => {
     )
     expect(s.box.wPt).toBeCloseTo(expectedWidest * 0.96, 6)
     expect(s.box.hPt).toBeCloseTo(3 * 20 * 1.2, 6)
-  })
-
-  it("spAutoFit shape + LONGER translation: fittedSizePt shrinks until the translated block never exceeds the original's measured extent", async () => {
-    const srcPath = await writeDeck({
-      slides: [
-        {
-          shapes: [
-            {
-              kind: 'textbox',
-              text: ['Short'],
-              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT },
-              fontPt: 18,
-              name: 'TextBox 18',
-              autofit: 'spAutoFit'
-            }
-          ]
-        }
-      ]
-    })
-
-    const segments = await new PptxAdapter().extract(srcPath)
-    const [s] = segments
-    const originalWidest = measureWidestLine(s.text.split('\n'), s.font.sizePt, s.font)
-    const originalHeight = 1 * s.font.sizePt * 1.2
-
-    const longTranslation =
-      'This is a very much longer translated sentence that would never have fit at the original size'
-    const result = fit(longTranslation, s.box, s.font)
-
-    expect(result.fontSizePt).toBeLessThan(s.font.sizePt) // real shrink happened
-    const translatedWidest = measureWidestLine(result.lines, result.fontSizePt, s.font)
-    // The core guarantee: the fitted translation's own measured block never
-    // exceeds the ORIGINAL text's measured block, in either dimension -
-    // this is what keeps PowerPoint's recomputed spAutoFit shape from
-    // growing past its original size.
-    expect(translatedWidest).toBeLessThanOrEqual(originalWidest)
-    const translatedHeight = result.lines.length * result.fontSizePt * 1.2
-    expect(translatedHeight).toBeLessThanOrEqual(originalHeight + 1e-6)
   })
 
   it('spAutoFit shape + SHORTER translation: size is unchanged (no needless shrink)', async () => {
@@ -1134,6 +1177,51 @@ describe('PptxAdapter.extract - spAutoFit box synthesis', () => {
     const insetW = 5000 - 7.2 - 7.2
     expect(s.box.wPt).toBeCloseTo(insetW * 0.96, 6)
     expect(s.box.hPt).toBeCloseTo(3000 - 3.6 - 3.6, 6)
+  })
+})
+
+describe('SPAUTOFIT_LINE_HEIGHT_FACTOR drift guard', () => {
+  // pptx-adapter.ts cannot import fit-engine.ts's LINE_HEIGHT_FACTOR
+  // (private, not exported) so it mirrors the value as
+  // SPAUTOFIT_LINE_HEIGHT_FACTOR - this test proves the mirrored value is
+  // exactly what fit-engine's own fitsBox() uses, by checking the fit/
+  // no-fit boundary it produces rather than comparing the numbers directly
+  // (the two modules have no shared import to do that). Mirrors
+  // tests/core/images/overlay.test.ts's identical drift-guard block for
+  // overlay.ts's own copy of the same constant. Width is set huge so only
+  // the height term of fitsBox can decide the outcome.
+  it('matches the fit engine at the fit/no-fit height boundary', () => {
+    const font = { family: 'Noto Sans', sizePt: 20 }
+    const sizePt = 20
+    const lines = ['a', 'b', 'c']
+    const wPt = 100000
+    const mirrored = pptxInternals.SPAUTOFIT_LINE_HEIGHT_FACTOR
+
+    const fitsAtBoundary = fitInternals.measuredFits(
+      lines,
+      sizePt,
+      { wPt, hPt: lines.length * sizePt * mirrored },
+      font
+    )
+    const failsJustBelow = fitInternals.measuredFits(
+      lines,
+      sizePt,
+      { wPt, hPt: lines.length * sizePt * mirrored - 0.01 },
+      font
+    )
+
+    expect(fitsAtBoundary).toBe(true)
+    expect(failsJustBelow).toBe(false)
+  })
+
+  // Sanity: fit() itself agrees text laid out at this factor's exact box
+  // height does not overflow, for an actual paragraph rather than a
+  // pre-built lines array (belt-and-suspenders against the two systems'
+  // layout functions disagreeing in some other way).
+  it('fit() does not report overflow for a box sized exactly at the mirrored factor', () => {
+    const mirrored = pptxInternals.SPAUTOFIT_LINE_HEIGHT_FACTOR
+    const r = fit('Hi', { wPt: 300, hPt: 24 * mirrored }, { family: 'Noto Sans', sizePt: 24 })
+    expect(r.overflowed).toBe(false)
   })
 })
 
@@ -1548,8 +1636,72 @@ describe('PptxAdapter.apply', () => {
     const archive = await openPptx(outPath)
     const doc = archive.readXml(slidePath)
     const bodyPr = elems(doc, A_NS, 'bodyPr')[0]
+    // This shape HAS a real declared ext (5000x3000pt above) - the
+    // conversion is unchanged/still expected here (regression: only the
+    // ext-ABSENT case below skips it).
     expect(elems(bodyPr, A_NS, 'spAutoFit')).toHaveLength(0)
     expect(elems(bodyPr, A_NS, 'normAutofit')).toHaveLength(1)
+  })
+
+  it('an ext-absent spAutoFit shape that genuinely shrinks: sz is written, a:spAutoFit is preserved (NOT converted to normAutofit), and no a:ext ever appears in the written shape XML', async () => {
+    const srcPath = await writeDeck({
+      slides: [
+        {
+          shapes: [
+            {
+              kind: 'textbox',
+              text: ['Short'],
+              box: { xEmu: 0, yEmu: 0, wEmu: 5000 * EMU_PER_PT, hEmu: 3000 * EMU_PER_PT },
+              omitExt: true,
+              fontPt: 18,
+              name: 'TextBox 18',
+              autofit: 'spAutoFit'
+            }
+          ]
+        }
+      ]
+    })
+
+    const adapter = new PptxAdapter()
+    const [seg] = await adapter.extract(srcPath)
+    // A translation long enough that fit() genuinely shrinks the size - see
+    // the box-synthesis tests above for why an ext-absent spAutoFit shape
+    // always resolves a real, tight ceiling from the ORIGINAL text's own
+    // measured extent, not SENTINEL_BOX.
+    const longTranslation =
+      'This is a very much longer translated sentence that would never have fit at the original size'
+    const result = fit(longTranslation, seg.box, seg.font)
+    expect(result.fontSizePt).toBeLessThan(seg.font.sizePt) // sanity: a real shrink is actually exercised
+
+    const translated = makeTranslated(seg, {
+      translation: longTranslation,
+      fittedSizePt: result.fontSizePt,
+      fittedLines: result.lines
+    })
+    const outPath = path.join(path.dirname(srcPath), 'out.pptx')
+    await adapter.apply(srcPath, outPath, [translated])
+
+    const archive = await openPptx(outPath)
+    const doc = archive.readXml(archive.listSlidePaths()[0])
+
+    const rPr = elems(doc, A_NS, 'rPr')[0]
+    expect(rPr.hasAttribute('sz')).toBe(true) // the fitted size WAS written
+
+    const bodyPr = elems(doc, A_NS, 'bodyPr')[0]
+    // Preserved, not converted: there is no a:ext for a normAutofit
+    // fontScale to mean anything against, and the sz just written already
+    // guarantees the shape PowerPoint recomputes stays within the original
+    // extent (see ensureNormAutofit's doc comment).
+    expect(elems(bodyPr, A_NS, 'spAutoFit')).toHaveLength(1)
+    expect(elems(bodyPr, A_NS, 'normAutofit')).toHaveLength(0)
+
+    // apply() never writes an a:ext either way - confirms this shape stays
+    // genuinely ext-absent in the OUTPUT file too, not just the input.
+    // Scoped to the shape itself (not the whole slide doc): the root
+    // spTree's own p:grpSpPr always carries an unrelated <a:ext cx="0"
+    // cy="0"/> regardless of any shape's own ext.
+    const shapeEl = elems(doc, P_NS, 'sp')[0]
+    expect(elems(shapeEl, A_NS, 'ext')).toHaveLength(0)
   })
 
   it('a gated (kept-original) segment in a spAutoFit shape is left completely untouched by apply(): translation === text means no fit pressure, so sz is never written and spAutoFit survives (interacts with polish A)', async () => {

@@ -41,8 +41,14 @@ import {
   writeMediaBytes,
   type PptxArchive
 } from './ooxml'
-import { groupChildScale, resolveShapeGeom, tableCellBoxes } from './geometry'
-import { measureWidestLine } from '../../fit/fit-engine'
+import {
+  groupChildScale,
+  resolveShapeGeom,
+  tableCellBoxes,
+  type ResolvedBox,
+  type WrapMode
+} from './geometry'
+import { measureWidestLine, wrapLines } from '../../fit/fit-engine'
 import {
   CONFIDENCE_FLOOR,
   validateRegions,
@@ -176,6 +182,16 @@ interface Site {
   bodyEl: Element
   /** SmartArt data-point sites only: the resolved cached `dsp:drawing` part path (see resolveSmartArtDrawingPath) mirroring this site's text, when the deck has one wired via the data part's extLst relId - undefined otherwise (no cached drawing, or not a SmartArt site at all). */
   smartArtDrawingPath?: string
+  /**
+   * `shape` sites only: true when this shape's autofit is spAutoFit AND
+   * geom.box resolved to null (no explicit own ext, nothing to inherit
+   * either - see handleSp/synthesizeSpAutoFitBox). apply()'s writeSize
+   * passes this through to ensureNormAutofit, which skips converting
+   * spAutoFit to normAutofit exactly when this is true (see its own doc
+   * comment for why) - undefined/false for every other site, where the
+   * flag has no effect either way.
+   */
+  preserveSpAutoFit?: boolean
 }
 
 export class PptxAdapter implements FormatAdapter {
@@ -315,7 +331,7 @@ export class PptxAdapter implements FormatAdapter {
         // text already fits at the starting size - i.e. that this comparison
         // is a reliable proxy for "no shrink happened", not just a close one.
         if (site.kind !== 'notes' && seg.fittedSizePt !== seg.font.sizePt) {
-          writeSize(site.bodyEl, seg.fittedSizePt)
+          writeSize(site.bodyEl, seg.fittedSizePt, site.preserveSpAutoFit ?? false)
         }
         continue
       }
@@ -632,7 +648,7 @@ function handleSp(
   // geometry-box behavior unchanged.
   const box: Box =
     geom.autofit === 'spAutoFit'
-      ? synthesizeSpAutoFitBox(text, fontSpec)
+      ? synthesizeSpAutoFitBox(text, fontSpec, geom.wrap, geom.box)
       : geom.box
         ? { wPt: geom.box.wPt * WRAP_SAFETY, hPt: geom.box.hPt }
         : SENTINEL_BOX
@@ -646,7 +662,10 @@ function handleSp(
     font: fontSpec,
     box,
     partPath: ctx.slidePath,
-    bodyEl: txBody
+    bodyEl: txBody,
+    // See Site.preserveSpAutoFit's doc comment - only meaningful combined
+    // with this shape currently being spAutoFit.
+    preserveSpAutoFit: geom.autofit === 'spAutoFit' && geom.box === null
   })
 }
 
@@ -662,38 +681,62 @@ function handleSp(
  * constraint is the ORIGINAL text's own measured extent - fit the
  * translation into a box no larger than that and the shape PowerPoint
  * recomputes can never grow past its original size, regardless of what
- * `a:ext` (if any) currently says. Same treatment whether or not the shape
- * has an explicit ext (see this function's only caller, handleSp) - an
- * explicit ext is just as stale a snapshot as no ext at all.
+ * `a:ext` (if any) currently says.
  *
- * `text` is split on paragraph/explicit-break boundaries exactly as
- * paragraphsText/paragraphText extract them - NOT re-wrapped against any
- * box, since there is no box width here to wrap against (the box is what
- * this function computes). Width is the widest such line measured at
- * `font` - the exact measurement machinery fit-engine.ts's own fit() uses
- * internally (see measureWidestLine's doc comment). Height is the line
- * count times `font.sizePt` times the fit engine's own line-height model
- * (SPAUTOFIT_LINE_HEIGHT_FACTOR - see its doc comment for why this is a
- * duplicated constant, not an import). WRAP_SAFETY is applied to width,
- * same as every other box handleSp hands to fit() (see WRAP_SAFETY's own
- * doc comment) - doubly important here, since this box is the ceiling the
- * whole no-growth guarantee rests on.
+ * ECMA-376's CT_TextBodyProperties `@wrap` (default "square" when absent -
+ * see geometry.ts's WrapMode) decides what "the original text's measured
+ * extent" even means, so this function branches on it:
  *
- * Deliberately NOT scaled by groupScale: this box is derived purely from
- * nominal-point-size text measurement, not from a shape `a:ext` - mirroring
- * ShapeGeom.fontPt's own no-group-scaling rule (PowerPoint renders grouped
- * text at nominal size regardless of the group's XML transform - see that
- * field's doc comment), not resolveShapeGeom's separate ext-scaling rule,
- * which simply doesn't apply here since no ext is consulted.
+ *  - wrap="square" (the common case) WITH a real declared/inherited width
+ *    (`geomBox` non-null): PowerPoint wraps text at that FIXED width and
+ *    grows/shrinks only the shape's HEIGHT. The width ceiling is therefore
+ *    that real width (same WRAP_SAFETY convention as every other box below -
+ *    see WRAP_SAFETY's own doc comment), and the height ceiling must be the
+ *    ORIGINAL text's TRUE wrapped line count AT THAT WIDTH, not the raw
+ *    paragraph count - a wrapping paragraph's raw count under-counts its
+ *    real visual lines, which would under-shrink a longer translation and
+ *    let PowerPoint's own re-wrap at the fixed width push it onto more
+ *    lines than budgeted, growing the shape taller (the exact Task B bug,
+ *    just relocated to the height axis instead of the width axis). The true
+ *    wrapped count comes from wrapLines - fit-engine.ts's own wrapping
+ *    machinery, not a reimplementation - run against the RAW (not
+ *    WRAP_SAFETY-reduced) width, since that's what PowerPoint itself
+ *    actually wrapped the original text at.
+ *  - wrap="none" (text grows the shape horizontally and never wraps), OR no
+ *    resolvable width at all (`geomBox` null - own ext absent and nothing to
+ *    inherit): there is no fixed width to wrap the original text against in
+ *    either case, so this falls back to the raw, unwrapped per-paragraph
+ *    line model (widest raw line x WRAP_SAFETY for width, raw paragraph
+ *    count for height) - the same formula this function used before wrap
+ *    awareness existed.
+ *
+ * Deliberately NOT scaled by groupScale in either branch: width/height here
+ * come from nominal-point-size text measurement (and, in the square-wrap
+ * case, from geomBox - which resolveShapeGeom already scaled by groupScale
+ * once), never re-derived from a raw `a:ext`, mirroring ShapeGeom.fontPt's
+ * own no-group-scaling rule for the same "PowerPoint renders grouped text
+ * at nominal size" reason (see that field's doc comment).
  *
  * Mixed per-run sizes within one shape: `font.sizePt` is the segment's
  * single resolved size (the adapter's existing one-size-per-segment
- * contract, unchanged by this function) - every line is measured at that
- * one size even when the source paragraphs actually differ in size, the
- * same approximation fit()'s own single-sizePt-per-segment contract already
- * makes.
+ * contract, unchanged by this function) - every line is measured/wrapped at
+ * that one size even when the source paragraphs actually differ in size,
+ * the same approximation fit()'s own single-sizePt-per-segment contract
+ * already makes.
  */
-function synthesizeSpAutoFitBox(text: string, font: FontSpec): Box {
+function synthesizeSpAutoFitBox(
+  text: string,
+  font: FontSpec,
+  wrap: WrapMode,
+  geomBox: ResolvedBox | null
+): Box {
+  if (wrap !== 'none' && geomBox) {
+    const wPt = geomBox.wPt * WRAP_SAFETY
+    const wrappedLines = wrapLines(text, font.sizePt, geomBox.wPt, font)
+    const hPt = wrappedLines.length * font.sizePt * SPAUTOFIT_LINE_HEIGHT_FACTOR
+    return { wPt, hPt }
+  }
+
   const lines = text.split('\n')
   const wPt = measureWidestLine(lines, font.sizePt, font) * WRAP_SAFETY
   const hPt = lines.length * font.sizePt * SPAUTOFIT_LINE_HEIGHT_FACTOR
@@ -1217,8 +1260,12 @@ function appendBreakLine(paragraph: Element, text: string): void {
  * reintroducing the very overflow fit() was asked to prevent. Flooring
  * only ever writes a size at or below what was measured, which can only
  * ever make the fit margin more conservative, never less.
+ *
+ * `preserveSpAutoFit` is Site.preserveSpAutoFit (default false for every
+ * caller outside this shape's own apply() branch) - see ensureNormAutofit's
+ * doc comment for what it does and why.
  */
-function writeSize(bodyEl: Element, sizePt: number): void {
+function writeSize(bodyEl: Element, sizePt: number, preserveSpAutoFit: boolean): void {
   const QUARTER_POINT = 25
   const hundredths = Math.floor((sizePt * 100) / QUARTER_POINT) * QUARTER_POINT
 
@@ -1227,7 +1274,7 @@ function writeSize(bodyEl: Element, sizePt: number): void {
     ensureRPr(run).setAttribute('sz', String(hundredths))
   }
 
-  ensureNormAutofit(bodyEl)
+  ensureNormAutofit(bodyEl, preserveSpAutoFit)
 }
 
 /**
@@ -1253,8 +1300,23 @@ function writeSize(bodyEl: Element, sizePt: number): void {
  * normally unreachable) case a body somehow lacks one - `a:bodyPr` is
  * `CT_TextBody`'s first required child, so every body this codebase can
  * actually extract a segment from will already have one.
+ *
+ * EXCEPT when `preserveSpAutoFit` is true and the body currently carries
+ * `a:spAutoFit`: this is an ext-absent spAutoFit shape (Site.preserveSpAutoFit
+ * - own ext absent, nothing to inherit either), and the conversion is
+ * skipped entirely, leaving `a:spAutoFit` in place untouched. Converting it
+ * here would write "shrink text on overflow" into a file that never gains
+ * an `a:ext` for that to mean anything against (apply() never writes one),
+ * losing spAutoFit's own recompute-on-open self-healing for no benefit: the
+ * `sz` writeSize() already wrote is measured against synthesizeSpAutoFitBox's
+ * box, which IS the original text's extent - the shape PowerPoint recomputes
+ * from that `sz` is already guaranteed to stay within it, so there is
+ * nothing left for normAutofit to additionally guard here. A shape WITH an
+ * explicit/inherited ext keeps the conversion unchanged: there, a real ext
+ * exists for normAutofit's belt-and-suspenders to fall back against, same
+ * as every other autofit case.
  */
-function ensureNormAutofit(bodyEl: Element): void {
+function ensureNormAutofit(bodyEl: Element, preserveSpAutoFit: boolean): void {
   const doc = bodyEl.ownerDocument
   if (!doc) return
 
@@ -1264,6 +1326,11 @@ function ensureNormAutofit(bodyEl: Element): void {
   }
 
   let bodyPr = childElems(bodyEl, A_NS, 'bodyPr')[0]
+
+  if (preserveSpAutoFit && bodyPr && childElems(bodyPr, A_NS, 'spAutoFit')[0]) {
+    return
+  }
+
   if (!bodyPr) {
     bodyPr = doc.createElementNS(A_NS, qualified(bodyEl, 'bodyPr'))
     bodyEl.insertBefore(bodyPr, bodyEl.firstChild)
@@ -1612,3 +1679,9 @@ function resolveRelById(archive: PptxArchive, partPath: string, rId: string): st
   }
   return null
 }
+
+// Test-only visibility into the mirrored constant above (drift-guard test in
+// tests/core/pptx/pptx-adapter.test.ts) - not part of this module's real
+// interface, matching fit-engine.ts's own _internals convention (and
+// overlay.ts's identical mirroring of the same constant).
+export const _internals = { SPAUTOFIT_LINE_HEIGHT_FACTOR }

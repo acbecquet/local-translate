@@ -81,6 +81,17 @@ export interface ResolvedBox {
  */
 export type AutofitMode = 'spAutoFit' | 'normAutofit' | 'noAutofit' | null
 
+/**
+ * ECMA-376 CT_TextBodyProperties `@wrap` (ST_TextWrappingType): 'square'
+ * wraps text at the body's width (the spec default when the attribute is
+ * absent - a bare `<a:bodyPr/>` is 'square', not 'none'), 'none' lets text
+ * run past the body width on one line instead of wrapping. null covers "no
+ * bodyPr at all" (mirrors AutofitMode's own null convention) - distinct
+ * from an explicit 'square', though both mean "wraps" to any caller that
+ * only special-cases 'none' (see pptx-adapter.ts's synthesizeSpAutoFitBox).
+ */
+export type WrapMode = 'square' | 'none' | null
+
 export interface ShapeGeom {
   /**
    * null = no constraint resolvable (fit engine skipped, size preserved).
@@ -114,6 +125,8 @@ export interface ShapeGeom {
   insetsPt: { l: number; r: number; t: number; b: number }
   /** See AutofitMode's own doc comment. Reported as a plain fact - this module never decides what a caller does with it. */
   autofit: AutofitMode
+  /** See WrapMode's own doc comment. Reported as a plain fact alongside `autofit` - same "this module never decides what a caller does with it" rule. */
+  wrap: WrapMode
 }
 
 export interface ResolveShapeGeomOptions {
@@ -133,11 +146,12 @@ export function resolveShapeGeom(opts: ResolveShapeGeomOptions): ShapeGeom {
   const fontPt = resolveFontPt(shape)
   const insetsPt = readInsetsPt(shape, groupScale)
   const autofit = resolveAutofitMode(shape)
+  const wrap = resolveWrapMode(shape)
 
   const ownExt = getOwnExtEmu(shape)
   const extEmu = ownExt ?? resolveInheritedExtEmu(shape, layoutDoc, masterDoc)
   if (!extEmu) {
-    return { box: null, fontPt, insetsPt, autofit }
+    return { box: null, fontPt, insetsPt, autofit, wrap }
   }
 
   const insetsEmu = readInsetsEmu(shape)
@@ -149,7 +163,7 @@ export function resolveShapeGeom(opts: ResolveShapeGeomOptions): ShapeGeom {
     hPt: (usableHEmu / EMU_PER_PT) * groupScale.sy
   }
 
-  return { box, fontPt, insetsPt, autofit }
+  return { box, fontPt, insetsPt, autofit, wrap }
 }
 
 /**
@@ -394,6 +408,14 @@ function resolveAutofitMode(shape: Element): AutofitMode {
   if (childElems(bodyPr, A_NS, 'normAutofit')[0]) return 'normAutofit'
   if (childElems(bodyPr, A_NS, 'noAutofit')[0]) return 'noAutofit'
   return null
+}
+
+/** See WrapMode's doc comment. `@wrap="none"` is the only value that means "don't wrap" - anything else present (or the attribute simply absent) is the ECMA-376 default, 'square'. */
+function resolveWrapMode(shape: Element): WrapMode {
+  const txBody = findTxBody(shape)
+  const bodyPr = txBody && childElems(txBody, A_NS, 'bodyPr')[0]
+  if (!bodyPr) return null
+  return bodyPr.getAttribute('wrap') === 'none' ? 'none' : 'square'
 }
 
 function readInsetsEmu(shape: Element): { l: number; r: number; t: number; b: number } {

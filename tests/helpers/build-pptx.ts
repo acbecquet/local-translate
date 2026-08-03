@@ -88,6 +88,15 @@ export interface TextboxShapeSpec {
    * usual state and every test written before this option existed.
    */
   omitExt?: boolean
+  /**
+   * Explicit `a:bodyPr/@wrap` (ECMA-376 ST_TextWrappingType) - Phase 3
+   * polish-round Task B fixture support for wrap="square"-vs-"none"
+   * spAutoFit box-synthesis tests. Omitted (default) emits no `wrap`
+   * attribute at all, matching every real deck's most common state (and
+   * every test written before this option existed) - the spec default,
+   * 'square', applies either way.
+   */
+  wrap?: 'square' | 'none'
 }
 
 export interface PlaceholderShapeSpec {
@@ -241,9 +250,10 @@ function xfrmXml(box: EmuBox, omitExt?: boolean): string {
 function bodyPrXml(
   insetsEmu?: { l?: number; r?: number; t?: number; b?: number },
   wordArt?: boolean,
-  autofit?: 'spAutoFit' | 'normAutofit' | 'noAutofit'
+  autofit?: 'spAutoFit' | 'normAutofit' | 'noAutofit',
+  wrap?: 'square' | 'none'
 ): string {
-  const attrs = insetsEmu
+  const insetAttrs = insetsEmu
     ? [
         insetsEmu.l !== undefined ? `lIns="${insetsEmu.l}"` : null,
         insetsEmu.r !== undefined ? `rIns="${insetsEmu.r}"` : null,
@@ -251,6 +261,7 @@ function bodyPrXml(
         insetsEmu.b !== undefined ? `bIns="${insetsEmu.b}"` : null
       ].filter((a): a is string => a !== null)
     : []
+  const attrs = wrap ? [...insetAttrs, `wrap="${wrap}"`] : insetAttrs
   const attrsStr = attrs.length ? ` ${attrs.join(' ')}` : ''
   const warp = wordArt ? '<a:prstTxWarp prst="textArchUp"><a:avLst/></a:prstTxWarp>' : ''
   const autofitEl = autofit ? `<a:${autofit}/>` : ''
@@ -348,7 +359,7 @@ function buildShapeXml(
         `<p:sp><p:nvSpPr><p:cNvPr id="${id}" name="${escAttr(name)}"/>` +
         '<p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr/></p:nvSpPr>' +
         `<p:spPr>${xfrmXml(shape.box, shape.omitExt)}<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>` +
-        `<p:txBody>${bodyPrXml(shape.insetsEmu, shape.wordArt, shape.autofit)}<a:lstStyle/>` +
+        `<p:txBody>${bodyPrXml(shape.insetsEmu, shape.wordArt, shape.autofit, shape.wrap)}<a:lstStyle/>` +
         paragraphsXml(shape.text, {
           fontPt: shape.fontPt,
           bold: shape.bold,

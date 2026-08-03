@@ -107,7 +107,7 @@ describe('resolveShapeGeom', () => {
     expect(geom.box).toEqual({ wPt: 1000 - 2 - 3, hPt: 500 - 1 - 4 })
   })
 
-  it('contract 6 (Phase 3 polish-round Task B): reports spAutoFit/normAutofit/noAutofit/none as ShapeGeom.autofit, independent of box resolution', async () => {
+  it('contract 7 (Phase 3 polish-round Task B): reports spAutoFit/normAutofit/noAutofit/none as ShapeGeom.autofit, independent of box resolution', async () => {
     for (const autofit of ['spAutoFit', 'normAutofit', 'noAutofit', undefined] as const) {
       const buffer = await buildPptx({
         slides: [
@@ -133,7 +133,7 @@ describe('resolveShapeGeom', () => {
     }
   })
 
-  it("contract 6b: a spAutoFit shape with NO explicit a:ext still reports box: null - geometry.ts never synthesizes a box itself, that is the pptx adapter's job (see pptx-adapter.ts synthesizeSpAutoFitBox)", async () => {
+  it("contract 7b: a spAutoFit shape with NO explicit a:ext still reports box: null - geometry.ts never synthesizes a box itself, that is the pptx adapter's job (see pptx-adapter.ts synthesizeSpAutoFitBox)", async () => {
     const buffer = await buildPptx({
       slides: [
         {
@@ -157,6 +157,32 @@ describe('resolveShapeGeom', () => {
     const geom = resolveShapeGeom({ shape, slideDoc, layoutDoc, masterDoc })
     expect(geom.autofit).toBe('spAutoFit')
     expect(geom.box).toBeNull()
+  })
+
+  it('contract 7c: reports @wrap as ShapeGeom.wrap - "none" only when explicit, "square" both when explicit and when the attribute is absent (the ECMA-376 default)', async () => {
+    for (const wrap of ['square', 'none', undefined] as const) {
+      const buffer = await buildPptx({
+        slides: [
+          {
+            shapes: [
+              {
+                kind: 'textbox',
+                text: ['hello'],
+                box: { xEmu: 0, yEmu: 0, wEmu: 10 * EMU_PER_PT * 100, hEmu: 5 * EMU_PER_PT * 100 },
+                wrap
+              }
+            ]
+          }
+        ]
+      })
+      const archive = await openDeck(buffer)
+      const slidePath = archive.listSlidePaths()[0]
+      const { slideDoc, layoutDoc, masterDoc } = resolveDocs(archive, slidePath)
+      const shape = elems(slideDoc, P_NS, 'sp')[0]
+
+      const geom = resolveShapeGeom({ shape, slideDoc, layoutDoc, masterDoc })
+      expect(geom.wrap).toBe(wrap === 'none' ? 'none' : 'square')
+    }
   })
 
   it('contract 5: explicit run sz="1125" resolves to fontPt 11.25 (fractional preserved)', async () => {

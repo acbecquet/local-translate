@@ -191,6 +191,23 @@ export function measureWidestLine(lines: string[], sizePt: number, font: FontSpe
   return lines.length === 0 ? 0 : Math.max(...lines.map(width))
 }
 
+/**
+ * `text`'s TRUE visual line count at `wPt`/`sizePt`/`font` - the exact same
+ * paragraph-split-then-wrapParagraph pipeline layout() (fit()'s own
+ * internal layout step) uses, exposed standalone for callers that need
+ * PowerPoint's real wrapped line count at a KNOWN width without running the
+ * shrink-to-fit loop layout()/fit() also perform (e.g. the pptx adapter's
+ * spAutoFit box synthesis for a wrap="square" shape: it needs the ORIGINAL
+ * text's true wrapped line count at the shape's real declared width, not
+ * the raw per-paragraph count that's only correct for wrap="none"). Never
+ * reimplements wrapping - this is the same wrapParagraph call layout() makes,
+ * just without the fitsBox check or the font-size shrink loop around it.
+ */
+export function wrapLines(text: string, sizePt: number, wPt: number, font: FontSpec): string[] {
+  setFont(sizePt, font)
+  return text.split('\n').flatMap((par) => wrapParagraph(par, wPt))
+}
+
 function layout(
   text: string,
   sizePt: number,
