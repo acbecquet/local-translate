@@ -2,10 +2,10 @@
 // is locked by the plan - see "Task 3: overlay.ts" in
 // docs/superpowers/plans/2026-07-31-phase-3-image-text.md - and this module
 // implements it verbatim rather than improvising alternatives.
-import { Canvas, loadImage, type CanvasRenderingContext2D } from 'skia-canvas'
+import { loadImage, type CanvasRenderingContext2D } from 'skia-canvas'
 import type { FontSpec } from '../segments'
 import type { RegionBBox } from './regions'
-import { registerBundledFonts, resolveFamily } from '../fit/fonts'
+import { createCanvas, registerBundledFonts, resolveFamily } from '../fit/fonts'
 
 export interface OverlayRegion {
   bbox: RegionBBox
@@ -376,7 +376,7 @@ export async function renderOverlay(
   registerBundledFonts()
 
   const img = await loadImage(image)
-  const canvas = new Canvas(img.width, img.height)
+  const canvas = createCanvas(img.width, img.height)
   const ctx = canvas.getContext('2d')
   ctx.drawImage(img, 0, 0)
 

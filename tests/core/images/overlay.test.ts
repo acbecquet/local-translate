@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { Canvas, loadImage } from 'skia-canvas'
+import { loadImage } from 'skia-canvas'
 import { _internals, fit } from '../../../src/core/fit/fit-engine'
-import { registerBundledFonts } from '../../../src/core/fit/fonts'
+import { createCanvas, registerBundledFonts } from '../../../src/core/fit/fonts'
 import {
   _internals as overlayInternals,
   renderOverlay,
@@ -30,7 +30,7 @@ async function solidImageBuffer(
   color: string,
   format: 'png' | 'jpeg' = 'png'
 ): Promise<Buffer> {
-  const canvas = new Canvas(width, height)
+  const canvas = createCanvas(width, height)
   const ctx = canvas.getContext('2d')
   ctx.fillStyle = color
   ctx.fillRect(0, 0, width, height)
@@ -39,7 +39,7 @@ async function solidImageBuffer(
 
 async function decode(buffer: Buffer): Promise<Decoded> {
   const img = await loadImage(buffer)
-  const canvas = new Canvas(img.width, img.height)
+  const canvas = createCanvas(img.width, img.height)
   const ctx = canvas.getContext('2d')
   ctx.drawImage(img, 0, 0)
   const imageData = ctx.getImageData(0, 0, img.width, img.height)
@@ -126,7 +126,7 @@ describe('renderOverlay - background-sampled fill (behavior contract point 2)', 
     const width = 140
     const height = 80
     const red = { r: 200, g: 30, b: 30 }
-    const canvas = new Canvas(width, height)
+    const canvas = createCanvas(width, height)
     const ctx = canvas.getContext('2d')
     ctx.fillStyle = `rgb(${red.r}, ${red.g}, ${red.b})`
     ctx.fillRect(0, 0, width, height)
@@ -166,7 +166,7 @@ describe('renderOverlay - large regions (regression: spread over per-pixel array
     // regions on deck screenshots reach this size routinely.
     const width = 500
     const height = 400
-    const canvas = new Canvas(width, height)
+    const canvas = createCanvas(width, height)
     const ctx = canvas.getContext('2d')
     ctx.fillStyle = '#204060'
     ctx.fillRect(0, 0, width, height)
@@ -200,7 +200,7 @@ describe('renderOverlay - 2-means cluster branch (not just the uniform fallback)
     const height = 80
     const yellow = { r: 240, g: 220, b: 40 }
     const blue = { r: 20, g: 40, b: 200 }
-    const canvas = new Canvas(width, height)
+    const canvas = createCanvas(width, height)
     const ctx = canvas.getContext('2d')
     ctx.fillStyle = `rgb(${yellow.r}, ${yellow.g}, ${yellow.b})`
     ctx.fillRect(0, 0, width, height)
@@ -393,7 +393,7 @@ describe('renderOverlay + inkMatchedFontSizePt - pixel-exact ink height (polish 
     const origSizePt = 26
     const originalText = 'Hello'
 
-    const srcCanvas = new Canvas(width, height)
+    const srcCanvas = createCanvas(width, height)
     const srcCtx = srcCanvas.getContext('2d')
     srcCtx.fillStyle = '#ffffff'
     srcCtx.fillRect(0, 0, width, height)

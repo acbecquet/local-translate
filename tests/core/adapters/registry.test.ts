@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { Canvas } from 'skia-canvas'
+import { createCanvas } from '../../../src/core/fit/fonts'
 import { adapterFor } from '../../../src/core/adapters/adapter'
 import { buildAdapters } from '../../../src/core/adapters/registry'
 import type { RegionEngine, TextRegion } from '../../../src/core/images/regions'
@@ -65,7 +65,7 @@ describe('buildAdapters - pptx adapter receives regionEngine/sourceLang (Phase 3
   }
 
   async function makePngBytes(width: number, height: number): Promise<Buffer> {
-    const canvas = new Canvas(width, height)
+    const canvas = createCanvas(width, height)
     const ctx = canvas.getContext('2d')
     ctx.fillStyle = '#ffffff'
     ctx.fillRect(0, 0, width, height)

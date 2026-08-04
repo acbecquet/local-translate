@@ -5,7 +5,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import JSZip from 'jszip'
-import { Canvas } from 'skia-canvas'
+import { createCanvas } from '../../../src/core/fit/fonts'
 import {
   A_NS,
   P_NS,
@@ -24,7 +24,7 @@ import { buildPptx } from '../../helpers/build-pptx'
 
 /** A real, skia-canvas-decodable solid-color PNG - media byte tests need genuine encoded images, never raw/fake buffers. */
 async function makePngBytes(width: number, height: number, color = '#3366cc'): Promise<Buffer> {
-  const canvas = new Canvas(width, height)
+  const canvas = createCanvas(width, height)
   const ctx = canvas.getContext('2d')
   ctx.fillStyle = color
   ctx.fillRect(0, 0, width, height)

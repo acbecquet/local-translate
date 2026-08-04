@@ -5,7 +5,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import JSZip from 'jszip'
-import { Canvas, loadImage } from 'skia-canvas'
+import { loadImage } from 'skia-canvas'
 import type { Element } from '@xmldom/xmldom'
 import { A_NS, P_NS, elems, openPptx } from '../../../src/core/adapters/pptx/ooxml'
 import {
@@ -19,7 +19,7 @@ import {
   measureWidestLine,
   wrapLines
 } from '../../../src/core/fit/fit-engine'
-import { registerBundledFonts, resolveFamily } from '../../../src/core/fit/fonts'
+import { createCanvas, registerBundledFonts, resolveFamily } from '../../../src/core/fit/fonts'
 import type { TextSegment, TranslatedSegment } from '../../../src/core/segments'
 import {
   CONFIDENCE_FLOOR,
@@ -36,7 +36,7 @@ import { checkPptxIntegrity } from '../../helpers/pptx-integrity'
 
 /** A real, skia-canvas-decodable solid-color PNG - media region detection decodes real dimensions, so every fixture here must be a genuine encoded image, never a raw/fake buffer. */
 async function makePngBytes(width: number, height: number, color = '#ffffff'): Promise<Buffer> {
-  const canvas = new Canvas(width, height)
+  const canvas = createCanvas(width, height)
   const ctx = canvas.getContext('2d')
   ctx.fillStyle = color
   ctx.fillRect(0, 0, width, height)
@@ -44,7 +44,7 @@ async function makePngBytes(width: number, height: number, color = '#ffffff'): P
 }
 
 async function makeJpegBytes(width: number, height: number, color = '#ffffff'): Promise<Buffer> {
-  const canvas = new Canvas(width, height)
+  const canvas = createCanvas(width, height)
   const ctx = canvas.getContext('2d')
   ctx.fillStyle = color
   ctx.fillRect(0, 0, width, height)
@@ -71,7 +71,7 @@ const EMU_PER_PT = 12700
 /** Independent measurement helper (mirrors sizing.test.ts's own) - verifies
  * collectMediaSegments's font.sizePt against a fresh measurement rather than
  * checking pptx-adapter.ts's computation against itself. */
-const mediaMeasureCanvas = new Canvas(8, 8)
+const mediaMeasureCanvas = createCanvas(8, 8)
 const mediaMeasureCtx = mediaMeasureCanvas.getContext('2d')
 function mediaInkHeightAt(text: string, sizePt: number, family: string): number {
   const { family: resolved } = resolveFamily(family)
@@ -3728,7 +3728,7 @@ describe('embedded media - rotated-region parity with image-adapter.ts (polish r
       buffer: Buffer
     ): Promise<{ minX: number; minY: number; maxX: number; maxY: number; w: number; h: number }> {
       const img = await loadImage(buffer)
-      const canvas = new Canvas(img.width, img.height)
+      const canvas = createCanvas(img.width, img.height)
       const ctx = canvas.getContext('2d')
       ctx.drawImage(img, 0, 0)
       const data = ctx.getImageData(0, 0, img.width, img.height).data

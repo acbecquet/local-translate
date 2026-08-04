@@ -24,7 +24,8 @@
 // orchestration) from regions.ts's pure validation, matching how ppocr.ts,
 // overlay.ts and sizing.ts already each get their own sibling module for
 // their own distinct concern under src/core/images/.
-import { Canvas, loadImage } from 'skia-canvas'
+import { loadImage } from 'skia-canvas'
+import { createCanvas } from '../fit/fonts'
 import { iou, type RegionBBox, type RegionEngine, type TextRegion } from './regions'
 
 // Plan point 2: a rotated-pass region overlapping ANY normal-pass region
@@ -59,7 +60,7 @@ async function rotateClockwise(
   w: number,
   h: number
 ): Promise<Buffer> {
-  const canvas = new Canvas(h, w)
+  const canvas = createCanvas(h, w)
   const ctx = canvas.getContext('2d')
   ctx.translate(h / 2, w / 2)
   ctx.rotate(Math.PI / 2)
@@ -73,7 +74,7 @@ async function rotateCounterclockwise(
   w: number,
   h: number
 ): Promise<Buffer> {
-  const canvas = new Canvas(h, w)
+  const canvas = createCanvas(h, w)
   const ctx = canvas.getContext('2d')
   ctx.translate(h / 2, w / 2)
   ctx.rotate(-Math.PI / 2)

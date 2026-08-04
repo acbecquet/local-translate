@@ -107,6 +107,31 @@ export function resolveFamily(requested: string): { family: string; substituted:
   return { family: 'Noto Sans', substituted: true }
 }
 
+/**
+ * The one sanctioned way to construct a skia-canvas Canvas anywhere in this
+ * codebase - it forces CPU rendering (`gpu = false`) before first use.
+ *
+ * skia-canvas defaults to GPU rendering (Vulkan on Windows/Linux), which
+ * pulls the live GPU driver INTO this process: measured on the dev machine,
+ * a default Canvas loads amdvlk64.dll (twice, from two different driver
+ * stores), vulkan-1.dll, the d3d stack, and even third-party Vulkan overlay
+ * layers (RivaTuner's RTSSVkLayer64.dll) - none of which load with
+ * gpu=false. That is not a theoretical concern: the phase-3 gate runs died
+ * with a raw 0xC0000005 in the CLI's node process at the exact moment
+ * ollama's ROCm model load stormed the same discrete GPU our Vulkan context
+ * lived on (diagnosed 2026-08-04; the identical pipeline against a fake
+ * ollama server, no GPU load, runs clean end to end). A batch document
+ * pipeline gains nothing from GPU rasterization, and CPU rendering also
+ * matches CI's GPU-less runners exactly, so pixel tests assert the same
+ * rasterizer everywhere. A static policy test keeps `new Canvas(` calls
+ * from creeping in outside this function.
+ */
+export function createCanvas(width: number, height: number): Canvas {
+  const canvas = new Canvas(width, height)
+  canvas.gpu = false
+  return canvas
+}
+
 // This module is the only place that knows which canvas library backs text
 // measurement. Callers (fit-engine.ts and anything else that needs to measure
 // text) get a 2D context, not a canvas library, so swapping the backend never
@@ -115,7 +140,7 @@ let measurementCtx: CanvasRenderingContext2D | null = null
 
 export function measureCtx(): CanvasRenderingContext2D {
   if (!measurementCtx) {
-    const canvas = new Canvas(8, 8) // throwaway measurement surface, never rendered
+    const canvas = createCanvas(8, 8) // throwaway measurement surface, never rendered
     measurementCtx = canvas.getContext('2d')
   }
   return measurementCtx

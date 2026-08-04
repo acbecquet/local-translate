@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { Canvas } from 'skia-canvas'
-import { registerBundledFonts, resolveFamily } from '../../../src/core/fit/fonts'
+import { createCanvas, registerBundledFonts, resolveFamily } from '../../../src/core/fit/fonts'
 import { inkMatchedFontSizePt, sizingAxesFor } from '../../../src/core/images/sizing'
 import type { FontSpec } from '../../../src/core/segments'
 
@@ -10,7 +9,7 @@ registerBundledFonts()
 // own private measuredInkHeightPx, so these tests verify inkMatchedFontSizePt
 // against a fresh measurement rather than checking the implementation
 // against itself.
-const measureCanvas = new Canvas(8, 8)
+const measureCanvas = createCanvas(8, 8)
 const measureCtx = measureCanvas.getContext('2d')
 
 function inkHeightAt(text: string, sizePt: number, font: FontSpec): number {

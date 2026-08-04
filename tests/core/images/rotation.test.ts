@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
-import { Canvas, loadImage } from 'skia-canvas'
-import { registerBundledFonts } from '../../../src/core/fit/fonts'
+import { loadImage } from 'skia-canvas'
+import { createCanvas, registerBundledFonts } from '../../../src/core/fit/fonts'
 import {
   validateRegions,
   type RegionEngine,
@@ -13,7 +13,7 @@ registerBundledFonts()
 const { mapCwBBoxToOriginal, mapCcwBBoxToOriginal } = _internals
 
 async function solidPng(width: number, height: number, color = '#ffffff'): Promise<Buffer> {
-  const canvas = new Canvas(width, height)
+  const canvas = createCanvas(width, height)
   const ctx = canvas.getContext('2d')
   ctx.fillStyle = color
   ctx.fillRect(0, 0, width, height)
@@ -296,7 +296,7 @@ describe('withRotationPasses - real end-to-end rotation fixture (design point (b
     // environment).
     const width = 300
     const height = 200
-    const canvas = new Canvas(width, height)
+    const canvas = createCanvas(width, height)
     const ctx = canvas.getContext('2d')
     ctx.fillStyle = '#ffffff'
     ctx.fillRect(0, 0, width, height)

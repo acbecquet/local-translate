@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { Canvas, loadImage } from 'skia-canvas'
+import { loadImage } from 'skia-canvas'
 import {
   _internals as imageAdapterInternals,
   createImageAdapter
@@ -13,7 +13,7 @@ import {
   type RegionEngine,
   type TextRegion
 } from '../../../src/core/images/regions'
-import { registerBundledFonts, resolveFamily } from '../../../src/core/fit/fonts'
+import { createCanvas, registerBundledFonts, resolveFamily } from '../../../src/core/fit/fonts'
 import { _internals as fitInternals, fit } from '../../../src/core/fit/fit-engine'
 import type { FontSpec, TranslatedSegment } from '../../../src/core/segments'
 import { runPipeline } from '../../../src/core/pipeline'
@@ -24,7 +24,7 @@ registerBundledFonts()
 // Independent measurement helper (mirrors sizing.test.ts's own) - verifies
 // extract()'s font.sizePt against a fresh measurement rather than checking
 // image-adapter.ts's computation against itself.
-const measureCanvas = new Canvas(8, 8)
+const measureCanvas = createCanvas(8, 8)
 const measureCtx = measureCanvas.getContext('2d')
 function inkHeightAt(text: string, sizePt: number, font: FontSpec): number {
   const { family } = resolveFamily(font.family)
@@ -57,7 +57,7 @@ async function writePng(
 ): Promise<string> {
   const dir = newTmpDir()
   const file = path.join(dir, fileName)
-  const canvas = new Canvas(width, height)
+  const canvas = createCanvas(width, height)
   const ctx = canvas.getContext('2d')
   ctx.fillStyle = color
   ctx.fillRect(0, 0, width, height)
@@ -89,7 +89,7 @@ async function decodeFile(
   file: string
 ): Promise<{ width: number; height: number; data: Uint8ClampedArray }> {
   const img = await loadImage(await readFile(file))
-  const canvas = new Canvas(img.width, img.height)
+  const canvas = createCanvas(img.width, img.height)
   const ctx = canvas.getContext('2d')
   ctx.drawImage(img, 0, 0)
   const imageData = ctx.getImageData(0, 0, img.width, img.height)
@@ -667,7 +667,7 @@ describe('runPipeline pixel-exactness through the full pipeline (closes the gap:
     const origSizePt = 26
     const originalText = 'Hello'
 
-    const srcCanvas = new Canvas(width, height)
+    const srcCanvas = createCanvas(width, height)
     const srcCtx = srcCanvas.getContext('2d')
     srcCtx.fillStyle = '#ffffff'
     srcCtx.fillRect(0, 0, width, height)
