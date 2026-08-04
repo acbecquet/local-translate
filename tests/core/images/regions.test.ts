@@ -291,15 +291,20 @@ describe('validateRegions - rotated flag passthrough', () => {
     expect(result[0].rotated).toBe(true)
   })
 
-  it('marks a merged region rotated if either constituent was rotated, conservatively', () => {
-    const straight = region({ bbox: { x: 100, y: 100, w: 100, h: 20 }, text: 'Left' })
+  it('keeps a merged region rotated when the rotated constituent dominates the merge', () => {
+    // A genuinely rotated region must not lose its status by absorbing a
+    // small straight fragment. (Status conflicts resolve to the dominant-
+    // area contributor since the gate-round-2 fix - the symmetric case, a
+    // small rotated fragment poisoning a dominant straight region, is
+    // covered by the regression suite below.)
     const skewed = region({
-      bbox: { x: 120, y: 100, w: 100, h: 20 },
+      bbox: { x: 120, y: 95, w: 140, h: 30 },
       text: 'Right',
       rotated: true
     })
+    const straightSliver = region({ bbox: { x: 130, y: 100, w: 30, h: 20 }, text: 'Left' })
 
-    const result = validateRegions([straight, skewed], 1000, 1000)
+    const result = validateRegions([skewed, straightSliver], 1000, 1000)
 
     expect(result).toHaveLength(1)
     expect(result[0].rotated).toBe(true)
@@ -320,17 +325,65 @@ describe('validateRegions - rotation angle passthrough (polish round Task E)', (
     expect(result[0].rotation).toBe(-90)
   })
 
-  it('carries a rotation angle through a merge (defensive: rotation.ts already resolves rotated-pass overlaps before this ladder runs, but the angle must not be silently dropped if it ever does merge)', () => {
-    const straight = region({ bbox: { x: 100, y: 100, w: 100, h: 20 }, text: 'Left' })
+  it('carries a rotation angle through a merge when the angled constituent dominates it', () => {
+    // The angle must not be silently dropped when a genuine rotated region
+    // absorbs a small unrotated fragment - the dominant-area contributor
+    // decides orientation on conflict (gate-round-2 rule; the reverse
+    // direction is covered by the regression suite below).
     const rotated = region({
-      bbox: { x: 120, y: 100, w: 100, h: 20 },
+      bbox: { x: 120, y: 95, w: 140, h: 30 },
       text: 'Right',
       rotation: 90
     })
+    const straightSliver = region({ bbox: { x: 130, y: 100, w: 30, h: 20 }, text: 'Left' })
 
-    const result = validateRegions([straight, rotated], 1000, 1000)
+    const result = validateRegions([rotated, straightSliver], 1000, 1000)
 
     expect(result).toHaveLength(1)
     expect(result[0].rotation).toBe(90)
+  })
+})
+
+describe('validateRegions - merge orientation conflicts resolve to the dominant-area contributor (gate round 2 regression)', () => {
+  it('a small rotation-tagged fragment containment-merged into a large normal region must NOT re-orient it', () => {
+    // Real image8: a 24x15 rotated-pass re-read of one axis number merged
+    // into the 473x17 normal number row and its rotation tag made the whole
+    // row paint VERTICALLY over the chart.
+    const row = region({
+      bbox: { x: 92, y: 434, w: 473, h: 17 },
+      text: '20 25 30 35 40',
+      confidence: 1.0
+    })
+    const fragment = region({
+      bbox: { x: 91, y: 435, w: 24, h: 15 },
+      text: '20',
+      confidence: 1.0,
+      rotation: -90
+    })
+
+    const result = validateRegions([row, fragment], 640, 480)
+
+    expect(result).toHaveLength(1)
+    expect(result[0].rotation).toBeUndefined()
+    expect(result[0].rotated).toBeUndefined()
+  })
+
+  it('a tiny untagged noise box merged into a large rotated region must NOT strip its angle', () => {
+    const title = region({
+      bbox: { x: 10, y: 60, w: 30, h: 150 },
+      text: 'TPM (mg/puff)',
+      confidence: 0.9,
+      rotation: -90
+    })
+    const noise = region({
+      bbox: { x: 12, y: 65, w: 20, h: 12 },
+      text: 'no',
+      confidence: 0.9
+    })
+
+    const result = validateRegions([title, noise], 640, 480)
+
+    expect(result).toHaveLength(1)
+    expect(result[0].rotation).toBe(-90)
   })
 })

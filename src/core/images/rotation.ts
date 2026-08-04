@@ -46,6 +46,60 @@ const ROTATION_OVERLAP_IOU_THRESHOLD = 0.3
 // prescribed guard, polish round E).
 const ORPHAN_MIN_ASPECT = 2
 
+// Gate-round-2 fix (real-deck evidence, 2026-08-04): when a chart full of
+// ordinary horizontal text is rotated 90 degrees, PP-OCR reads each vertical
+// STRIP of the original as one long "line" - concatenating the y-axis
+// numbers, a slice of the title, an x-axis number and a legend fragment into
+// a single narrow full-height candidate. Those strips destroyed whole chart
+// images on the real deck: each one overlaps every individual normal-pass
+// box only slightly (IoU with a small box is tiny when the union is the
+// whole strip), so the IoU kill above never fires, and they are elongated,
+// so the orphan aspect guard passes them too. Two additional geometric kills
+// target exactly that shape:
+//
+// - SWALLOW: a candidate covering at least this fraction of some individual
+//   normal-pass region's area has consumed an established horizontal
+//   reading - real rotated text occupies space the normal pass saw nothing
+//   in (a strip down the y-axis number column fully contains several of the
+//   numbers; a genuine vertical axis title contains none).
+const SWALLOW_FRACTION = 0.5
+// - CROSSCUT: a candidate intersecting at least this many DISTINCT normal-
+//   pass regions is a strip cutting across the page's horizontal content
+//   (title + axis number + legend...), not a title sitting in clear margin
+//   space. Two is still allowed: a vertical title hugging a crowded axis may
+//   graze a neighboring tick label or two.
+const CROSSCUT_MIN_REGIONS = 3
+// - CONTAINED: a candidate mostly inside ONE normal-pass region (at least
+//   this fraction of the CANDIDATE's own area) is a rotated re-read of
+//   content the normal pass already owns. Real-deck evidence: the rotated
+//   passes re-detected individual x-axis numbers ("20", "35", mirror junk
+//   "OS") as 24x15 candidates sitting 96% inside the normal pass's merged
+//   473x17 number-row region - far too small against the row for IoU,
+//   swallow or crosscut to fire, and downstream they containment-merged
+//   INTO the row and re-tagged it rotated. Same shape on photos: "NEW COIL"
+//   re-read rotated inside the normal "NEW COIL2 OLD COIL1" label row.
+const CONTAINED_IN_NORMAL_FRACTION = 0.6
+
+// Opposite-direction passes frequently BOTH detect the same genuinely
+// rotated text - one reading it upright, the other reading it 180-degrees
+// flipped as confident gibberish ("TPM (mg/puff)" vs "(Jjnd/6w) WdL" on the
+// real deck; PP-OCR's internal orientation classifier is unreliable on
+// short runs). When the two readings DISAGREE and their confidences are
+// within this delta, there is no basis for picking one - and painting the
+// mirror reading defaces the exact case this feature exists for - so BOTH
+// are dropped and the original pixels stay (the firm gate constraint
+// prefers leaving content alone over painting a coin-flip). A clear
+// confidence winner is still kept, and candidates whose texts AGREE are an
+// ordinary duplicate (keep the higher-confidence one) regardless of delta.
+const AMBIGUOUS_CONFIDENCE_DELTA = 0.1
+
+/** Area of the intersection of two bboxes (0 when disjoint). */
+function intersectionArea(a: RegionBBox, b: RegionBBox): number {
+  const ix = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)
+  const iy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y)
+  return ix > 0 && iy > 0 ? ix * iy : 0
+}
+
 /**
  * Rotates `img` (dimensions W x H) 90 degrees CLOCKWISE into a new W x H -
  * swapped-to-H-x-W PNG buffer. Drawn via translate-to-new-center + rotate +
@@ -171,12 +225,18 @@ function overlapsAbove(a: RegionBBox, b: RegionBBox): boolean {
 }
 
 /**
- * Among candidates that mutually overlap above the threshold, keeps only the
- * highest-confidence one per overlap cluster - a fixpoint pairwise drop loop
- * mirroring regions.ts's own mergeOverlapping (same repeat-to-a-fixpoint
- * shape; DROP instead of merge, since two rotated-pass detections
- * disagreeing about the same text are a duplicate, not two real pieces of
- * content to join).
+ * Resolves rotated-vs-rotated overlaps (IoU above the shared threshold) to a
+ * fixpoint, mirroring regions.ts's own mergeOverlapping loop shape (DROP
+ * instead of merge, since two rotated-pass detections claiming the same spot
+ * are competing readings, not two real pieces of content to join):
+ *
+ * - Same text (trimmed): an ordinary duplicate - keep the higher-confidence
+ *   one.
+ * - Different text, confidence gap >= AMBIGUOUS_CONFIDENCE_DELTA: keep the
+ *   clear winner.
+ * - Different text, confidences within the delta: drop BOTH - an
+ *   irresolvable upright-vs-mirrored reading (see the constant's doc
+ *   comment); leaving the original pixels beats painting a coin-flip.
  */
 function dropLowerConfidenceOverlaps(regions: TextRegion[]): TextRegion[] {
   let current = regions.slice()
@@ -186,8 +246,13 @@ function dropLowerConfidenceOverlaps(regions: TextRegion[]): TextRegion[] {
     for (let i = 0; i < current.length && !changed; i++) {
       for (let j = i + 1; j < current.length; j++) {
         if (!overlapsAbove(current[i].bbox, current[j].bbox)) continue
-        const dropIndex = current[i].confidence >= current[j].confidence ? j : i
-        current = current.filter((_, idx) => idx !== dropIndex)
+        const a = current[i]
+        const b = current[j]
+        const sameText = a.text.trim() === b.text.trim()
+        const ambiguous =
+          !sameText && Math.abs(a.confidence - b.confidence) < AMBIGUOUS_CONFIDENCE_DELTA
+        const dropIndexes = ambiguous ? [i, j] : [a.confidence >= b.confidence ? j : i]
+        current = current.filter((_, idx) => !dropIndexes.includes(idx))
         changed = true
         break
       }
@@ -211,11 +276,25 @@ function dropLowerConfidenceOverlaps(regions: TextRegion[]): TextRegion[] {
  *    happened to set one) back into the original image's coordinate frame
  *    (see mapCwBBoxToOriginal/mapCcwBBoxToOriginal) and tags it with the
  *    corresponding `rotation` angle.
- * 4. Dedupes: a rotated-pass region overlapping (IoU > 0.3) any normal-pass
- *    region is dropped entirely (the normal pass wins - horizontal text also
- *    reads as confident garbage in a rotated frame); among rotated-pass
- *    regions overlapping EACH OTHER above the same threshold, only the
- *    highest-confidence one survives.
+ * 4. Dedupes and guards, in order: a rotated-pass region overlapping
+ *    (IoU > 0.3) any normal-pass region is dropped entirely (the normal
+ *    pass wins - horizontal text also reads as confident garbage in a
+ *    rotated frame); one that SWALLOWS an individual normal-pass region
+ *    (>= SWALLOW_FRACTION of that region's area) or CROSSCUTS
+ *    >= CROSSCUT_MIN_REGIONS distinct normal-pass regions is dropped as a
+ *    rotated-frame "strip" reading of ordinary horizontal content (the
+ *    failure mode that flattened real chart images at the round-2 gate);
+ *    one mostly CONTAINED inside a single normal-pass region
+ *    (CONTAINED_IN_NORMAL_FRACTION of its own area) is a rotated re-read of
+ *    already-owned content and dies too; zero-overlap orphans must be
+ *    elongated (ORPHAN_MIN_ASPECT); and among rotated-pass survivors
+ *    overlapping EACH OTHER, same-text duplicates keep the
+ *    higher-confidence copy while different-text conflicts keep a clear
+ *    confidence winner or - within AMBIGUOUS_CONFIDENCE_DELTA - drop both
+ *    (an upright-vs-mirrored reading nobody can adjudicate). Normal-pass
+ *    regions FLAGGED rotated are exempt from every kill above and are
+ *    instead superseded by any surviving rotated-pass reading that covers
+ *    them (the candidate read the same pixels the right way up).
  *
  * Returns the normal-pass regions plus every surviving rotated-pass region,
  * as ONE raw TextRegion[] - exactly the shape any RegionEngine already
@@ -254,28 +333,72 @@ export function withRotationPasses(engine: RegionEngine): RegionEngine {
       // drag its (otherwise clean) rival down with it when the winner is
       // then dropped in a second pass - see this module's test suite for the
       // exact scenario this ordering avoids.
-      const notOverlappingNormal = [...cwMapped, ...ccwMapped].filter(
-        (candidate) => !normalRegions.some((normal) => overlapsAbove(candidate.bbox, normal.bbox))
-      )
-      // Orphan guard: a rotated-pass candidate with ZERO overlap against any
-      // normal-pass region is content nothing else ever corroborated - the
-      // highest-risk shape for a hallucinated rotated paint (three passes
-      // triple the detector's chances to invent text in blank areas, and a
-      // wrongly painted ROTATED region is maximum-visibility damage). Real
-      // rotated text (vertical axis titles) is characteristically an
-      // elongated run, so orphans must additionally be elongated; candidates
-      // with SOME normal-pass overlap (IoU in (0, threshold]) have partial
-      // corroboration and pass as before.
-      const guarded = notOverlappingNormal.filter((candidate) => {
-        const touchesNormal = normalRegions.some((normal) => iou(candidate.bbox, normal.bbox) > 0)
-        if (touchesNormal) return true
+      // Normal-pass regions FLAGGED rotated (skewed polygon, or the
+      // vertical-shape signal ppocr.ts now emits) are in-place garble reads
+      // of genuinely rotated text - the one kind of normal-pass content a
+      // rotated-pass candidate is MORE trustworthy than, since the candidate
+      // read the same pixels the right way up. They are excluded from every
+      // kill below and superseded after dedup (see the return).
+      const flaggedNormals = normalRegions.filter((normal) => normal.rotated)
+      const cleanNormals = normalRegions.filter((normal) => !normal.rotated)
+
+      const guarded = [...cwMapped, ...ccwMapped].filter((candidate) => {
+        // (a) Same-spot conflict: the normal pass already established a
+        // horizontal reading here - it wins unconditionally.
+        if (cleanNormals.some((normal) => overlapsAbove(candidate.bbox, normal.bbox))) return false
+        // (b) SWALLOW, (c) CROSSCUT and (e) CONTAINED kills - the shapes
+        // that flattened real chart images at the round-2 gate; see the
+        // constants' doc comments for the evidence behind each.
+        const candidateArea = Math.max(1, candidate.bbox.w * candidate.bbox.h)
+        let crossed = 0
+        for (const normal of cleanNormals) {
+          const inter = intersectionArea(candidate.bbox, normal.bbox)
+          if (inter <= 0) continue
+          crossed += 1
+          const normalArea = Math.max(1, normal.bbox.w * normal.bbox.h)
+          if (inter / normalArea >= SWALLOW_FRACTION) return false
+          if (inter / candidateArea >= CONTAINED_IN_NORMAL_FRACTION) return false
+          if (crossed >= CROSSCUT_MIN_REGIONS) return false
+        }
+        if (crossed > 0) return true
+        // Overlapping an in-place garble of rotated text is corroboration,
+        // not orphanhood - two passes saw text at this spot.
+        if (flaggedNormals.some((n) => intersectionArea(candidate.bbox, n.bbox) > 0)) return true
+        // (d) Orphan guard: a candidate with ZERO overlap against any
+        // normal-pass region is content nothing else ever corroborated - the
+        // highest-risk shape for a hallucinated rotated paint. Real rotated
+        // text (vertical axis titles) is characteristically an elongated
+        // run, so orphans must additionally be elongated.
         const { w: bw, h: bh } = candidate.bbox
         const aspect = Math.max(bw, bh) / Math.max(1, Math.min(bw, bh))
         return aspect >= ORPHAN_MIN_ASPECT
       })
-      const survivors = dropLowerConfidenceOverlaps(guarded)
+      // Same-text veto: a rotated-pass candidate reading the SAME string as
+      // the flagged in-place garble it covers is not a better reading - it
+      // is the identical wrong-direction read reproduced from a rotated
+      // frame (the real deck's vertical title came back as "(nd/6w) Wd1"
+      // from BOTH the in-place read and the CCW pass). Promoting it would
+      // paint that garble's "translation" over the title; dropping it keeps
+      // the flagged region, which downstream skips - pixels stay intact.
+      const survivors = dropLowerConfidenceOverlaps(guarded).filter(
+        (s) =>
+          !flaggedNormals.some(
+            (normal) => overlapsAbove(s.bbox, normal.bbox) && normal.text.trim() === s.text.trim()
+          )
+      )
 
-      return [...normalRegions, ...survivors]
+      // Supersede: an in-place garble covered by a surviving (genuinely
+      // different) rotated-pass reading drops out entirely - keeping both
+      // would hand validateRegions an overlapping pair to containment-merge
+      // into nonsense. A flagged garble NO survivor claimed stays in the
+      // output: downstream adapters already skip rotated-without-angle
+      // regions, so it neither translates nor paints - the original pixels
+      // stay, which is the safe default.
+      const remainingFlagged = flaggedNormals.filter(
+        (normal) => !survivors.some((s) => overlapsAbove(s.bbox, normal.bbox))
+      )
+
+      return [...cleanNormals, ...remainingFlagged, ...survivors]
     }
   }
 }
@@ -286,7 +409,12 @@ export function withRotationPasses(engine: RegionEngine): RegionEngine {
 export const _internals = {
   ROTATION_OVERLAP_IOU_THRESHOLD,
   ORPHAN_MIN_ASPECT,
+  SWALLOW_FRACTION,
+  CROSSCUT_MIN_REGIONS,
+  CONTAINED_IN_NORMAL_FRACTION,
+  AMBIGUOUS_CONFIDENCE_DELTA,
   mapCwBBoxToOriginal,
   mapCcwBBoxToOriginal,
-  dropLowerConfidenceOverlaps
+  dropLowerConfidenceOverlaps,
+  intersectionArea
 }

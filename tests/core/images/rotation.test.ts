@@ -205,6 +205,256 @@ describe('withRotationPasses - orphan aspect guard (review finding: uncorroborat
   })
 })
 
+describe('withRotationPasses - chart-strip kills (gate round 2 regression: rotated passes flattened real chart images)', () => {
+  // Scaled reconstruction of the real deck's image8.png (640x480 matplotlib
+  // chart) whose entire plot got painted over by rotated-pass "strips": in
+  // the rotated frame PP-OCR reads each vertical strip of the original as
+  // one long line (y-axis numbers + a slice of the title + an x-axis number
+  // + a legend fragment concatenated). Each strip's IoU against every
+  // individual normal-pass box is far below the 0.3 kill threshold (the
+  // union is the whole strip), it touches normal content (which used to
+  // exempt it from the orphan aspect guard) and it is elongated - so before
+  // this fix EVERY defense passed it through.
+  const NORMALS = [
+    rawRegion({ bbox: { x: 140, y: 35, w: 360, h: 25 }, text: 'Chart Title', confidence: 0.95 }),
+    // y-axis tick numbers: a vertical column of small boxes at x ~ 28.
+    ...Array.from({ length: 9 }, (_, i) =>
+      rawRegion({
+        bbox: { x: 28, y: 55 + i * 42, w: 12, h: 16 },
+        text: `${9 - i}`,
+        confidence: 0.9
+      })
+    ),
+    rawRegion({ bbox: { x: 276, y: 428, w: 24, h: 16 }, text: '35', confidence: 0.9 }),
+    rawRegion({
+      bbox: { x: 250, y: 455, w: 140, h: 18 },
+      text: 'Number of Puffs',
+      confidence: 0.93
+    }),
+    rawRegion({ bbox: { x: 510, y: 65, w: 90, h: 80 }, text: 'BHHT-1 legend', confidence: 0.9 })
+  ]
+
+  it('SWALLOW kill: a full-height strip down the y-axis number column fully contains individual tick numbers and dies, despite sub-threshold IoU with each', async () => {
+    const buffer = await solidPng(640, 480)
+    // Original-frame strip {x:20,y:0,w:30,h:480} - forward CW map at H=480:
+    // x' = H-y-h = 0, y' = x = 20, w' = h = 480, h' = w = 30.
+    const columnStrip = rawRegion({
+      bbox: { x: 0, y: 20, w: 480, h: 30 },
+      text: '6 7 6 5 4 3 2 8',
+      confidence: 0.88
+    })
+    const { engine } = sequenceEngine(NORMALS, [columnStrip], [])
+
+    const result = await withRotationPasses(engine).detectRegions(buffer)
+
+    expect(result.some((r) => r.text === '6 7 6 5 4 3 2 8')).toBe(false)
+    expect(result).toHaveLength(NORMALS.length)
+  })
+
+  it('CROSSCUT kill: a full-height strip crossing title + x-number + xlabel (swallowing none of them) dies for cutting across 3+ established readings', async () => {
+    const buffer = await solidPng(640, 480)
+    // Original-frame strip {x:290,y:0,w:30,h:480}: slices 8% of the title,
+    // 21% of the xlabel and 42% of the '35' tick - never >= SWALLOW_FRACTION
+    // of any single one, but crosses three distinct normal regions.
+    // Forward CW map at H=480: {x:0,y:290,w:480,h:30}.
+    const crossStrip = rawRegion({
+      bbox: { x: 0, y: 290, w: 480, h: 30 },
+      text: 'rt Ti 35 of Pu',
+      confidence: 0.87
+    })
+    const { engine } = sequenceEngine(NORMALS, [crossStrip], [])
+
+    const result = await withRotationPasses(engine).detectRegions(buffer)
+
+    expect(result.some((r) => r.text === 'rt Ti 35 of Pu')).toBe(false)
+    expect(result).toHaveLength(NORMALS.length)
+  })
+
+  it('a genuine vertical axis title in the clear left margin still survives the same scene', async () => {
+    const buffer = await solidPng(640, 480)
+    // Original-frame title {x:6,y:140,w:20,h:180}: left of the tick-number
+    // column, zero overlap with every normal region, aspect 9 - the real
+    // "TPM (mg/puff)" shape. Forward CW map at H=480: x' = 480-140-180 =
+    // 160, y' = 6 -> {x:160,y:6,w:180,h:20}.
+    const axisTitle = rawRegion({
+      bbox: { x: 160, y: 6, w: 180, h: 20 },
+      text: 'TPM (mg/puff)',
+      confidence: 0.9
+    })
+    const { engine } = sequenceEngine(NORMALS, [axisTitle], [])
+
+    const result = await withRotationPasses(engine).detectRegions(buffer)
+
+    const title = result.find((r) => r.text === 'TPM (mg/puff)')
+    expect(title?.bbox).toEqual({ x: 6, y: 140, w: 20, h: 180 })
+    expect(title?.rotation).toBe(-90)
+  })
+
+  it('SWALLOW kill fires even for a compact (non-strip) candidate that consumes a whole normal region at sub-threshold IoU', async () => {
+    const buffer = await solidPng(640, 480)
+    const normal = rawRegion({
+      bbox: { x: 100, y: 100, w: 40, h: 20 },
+      text: 'Real',
+      confidence: 0.9
+    })
+    // Original-frame candidate {x:80,y:90,w:120,h:60}: fully contains the
+    // normal region (100% of its area) but IoU is only 800/7200 ~ 0.11 -
+    // below the 0.3 same-spot kill. Forward CW map at H=480:
+    // x' = 480-90-60 = 330, y' = 80 -> {x:330,y:80,w:60,h:120}.
+    const swallower = rawRegion({
+      bbox: { x: 330, y: 80, w: 60, h: 120 },
+      text: 'engulfing read',
+      confidence: 0.92
+    })
+    const { engine } = sequenceEngine([normal], [swallower], [])
+
+    const result = await withRotationPasses(engine).detectRegions(buffer)
+
+    expect(result.map((r) => r.text)).toEqual(['Real'])
+  })
+})
+
+describe('withRotationPasses - CONTAINED kill (gate round 2: rotated re-reads of single axis numbers inside the merged number row)', () => {
+  it('drops a small rotated candidate sitting mostly inside one normal-pass region, despite tiny IoU', async () => {
+    const buffer = await solidPng(640, 480)
+    // The real image8 geometry: the normal pass merges the x-axis numbers
+    // into one wide row {x:92,y:434,w:473,h:17}; a rotated pass re-detects
+    // the single number "20" as {x:91,y:435,w:24,h:15} - 96% of the
+    // candidate is inside the row while IoU is only ~0.04. Forward CW map of
+    // the candidate at H=480: x' = 480-435-15 = 30, y' = 91 ->
+    // {x:30,y:91,w:15,h:24}.
+    const numberRow = rawRegion({
+      bbox: { x: 92, y: 434, w: 473, h: 17 },
+      text: '20 25 30 35 40 45 50 55 60',
+      confidence: 1.0
+    })
+    const reRead = rawRegion({
+      bbox: { x: 30, y: 91, w: 15, h: 24 },
+      text: '20',
+      confidence: 1.0
+    })
+    const { engine } = sequenceEngine([numberRow], [reRead], [])
+
+    const result = await withRotationPasses(engine).detectRegions(buffer)
+
+    expect(result).toHaveLength(1)
+    expect(result[0].text).toBe('20 25 30 35 40 45 50 55 60')
+    expect(result[0].rotation).toBeUndefined()
+  })
+})
+
+describe('withRotationPasses - flagged in-place garbles are superseded, never merged over (gate round 2: vertical title translation)', () => {
+  // The real image8 vertical title: the normal pass reads "TPM (mg/puff)"
+  // in place as the garble "(nd/6w) Wd1" in a 24x108 box (now flagged
+  // rotated by ppocr.ts's vertical-shape signal); the CW pass reads the
+  // same pixels upright. Original-frame spot {x:36,y:190,w:24,h:108};
+  // forward CW map at H=480: x' = 480-190-108 = 182, y' = 36 ->
+  // {x:182,y:36,w:108,h:24}.
+  const garble = rawRegion({
+    bbox: { x: 36, y: 190, w: 24, h: 108 },
+    text: '(nd/6w) Wd1',
+    confidence: 0.89,
+    rotated: true
+  })
+  const uprightReading = rawRegion({
+    bbox: { x: 182, y: 36, w: 108, h: 24 },
+    text: 'TPM (mg/puff)',
+    confidence: 0.9
+  })
+
+  it('a surviving rotated-pass reading replaces the flagged garble at the same spot', async () => {
+    const buffer = await solidPng(640, 480)
+    const { engine } = sequenceEngine([garble], [uprightReading], [])
+
+    const result = await withRotationPasses(engine).detectRegions(buffer)
+
+    expect(result).toHaveLength(1)
+    expect(result[0].text).toBe('TPM (mg/puff)')
+    expect(result[0].bbox).toEqual({ x: 36, y: 190, w: 24, h: 108 })
+    expect(result[0].rotation).toBe(-90)
+  })
+
+  it('a rotated-pass candidate reading the SAME text as the flagged garble does NOT supersede it - identical wrong read, pixels stay', async () => {
+    const buffer = await solidPng(640, 480)
+    // Same spot as the garble, same string - the CCW pass reproducing the
+    // in-place mirror reading (observed verbatim on the real deck). Forward
+    // CCW map of {x:36,y:190,w:24,h:108} at W=640: x' = y = 190,
+    // y' = W-x-w = 580 -> {x:190,y:580,w:108,h:24}.
+    const sameGarble = rawRegion({
+      bbox: { x: 190, y: 580, w: 108, h: 24 },
+      text: '(nd/6w) Wd1',
+      confidence: 0.91
+    })
+    const { engine } = sequenceEngine([garble], [], [sameGarble])
+
+    const result = await withRotationPasses(engine).detectRegions(buffer)
+
+    expect(result).toHaveLength(1)
+    expect(result[0].text).toBe('(nd/6w) Wd1')
+    expect(result[0].rotated).toBe(true)
+    expect(result[0].rotation).toBeUndefined()
+  })
+
+  it('a flagged garble no rotated-pass reading claims stays in the output (downstream skips it, pixels stay)', async () => {
+    const buffer = await solidPng(640, 480)
+    const { engine } = sequenceEngine([garble], [], [])
+
+    const result = await withRotationPasses(engine).detectRegions(buffer)
+
+    expect(result).toHaveLength(1)
+    expect(result[0].text).toBe('(nd/6w) Wd1')
+    expect(result[0].rotated).toBe(true)
+  })
+})
+
+describe('withRotationPasses - opposite-pass reading ambiguity (gate round 2: mirror readings painted over real titles)', () => {
+  const { dropLowerConfidenceOverlaps, AMBIGUOUS_CONFIDENCE_DELTA } = _internals
+  const spot = { x: 10, y: 60, w: 20, h: 100 }
+
+  it('drops BOTH candidates when opposite passes disagree about the text within the confidence delta - original pixels beat a coin-flip', () => {
+    const upright = rawRegion({
+      bbox: spot,
+      text: 'TPM (mg/puff)',
+      confidence: 0.86,
+      rotation: -90
+    })
+    const mirrored = rawRegion({
+      bbox: spot,
+      text: '(Jjnd/6w) WdL',
+      confidence: 0.82,
+      rotation: 90
+    })
+    expect(Math.abs(upright.confidence - mirrored.confidence)).toBeLessThan(
+      AMBIGUOUS_CONFIDENCE_DELTA
+    )
+
+    expect(dropLowerConfidenceOverlaps([upright, mirrored])).toEqual([])
+  })
+
+  it('keeps the clear confidence winner when the gap is at least the delta', () => {
+    const upright = rawRegion({
+      bbox: spot,
+      text: 'TPM (mg/puff)',
+      confidence: 0.95,
+      rotation: -90
+    })
+    const mirrored = rawRegion({ bbox: spot, text: '(Jjnd/6w) WdL', confidence: 0.5, rotation: 90 })
+
+    const result = dropLowerConfidenceOverlaps([upright, mirrored])
+    expect(result).toHaveLength(1)
+    expect(result[0].text).toBe('TPM (mg/puff)')
+  })
+
+  it('treats same-text candidates as an ordinary duplicate regardless of the delta - keeps the higher-confidence copy', () => {
+    const a = rawRegion({ bbox: spot, text: 'TPM (mg/puff)', confidence: 0.86, rotation: -90 })
+    const b = rawRegion({ bbox: spot, text: 'TPM (mg/puff) ', confidence: 0.82, rotation: 90 })
+
+    const result = dropLowerConfidenceOverlaps([a, b])
+    expect(result).toHaveLength(1)
+    expect(result[0].confidence).toBe(0.86)
+  })
+})
+
 describe('withRotationPasses - rotated-pass-vs-rotated-pass dedup keeps the higher confidence (design point 2)', () => {
   it('drops the lower-confidence rotated candidate when a CW-pass and a CCW-pass region map to overlapping original bboxes', async () => {
     // Both candidates map back to the SAME original bbox {x:10,y:10,w:8,

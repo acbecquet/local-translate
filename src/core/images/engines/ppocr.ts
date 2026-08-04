@@ -44,6 +44,24 @@ function isRotated(box: number[][]): boolean {
   return angleDeg > ROTATION_THRESHOLD_DEG
 }
 
+// Second rotated-text signal (gate round 2 evidence): a vertical axis title
+// can come back from detection as a perfectly AXIS-ALIGNED tall box - the
+// TL->TR edge is horizontal, so the angle proxy above never fires - while
+// recognition still reads its glyphs sideways into confident garbage (the
+// real deck's "TPM (mg/puff)" title detected at 24x108, angle ~0, read as
+// "(nd/6w) Wd1" at 0.89 - which then translated and painted HORIZONTALLY
+// over the vertical title). A box that is substantially taller than wide
+// while holding several characters cannot be an ordinary horizontal line;
+// single/double-character boxes (a tall thin "5" on an axis) are exempt.
+const VERTICAL_SHAPE_MIN_ASPECT = 1.5
+const VERTICAL_SHAPE_MIN_CHARS = 3
+function isVerticalShape(bbox: RegionBBox, text: string): boolean {
+  const chars = text.replace(/\s/g, '').length
+  return (
+    chars >= VERTICAL_SHAPE_MIN_CHARS && bbox.h / Math.max(1, bbox.w) >= VERTICAL_SHAPE_MIN_ASPECT
+  )
+}
+
 function boxToBBox(box: number[][]): RegionBBox {
   const xs = box.map((p) => p[0])
   const ys = box.map((p) => p[1])
@@ -117,13 +135,16 @@ export function createPPOcrEngine(): RegionEngine {
         const withBox = lines.filter(
           (line): line is OcrLine & { box: number[][] } => !!line.box && line.box.length > 0
         )
-        return withBox.map((line, i) => ({
-          id: `r${i + 1}`,
-          bbox: boxToBBox(line.box),
-          text: line.text,
-          confidence: line.mean,
-          rotated: isRotated(line.box)
-        }))
+        return withBox.map((line, i) => {
+          const bbox = boxToBBox(line.box)
+          return {
+            id: `r${i + 1}`,
+            bbox,
+            text: line.text,
+            confidence: line.mean,
+            rotated: isRotated(line.box) || isVerticalShape(bbox, line.text)
+          }
+        })
       } finally {
         await unlink(tmpPath).catch(() => {})
       }

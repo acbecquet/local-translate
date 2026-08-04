@@ -236,6 +236,50 @@ describe('createPPOcrEngine - rotated flag', () => {
     expect(regions[0].rotated).toBe(false)
   })
 
+  it('flags rotated:true for an axis-aligned but VERTICAL-shaped multi-char box (gate round 2: in-place garble of a vertical axis title)', async () => {
+    // The real deck's "TPM (mg/puff)" came back as a perfectly axis-aligned
+    // 24x108 box (TL->TR edge horizontal - the angle proxy reads 0) whose
+    // text was read sideways into "(nd/6w) Wd1"; unflagged, it translated
+    // and painted horizontally over the vertical title.
+    mocks.detect.mockResolvedValue([
+      {
+        text: '(nd/6w) Wd1',
+        mean: 0.89,
+        box: [
+          [36, 190],
+          [60, 190],
+          [60, 298],
+          [36, 298]
+        ]
+      }
+    ])
+    const engine = createPPOcrEngine()
+
+    const regions = await engine.detectRegions(pngBuffer())
+
+    expect(regions[0].rotated).toBe(true)
+  })
+
+  it('does NOT flag a tall-but-short-text box (a thin axis digit) as rotated', async () => {
+    mocks.detect.mockResolvedValue([
+      {
+        text: '5',
+        mean: 0.97,
+        box: [
+          [61, 214],
+          [72, 214],
+          [72, 233],
+          [61, 233]
+        ]
+      }
+    ])
+    const engine = createPPOcrEngine()
+
+    const regions = await engine.detectRegions(pngBuffer())
+
+    expect(regions[0].rotated).toBe(false)
+  })
+
   it('flags rotated:true when the detection polygon is significantly skewed from axis-aligned', async () => {
     mocks.detect.mockResolvedValue([
       {

@@ -198,25 +198,33 @@ function mergeOverlapping(regions: TextRegion[]): TextRegion[] {
         const [first, second] = readsBefore(current[i], current[j])
           ? [current[i], current[j]]
           : [current[j], current[i]]
+        // Orientation of the merged region: when the two sides AGREE on
+        // rotation status, carry it through unchanged (a rotated region that
+        // survives merged still counts as paintable-rotated rather than
+        // silently losing its angle). When they DISAGREE, the dominant-area
+        // contributor decides BOTH fields: at the round-2 gate a 24x15
+        // rotated-pass re-read of one axis number got containment-merged
+        // into the 473x17 normal-pass number row and its rotation -90 tag
+        // poisoned the whole row - which then painted VERTICALLY over the
+        // chart. A sliver must never re-orient the content that dominates
+        // the merge; symmetrically, a tiny horizontal noise box must not
+        // strip a genuine vertical title of its angle.
+        const statusConflict =
+          (current[i].rotation ?? null) !== (current[j].rotation ?? null) ||
+          (current[i].rotated ?? false) !== (current[j].rotated ?? false)
+        const dominant =
+          bboxArea(current[i].bbox) >= bboxArea(current[j].bbox) ? current[i] : current[j]
         const merged: TextRegion = {
           id: first.id,
           bbox: unionBBox(current[i].bbox, current[j].bbox),
           text: `${first.text} ${second.text}`,
           confidence: Math.min(current[i].confidence, current[j].confidence),
-          rotated: current[i].rotated || current[j].rotated ? true : undefined,
-          // Carries a known rotation angle through a merge exactly like
-          // `rotated` above, so a region that survives merged still counts
-          // as paintable-rotated rather than silently losing the angle. In
-          // practice this rarely fires: rotation.ts's own dedup already
-          // resolves any rotated-pass pair whose overlap would meet ITS
-          // (lower) 0.3 IoU threshold before this ladder ever runs, and this
-          // ladder's own merge threshold (0.5 IoU / 0.8 containment) is
-          // strictly higher - so two DIFFERENT-orientation rotated regions
-          // should never both survive to reach here overlapping enough to
-          // merge. Guards the case anyway rather than assuming it can't
-          // happen: `first.rotation ?? second.rotation` prefers whichever
-          // constituent has an angle (both should agree when this does fire).
-          rotation: first.rotation ?? second.rotation
+          rotated: statusConflict
+            ? dominant.rotated
+            : current[i].rotated || current[j].rotated
+              ? true
+              : undefined,
+          rotation: statusConflict ? dominant.rotation : (first.rotation ?? second.rotation)
         }
         current = [
           ...current.slice(0, i),
