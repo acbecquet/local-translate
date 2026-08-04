@@ -84,6 +84,51 @@ if (!def) {
   throw new Error(`no evidence definition for ${phase}; add it to PHASES in this script`)
 }
 
+// --report-only rebuilds the README (incl. fit tables) from artifacts already
+// on disk, without re-running any translations (no model, no GPU).
+const reportOnly = process.argv.includes('--report-only')
+
+// Commit-headroom preflight (Windows): a live run charges system commit from
+// two sides at once - the CLI's node process (OCR sessions, image buffers,
+// extract working set) plus ollama's model load (ROCm host allocations). On a
+// machine whose commit is already mostly leaked away (this box's documented
+// driver-leak pattern: tens of GB of commit charged with no owning process),
+// that combination dies as a raw access violation mid-run AND deepens the
+// leak. Refusing up front with a clear message is the machine rule ("never
+// overcommit, never crash-retry") in code. Threshold is deliberately generous:
+// a healthy reboot leaves 25+ GB free, a leaked state leaves < 10.
+const MIN_COMMIT_HEADROOM_GB = 12
+function commitHeadroomGb() {
+  if (process.platform !== 'win32') return Infinity
+  try {
+    const kb = Number(
+      execSync(
+        'powershell -NoProfile -Command "(Get-CimInstance Win32_OperatingSystem).FreeVirtualMemory"',
+        { timeout: 30_000 }
+      )
+        .toString()
+        .trim()
+    )
+    // Unparseable output must not block a run - this guard only ever refuses
+    // on a POSITIVE reading of exhaustion, never on a failed measurement.
+    return Number.isFinite(kb) && kb > 0 ? (kb * 1024) / 1024 ** 3 : Infinity
+  } catch {
+    return Infinity
+  }
+}
+if (!reportOnly) {
+  const headroom = commitHeadroomGb()
+  if (headroom < MIN_COMMIT_HEADROOM_GB) {
+    console.error(
+      `[evidence] REFUSING to run: only ${headroom.toFixed(1)} GB of system commit ` +
+        `headroom is available (need ${MIN_COMMIT_HEADROOM_GB} GB). This machine is ` +
+        `likely in its leaked-commit state - running now would crash mid-run with an ` +
+        `access violation and deepen the leak. Reboot, then re-run.`
+    )
+    process.exit(3)
+  }
+}
+
 const outDir = path.join(root, 'EVIDENCE', phase)
 mkdirSync(outDir, { recursive: true })
 const commit = execSync('git rev-parse --short HEAD', { cwd: root }).toString().trim()
@@ -101,10 +146,6 @@ for (const orig of originals) {
   copyFileSync(path.join(root, orig), path.join(outDir, name))
 }
 const originalName = originalNames.get(def.original)
-
-// --report-only rebuilds the README (incl. fit tables) from artifacts already
-// on disk, without re-running any translations (no model, no GPU).
-const reportOnly = process.argv.includes('--report-only')
 
 const rows = []
 for (const run of def.runs) {
