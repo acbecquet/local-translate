@@ -408,6 +408,50 @@ describe('OllamaConnection.stop(): terminates the spawned child and removes the 
     await conn.stop()
     await expect(conn.stop()).resolves.toBeUndefined()
   })
+
+  // Gate round 4 regression, REAL process tree: the fixture spawns a child
+  // standing in for real ollama's llama-server runner - a process that
+  // ignores its parent's death entirely. stop() must reap it via the
+  // Windows tree-kill; the old kill-then-taskkill order left exactly this
+  // child alive forever (one leaked runner with a loaded model per run).
+  // Windows-only: the tree-kill primitive is taskkill; posix ollama reaps
+  // its own runners on SIGTERM instead (see terminatePid's doc comment).
+  it.skipIf(process.platform !== 'win32')(
+    'reaps the spawned server\'s CHILD process too (the "llama-server runner" leak)',
+    async () => {
+      const childPidFile = path.join(appDataDir, 'runner-child.pid')
+      process.env.OLLAMA_FAKE_SERVE_SPAWN_CHILD = childPidFile
+      let childPid: number | null = null
+      try {
+        const conn = await ensureOllama({
+          appDataDir,
+          exePath: 'unused-under-seam',
+          probeUrl: `http://127.0.0.1:${deadPort}`,
+          port: spawnPort
+        })
+        childPid = Number(await readFile(childPidFile, 'utf8'))
+        expect(isAlive(childPid)).toBe(true)
+
+        await conn.stop()
+
+        // taskkill /T /F is synchronous-ish but give the OS a beat.
+        const deadline = Date.now() + 3000
+        while (Date.now() < deadline && isAlive(childPid)) {
+          await new Promise((r) => setTimeout(r, 50))
+        }
+        expect(isAlive(childPid)).toBe(false)
+      } finally {
+        delete process.env.OLLAMA_FAKE_SERVE_SPAWN_CHILD
+        if (childPid && isAlive(childPid)) {
+          try {
+            process.kill(childPid)
+          } catch {
+            // already gone
+          }
+        }
+      }
+    }
+  )
 })
 
 // --- 4. crash-orphan cleanup on ensureOllama start ---
@@ -591,36 +635,79 @@ describe('findOllamaExe', () => {
   })
 })
 
-// --- _internals.terminatePid: deterministic unit test of the grace-window/taskkill fallback ---
+// --- _internals.terminatePid: deterministic unit tests of both platform orders ---
 
-describe('_internals.terminatePid', () => {
-  // Important-2 regression: the taskkill tree-kill must run unconditionally
-  // after the grace window, not only when the top-level pid is still alive
-  // at that point - see the doc comment on terminatePid() for why gating it
-  // on isAlive(pid) made the tree-kill effectively unreachable on Windows.
+describe('_internals.terminatePid - Windows order (gate round 4 regression: tree-kill FIRST)', () => {
+  // taskkill /T can only enumerate descendants of a LIVING root: the old
+  // kill-then-taskkill order terminated the root instantly (TerminateProcess
+  // is never graceful), so the later tree-kill found nothing and every
+  // spawned-server run leaked one immortal llama-server runner. Found live:
+  // four orphaned runners, all parents dead, ~25 GB of commit unattributed.
 
-  it('kills, then still runs the tree-kill even though the process died immediately', async () => {
+  it('runs the tree-kill FIRST, while the root is still alive, then waits out its disappearance', async () => {
     let alive = true
     const calls: string[] = []
     await _internals.terminatePid(4242, 50, {
+      platform: 'win32',
+      isAlive: () => {
+        calls.push(`isAlive:${alive}`)
+        return alive
+      },
+      kill: () => calls.push('kill'),
+      forceKill: async (pid: number) => {
+        calls.push(`forceKill:${pid}`)
+        alive = false // taskkill /T /F reaps root + descendants together
+      },
+      delay: (ms: number) => new Promise((r) => setTimeout(r, ms))
+    })
+    // forceKill is the FIRST call of any kind - notably BEFORE any liveness
+    // check or polite kill could take the root down and orphan the tree.
+    expect(calls[0]).toBe('forceKill:4242')
+    expect(calls).not.toContain('kill')
+  })
+
+  it('returns after the grace window even if the root somehow survives the tree-kill', async () => {
+    const calls: string[] = []
+    await _internals.terminatePid(4242, 20, {
+      platform: 'win32',
+      isAlive: () => true,
+      kill: () => calls.push('kill'),
+      forceKill: async (pid: number) => {
+        calls.push(`forceKill:${pid}`)
+      },
+      delay: (ms: number) => new Promise((r) => setTimeout(r, ms))
+    })
+    expect(calls).toEqual(['forceKill:4242'])
+  })
+})
+
+describe('_internals.terminatePid - POSIX order (graceful SIGTERM, then grace window, then force)', () => {
+  // posix ollama traps SIGTERM and reaps its own runners, so the polite
+  // phase is genuinely useful there - and forceKillPid falls back to
+  // SIGKILL (no taskkill on posix).
+
+  it('kills, then still runs the force-kill even though the process died immediately', async () => {
+    let alive = true
+    const calls: string[] = []
+    await _internals.terminatePid(4242, 50, {
+      platform: 'linux',
       isAlive: () => alive,
       kill: () => {
         calls.push('kill')
-        alive = false // simulate the process reacting to kill() promptly
+        alive = false // simulate the process reacting to SIGTERM promptly
       },
       forceKill: async (pid: number) => {
         calls.push(`forceKill:${pid}`)
       },
       delay: (ms: number) => new Promise((r) => setTimeout(r, ms))
     })
-    // forceKill still runs - it's what actually reaps any subprocess tree,
-    // which an isAlive(pid) check on the top-level pid alone can't see.
     expect(calls).toEqual(['kill', 'forceKill:4242'])
   })
 
-  it('kills, waits out the grace window, then runs the tree-kill when the pid stays alive throughout', async () => {
+  it('kills, waits out the grace window, then force-kills when the pid stays alive throughout', async () => {
     const calls: string[] = []
     await _internals.terminatePid(4242, 20, {
+      platform: 'linux',
       isAlive: () => true, // never reacts to kill() on its own
       kill: () => calls.push('kill'),
       forceKill: async (pid: number) => {
@@ -631,9 +718,10 @@ describe('_internals.terminatePid', () => {
     expect(calls).toEqual(['kill', 'forceKill:4242'])
   })
 
-  it('skips kill() but still runs the tree-kill (as a safe no-op) when the pid was already dead at entry', async () => {
+  it('skips kill() but still runs the force-kill (as a safe no-op) when the pid was already dead at entry', async () => {
     const calls: string[] = []
     await _internals.terminatePid(4242, 50, {
+      platform: 'linux',
       isAlive: () => false,
       kill: () => calls.push('kill'),
       forceKill: async (pid: number) => {
@@ -641,8 +729,32 @@ describe('_internals.terminatePid', () => {
       },
       delay: (ms: number) => new Promise((r) => setTimeout(r, ms))
     })
-    // No point calling kill() on a pid that's already gone, but the
-    // tree-kill still runs in case a subprocess it spawned is lingering.
     expect(calls).toEqual(['forceKill:4242'])
+  })
+})
+
+// --- _internals.findOrphanedRunnerPids: pure decision arm of the orphan sweep ---
+
+describe('_internals.findOrphanedRunnerPids', () => {
+  const processes = [
+    { pid: 100, ppid: 50, name: 'llama-server.exe' }, // parent alive -> keep
+    { pid: 101, ppid: 51, name: 'llama-server.exe' }, // parent dead -> orphan
+    { pid: 102, ppid: 52, name: 'llama-server' }, // exe-less name variant, parent dead -> orphan
+    { pid: 103, ppid: 53, name: 'notepad.exe' }, // not a runner -> never touched
+    { pid: 104, ppid: 54, name: 'my-llama-server.exe' } // name must match exactly, not substring
+  ]
+  const livePids = new Set([50])
+
+  it('returns exactly the llama-server processes whose parent is dead', () => {
+    const orphans = _internals.findOrphanedRunnerPids(processes, (pid) => livePids.has(pid))
+    expect(orphans).toEqual([101, 102])
+  })
+
+  it('returns nothing when every runner has a living parent (e.g. the desktop app is up)', () => {
+    const orphans = _internals.findOrphanedRunnerPids(
+      processes.filter((p) => p.name.startsWith('llama-server')),
+      () => true
+    )
+    expect(orphans).toEqual([])
   })
 })

@@ -85,6 +85,19 @@ export async function ensureOllama(opts: {
   // server happens to answer the probe.
   await cleanupStalePidFile(opts.appDataDir)
 
+  // 5. Orphaned-runner sweep (gate round 4): llama-server runners whose
+  // parent server died (a crashed run, or any run before the tree-kill-first
+  // fix) hold their loaded model in VRAM/host commit FOREVER - nothing else
+  // ever reaps them, and a handful of them exhausts the machine's commit
+  // until a reboot. Best-effort and Windows-only; see reapOrphanedRunners.
+  const reaped = await reapOrphanedRunners().catch(() => [] as number[])
+  if (reaped.length > 0) {
+    console.warn(
+      `ollama lifecycle: reaped ${reaped.length} orphaned llama-server runner(s) (pids ${reaped.join(', ')}) - ` +
+        'leaked by a crashed or pre-fix run; their parent server was gone'
+    )
+  }
+
   // 1. A server (the user's own, or one from a previous run of this app) is
   // already listening there - use it as-is and never touch its lifecycle.
   if (await probeVersion(probeUrl)) {
@@ -389,35 +402,53 @@ async function imageNameForPid(pid: number): Promise<string | null> {
 }
 
 async function forceKillPid(pid: number): Promise<void> {
+  if (process.platform === 'win32') {
+    try {
+      await execFileAsync('taskkill', ['/pid', String(pid), '/T', '/F'])
+    } catch {
+      // Already gone, or we lack permission - either way there's nothing more we can do.
+    }
+    return
+  }
+  // POSIX has no taskkill: SIGKILL the pid directly (the graceful SIGTERM in
+  // terminatePid below already gave real ollama the chance to reap its own
+  // runners - posix ollama traps SIGTERM; Windows TerminateProcess never
+  // delivers one, which is why the win32 path can't rely on that at all).
   try {
-    await execFileAsync('taskkill', ['/pid', String(pid), '/T', '/F'])
+    process.kill(pid, 'SIGKILL')
   } catch {
-    // Already gone, or we lack permission - either way there's nothing more we can do.
+    // already gone
   }
 }
 
 /**
- * Graceful-then-forceful termination (contract point 3): `kill()` the pid,
- * wait up to `graceMs` for it to die, then *unconditionally* run
- * `taskkill /pid <pid> /T /F` to reap the whole process tree - important
- * for real ollama.exe, which can spawn a separate runner subprocess that a
- * plain kill of the parent never touches, and whose child processes keep
- * that pid recorded as their parent even after the parent itself has
- * exited (Windows does not re-parent orphans), so `/T` still finds them.
+ * Terminates the spawned server AND its process tree (contract point 3) -
+ * real ollama.exe spawns a separate llama-server runner subprocess holding
+ * the loaded model, and reaping only the parent leaks that runner (with the
+ * model pinned in VRAM/host memory) forever.
  *
- * The taskkill call is unconditional - not gated behind a "still alive?"
- * check - deliberately: on Windows, `process.kill()` on a well-behaved
- * child terminates it near-instantly, so gating taskkill on the top-level
- * pid's liveness left the tree-kill effectively unreachable in practice
- * (the exact case it exists to cover, a lingering subprocess under an
- * already-dead parent, is precisely the case an isAlive(pid) check can't
- * see). taskkill against a pid with no matching tree is a fast, harmless
- * no-op - forceKillPid swallows its "not found" error - so there's no cost
- * to always running it once the grace window has passed.
+ * ORDER IS LOAD-BEARING, and platform-specific:
  *
- * All primitives are injectable so this can be unit-tested deterministically
- * (see _internals.terminatePid in lifecycle.test.ts) without waiting on a
- * real OS process or the real 5s default.
+ * Windows: the tree-kill (`taskkill /pid <pid> /T /F`) runs FIRST, while
+ * the root is still alive. `/T` enumerates descendants BY WALKING FROM THE
+ * ROOT - against an already-dead root it reports "not found" and kills
+ * NOTHING, leaving the children orphaned beyond its reach (Windows does not
+ * re-parent orphans, but taskkill can't start a walk from a pid that no
+ * longer exists). The previous order here - polite kill(), grace window,
+ * then taskkill - therefore leaked exactly one immortal llama-server per
+ * spawned-server run: process.kill() on Windows is TerminateProcess (never
+ * graceful, near-instant), so by the time taskkill ran, the root was gone
+ * and the runner unreachable. Found live at gate round 4: four orphaned
+ * runners, every parent dead, ~25 GB of system commit unattributed. The
+ * grace loop after the tree-kill just waits for the root's disappearance to
+ * be observable before stop() returns.
+ *
+ * POSIX: polite SIGTERM first - posix ollama traps it and shuts its runners
+ * down itself - then the grace window, then SIGKILL as the fallback.
+ *
+ * All primitives (including `platform`) are injectable so both orders are
+ * unit-tested deterministically (see _internals.terminatePid in
+ * lifecycle.test.ts) without a real OS process or the real 5s default.
  */
 async function terminatePid(
   pid: number,
@@ -427,6 +458,7 @@ async function terminatePid(
     kill?: (pid: number) => void
     forceKill?: (pid: number) => Promise<void>
     delay?: (ms: number) => Promise<void>
+    platform?: NodeJS.Platform
   } = {}
 ): Promise<void> {
   const isAlive = deps.isAlive ?? isProcessAlive
@@ -441,6 +473,17 @@ async function terminatePid(
     })
   const forceKill = deps.forceKill ?? forceKillPid
   const wait = deps.delay ?? delay
+  const platform = deps.platform ?? process.platform
+
+  if (platform === 'win32') {
+    // Tree-kill FIRST - see the doc comment: /T needs a LIVING root.
+    await forceKill(pid)
+    const deadline = Date.now() + graceMs
+    while (Date.now() < deadline && isAlive(pid)) {
+      await wait(Math.min(50, Math.max(0, deadline - Date.now())))
+    }
+    return
+  }
 
   if (isAlive(pid)) {
     kill(pid)
@@ -451,9 +494,76 @@ async function terminatePid(
     }
   }
 
-  // Unconditional: see the doc comment above for why this must not be
-  // gated behind isAlive(pid).
   await forceKill(pid)
+}
+
+// --- orphaned-runner sweep -------------------------------------------------
+
+/**
+ * Pure decision arm of the sweep: among `processes`, the llama-server
+ * runners whose PARENT is no longer alive. A runner's parent is the ollama
+ * server that spawned it (our managed serve, or the user's desktop app);
+ * Windows never re-parents, so a dead ppid means that server is gone and
+ * nothing will ever reap or reuse this runner - it just sits on its loaded
+ * model forever (the gate-round-4 leak: one such orphan per crashed or
+ * pre-tree-kill-fix run, ~GBs of commit each). A runner whose parent is
+ * ALIVE belongs to a running server (e.g. the desktop app) and is never
+ * touched.
+ */
+function findOrphanedRunnerPids(
+  processes: { pid: number; ppid: number; name: string }[],
+  isAlive: (pid: number) => boolean = isProcessAlive
+): number[] {
+  return processes
+    .filter((p) => /^llama-server(\.exe)?$/i.test(p.name) && !isAlive(p.ppid))
+    .map((p) => p.pid)
+}
+
+/** Windows-only process listing for the sweep (CIM via powershell -
+ * tasklist can't report parent pids). Returns [] on any failure or off
+ * Windows: the sweep is a best-effort repair, never a gate. */
+async function listRunnerProcesses(): Promise<{ pid: number; ppid: number; name: string }[]> {
+  if (process.platform !== 'win32') return []
+  try {
+    const { stdout } = await execFileAsync('powershell', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      'Get-CimInstance Win32_Process -Filter "Name=\'llama-server.exe\'" | Select-Object ProcessId,ParentProcessId,Name | ConvertTo-Json -Compress'
+    ])
+    const raw = stdout.trim()
+    if (!raw) return []
+    const parsed: unknown = JSON.parse(raw)
+    const rows = Array.isArray(parsed) ? parsed : [parsed]
+    return rows
+      .filter(
+        (r): r is { ProcessId: number; ParentProcessId: number; Name: string } =>
+          r !== null &&
+          typeof r === 'object' &&
+          typeof (r as { ProcessId?: unknown }).ProcessId === 'number' &&
+          typeof (r as { ParentProcessId?: unknown }).ParentProcessId === 'number'
+      )
+      .map((r) => ({ pid: r.ProcessId, ppid: r.ParentProcessId, name: r.Name ?? '' }))
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Reaps llama-server runners whose parent server is dead - the leak class
+ * the tree-kill-first fix prevents going FORWARD; this sweep also repairs
+ * what past runs (and crashes, which never reach stop() at all) already
+ * left behind. Runs at every ensureOllama() start, mirroring
+ * cleanupStalePidFile's own crash-orphan contract. Returns the reaped pids
+ * so the caller can surface what happened.
+ */
+async function reapOrphanedRunners(): Promise<number[]> {
+  const runners = await listRunnerProcesses()
+  const orphans = findOrphanedRunnerPids(runners)
+  for (const pid of orphans) {
+    await forceKillPid(pid)
+  }
+  return orphans
 }
 
 export const _internals = {
@@ -462,5 +572,7 @@ export const _internals = {
   resolveHomeDir,
   terminatePid,
   isProcessAlive,
-  imageNameForPid
+  imageNameForPid,
+  findOrphanedRunnerPids,
+  reapOrphanedRunners
 }

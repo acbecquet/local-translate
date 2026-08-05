@@ -2,7 +2,7 @@
 // the original input file(s) and the translated output file(s) under
 // EVIDENCE/<phase>/, plus a minimal README recording when/how they were made.
 // Regenerate any time with: node scripts/capture-evidence.mjs <phase>
-import { execSync } from 'node:child_process'
+import { execFileSync, execSync } from 'node:child_process'
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -116,7 +116,47 @@ function commitHeadroomGb() {
     return Infinity
   }
 }
+// Orphaned-runner sweep BEFORE the headroom check (gate round 4): a
+// llama-server runner whose parent ollama server died holds its loaded
+// model's commit forever - past runs left several of these behind, eating
+// 5+ GB each until a reboot. lifecycle.ts now prevents (tree-kill-first
+// stop) and repairs (its own sweep at ensureOllama) this, but that code
+// only runs AFTER this script's headroom guard - so a machine whose
+// headroom is held hostage by dead runners would refuse here without ever
+// reaching the code that frees it. Same rule as lifecycle.ts's sweep: only
+// runners whose parent process is GONE are touched; a live server's
+// (e.g. the Ollama desktop app's) runners are never candidates.
+function reapOrphanedRunners() {
+  if (process.platform !== 'win32') return
+  try {
+    const out = execFileSync(
+      'powershell',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        '$reaped = 0; foreach ($p in Get-CimInstance Win32_Process -Filter "Name=\'llama-server.exe\'") { ' +
+          'if (-not (Get-Process -Id $p.ParentProcessId -ErrorAction SilentlyContinue)) { ' +
+          'Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue; $reaped++ } }; ' +
+          'Write-Output $reaped'
+      ],
+      { timeout: 30_000 }
+    )
+      .toString()
+      .trim()
+    const count = Number(out)
+    if (Number.isFinite(count) && count > 0) {
+      process.stdout.write(
+        `[evidence] reaped ${count} orphaned llama-server runner(s) left by earlier runs\n`
+      )
+    }
+  } catch {
+    // best-effort repair only - never blocks a run
+  }
+}
+
 if (!reportOnly) {
+  reapOrphanedRunners()
   const headroom = commitHeadroomGb()
   if (headroom < MIN_COMMIT_HEADROOM_GB) {
     console.error(

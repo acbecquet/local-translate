@@ -20,6 +20,24 @@
 // package.json "type" field.
 
 const http = require('node:http')
+const { spawn } = require('node:child_process')
+const fs = require('node:fs')
+
+// Runner-orphan seam (gate round 4): when OLLAMA_FAKE_SERVE_SPAWN_CHILD is a
+// file path, spawn a long-lived child process - standing in for the
+// llama-server runner real ollama serve spawns - and record its pid there.
+// The child deliberately IGNORES parent death (stdio ignored, no stdin
+// hint), exactly like a real runner: lifecycle.ts's stop() must reap it via
+// the process TREE, or it leaks - the exact production bug this seam exists
+// to regression-test.
+const childPidFile = process.env.OLLAMA_FAKE_SERVE_SPAWN_CHILD
+if (childPidFile) {
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+    windowsHide: true
+  })
+  fs.writeFileSync(childPidFile, String(child.pid))
+}
 
 const hostPort = process.env.OLLAMA_HOST || '127.0.0.1:11434'
 const sepIdx = hostPort.lastIndexOf(':')
