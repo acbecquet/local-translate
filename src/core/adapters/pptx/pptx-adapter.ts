@@ -57,7 +57,7 @@ import {
 } from '../../images/regions'
 import { renderOverlay, type OverlayRegion } from '../../images/overlay'
 import { containsCjk, isSourceLanguageRegion } from '../../images/gating'
-import { inkMatchedFontSizePt, sizingAxesFor } from '../../images/sizing'
+import { inkMatchedFontSizePt, refinePaintSizes, sizingAxesFor } from '../../images/sizing'
 
 /** DrawingML diagram (SmartArt) namespace - not part of ooxml.ts's exported constants (only a:/p:/r:/rels are). */
 const DGM_NS = 'http://schemas.openxmlformats.org/drawingml/2006/diagram'
@@ -295,7 +295,13 @@ export class PptxAdapter implements FormatAdapter {
     const siteById = new Map(collectSites(archive).map((s) => [s.id, s]))
     const drawingUpdates = new Map<string, Map<string, string | typeof AMBIGUOUS_TRANSLATION>>()
     const mediaSegIndex = this.mediaSegmentsByPath.get(path.resolve(filePath))
-    const overlaysByMediaPath = new Map<string, OverlayRegion[]>()
+    // Collected as {region, seg} pairs (not finished OverlayRegions):
+    // final paint sizes are resolved per IMAGE, once its whole batch is
+    // known - sizing.ts's refinePaintSizes re-matches each single-line
+    // TRANSLATION's ink to the region's original ink target and snaps
+    // noise-level size differences across the image to a shared value
+    // (gate round 3: uniform source tables must repaint uniformly).
+    const overlaysByMediaPath = new Map<string, { region: TextRegion; seg: TranslatedSegment }[]>()
 
     for (const seg of segments) {
       const site = siteById.get(seg.id)
@@ -341,22 +347,31 @@ export class PptxAdapter implements FormatAdapter {
       // unpainted - nothing changed, nothing worth risking a repaint over.
       if (seg.translation === seg.text) continue
 
-      const overlayRegions = overlaysByMediaPath.get(mediaEntry.mediaPath) ?? []
-      overlayRegions.push({
-        bbox: mediaEntry.region.bbox,
-        lines: seg.fittedLines,
-        fontSizePt: seg.fittedSizePt,
-        font: seg.font,
-        rotation: mediaEntry.region.rotation
-      })
-      overlaysByMediaPath.set(mediaEntry.mediaPath, overlayRegions)
+      const pendingRegions = overlaysByMediaPath.get(mediaEntry.mediaPath) ?? []
+      pendingRegions.push({ region: mediaEntry.region, seg })
+      overlaysByMediaPath.set(mediaEntry.mediaPath, pendingRegions)
     }
 
     for (const [drawingPath, bySourceText] of drawingUpdates) {
       applySmartArtDrawingText(archive, drawingPath, bySourceText)
     }
 
-    for (const [mediaPath, overlayRegions] of overlaysByMediaPath) {
+    for (const [mediaPath, pending] of overlaysByMediaPath) {
+      const sizes = refinePaintSizes(
+        pending.map(({ region, seg }) => ({
+          lines: seg.fittedLines,
+          fittedSizePt: seg.fittedSizePt,
+          font: seg.font,
+          region
+        }))
+      )
+      const overlayRegions: OverlayRegion[] = pending.map(({ region, seg }, i) => ({
+        bbox: region.bbox,
+        lines: seg.fittedLines,
+        fontSizePt: sizes[i],
+        font: seg.font,
+        rotation: region.rotation
+      }))
       const buffer = await readMediaBytes(archive, mediaPath)
       const result = await renderOverlay(buffer, overlayRegions)
       writeMediaBytes(archive, mediaPath, result.image)

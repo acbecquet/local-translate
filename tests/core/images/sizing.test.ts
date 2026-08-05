@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { createCanvas, registerBundledFonts, resolveFamily } from '../../../src/core/fit/fonts'
-import { inkMatchedFontSizePt, sizingAxesFor } from '../../../src/core/images/sizing'
+import {
+  inkMatchedFontSizePt,
+  refinePaintSizes,
+  sizingAxesFor,
+  type PaintSizeItem
+} from '../../../src/core/images/sizing'
 import type { FontSpec } from '../../../src/core/segments'
 
 registerBundledFonts()
@@ -161,5 +166,69 @@ describe('sizingAxesFor - rotated +-90 text: axes swap (polish round Task E)', (
     const region = { bbox: { x: 10, y: 10, w: 40, h: 220 }, rotation: -90 as const }
 
     expect(sizingAxesFor(region)).toEqual({ inkHeightPx: 40, fitBoxWPt: 220, fitBoxHPtFloor: 40 })
+  })
+})
+
+describe('refinePaintSizes - apply-time paint sizing (gate round 3: pixel-perfect word replacement)', () => {
+  const latinFont: FontSpec = { family: 'Noto Sans', sizePt: 0 }
+  const cjkFont: FontSpec = { family: 'Noto Sans CJK SC', sizePt: 0 }
+
+  function item(
+    lines: string[],
+    fittedSizePt: number,
+    font: FontSpec,
+    inkH: number
+  ): PaintSizeItem {
+    return {
+      lines,
+      fittedSizePt,
+      font,
+      region: {
+        bbox: { x: 0, y: 0, w: 400, h: inkH + 4 },
+        inkBBox: { x: 2, y: 2, w: 396, h: inkH }
+      }
+    }
+  }
+
+  it("re-matches a single-line CJK TRANSLATION's ink to the original ink target instead of painting at the latin-derived author size", () => {
+    // The round-3 failure: a caps/digits row's author-size estimate paints
+    // its CJK replacement ~20% taller than the ink it replaces. The refined
+    // size must render the TRANSLATION at the target ink height.
+    const target = 20
+    const authorSizeEstimate = 28 // pt derived from a latin caps row - too big for CJK glyphs
+    const [size] = refinePaintSizes([item(['高温高湿结果'], authorSizeEstimate, cjkFont, target)])
+
+    expect(size).toBeLessThan(authorSizeEstimate)
+    expect(Math.abs(inkHeightAt('高温高湿结果', size, cjkFont) - target)).toBeLessThanOrEqual(2)
+  })
+
+  it('never grows a paint size past the width-fitted ceiling', () => {
+    const [size] = refinePaintSizes([item(['高温高湿结果'], 5, cjkFont, 40)])
+    expect(size).toBe(5)
+  })
+
+  it('keeps the fitted size for a multi-line (wrapped) paint', () => {
+    const [size] = refinePaintSizes([item(['line one', 'line two'], 11, latinFont, 40)])
+    expect(size).toBe(11)
+  })
+
+  it('snaps noise-level size differences across one image to a shared value while keeping genuinely distinct sizes apart', () => {
+    // Three rows of one table whose detection boxes carry +-1-2px of jitter
+    // (targets 20/21/22px) plus a genuinely larger heading (48px). The three
+    // rows must come out at ONE size; the heading must stay its own size.
+    const rows = [
+      item(['行一行一'], 100, cjkFont, 20),
+      item(['行二行二'], 100, cjkFont, 21),
+      item(['行三行三'], 100, cjkFont, 22),
+      item(['大标题大标题'], 100, cjkFont, 48)
+    ]
+    const sizes = refinePaintSizes(rows)
+
+    expect(sizes[0]).toBe(sizes[1])
+    expect(sizes[1]).toBe(sizes[2])
+    expect(sizes[3]).toBeGreaterThan(sizes[0] * 1.5)
+    for (let i = 0; i < rows.length; i++) {
+      expect(sizes[i]).toBeLessThanOrEqual(rows[i].fittedSizePt)
+    }
   })
 })

@@ -187,3 +187,81 @@ export function sizingAxesFor(region: {
   }
   return { inkHeightPx: inkBBox.h, fitBoxWPt: region.bbox.w, fitBoxHPtFloor: region.bbox.h }
 }
+
+// ---- apply-time paint-size refinement (gate round 3: "font sizes are all
+// off and furthermore all over the place... pixel-perfect word replacement")
+//
+// The extract-time estimate above is measured against the ORIGINAL text -
+// the only text that exists before translation - which leaves two visible
+// error sources on a real repainted table:
+//
+// 1. Glyph-mix asymmetry: a caps/digits row's ink height is ~0.72em while
+//    its CJK replacement's ink is ~0.88em, so painting the replacement at
+//    the estimated author-pt renders it ~20% taller than the ink it
+//    replaces - and the error DIFFERS row by row with each row's glyph mix
+//    (descender rows land near 1.0, digit rows near 0.72). Fix: once the
+//    translation is known (apply time), re-match the TRANSLATION's own
+//    measured ink to the region's original ink target and paint at the
+//    smaller of that and the width-fitted size (never grow past fit()'s
+//    width ceiling; a genuinely-wrapped multi-line paint keeps its fitted
+//    size - per-line ink retargeting doesn't compose with wrapping).
+//
+// 2. Detection-box noise: +-2-3px of OCR box jitter on 12-16px text is a
+//    +-20% font-size swing between rows that were identical in the source,
+//    and a band-merged header region's union box is taller than any of its
+//    constituent lines. Fix: regions of ONE image whose refined sizes sit
+//    within a small relative gap of each other are the same authored size
+//    seen through noise - snap each cluster to its median (capped per
+//    region by its own width-fitted ceiling, so snapping never reintroduces
+//    an overflow).
+
+/** Adjacent refined sizes whose ratio is within this are treated as the
+ * same authored size observed through detection noise. 12% comfortably
+ * covers the observed +-2-3px jitter on small text while keeping genuinely
+ * distinct sizes (a 12pt body vs an 18pt heading, ratio 1.5) apart. */
+const CLUSTER_GAP_RATIO = 1.12
+
+export interface PaintSizeItem {
+  /** fit()'s output lines - a single-line paint is re-matched to the ink target; multi-line keeps fittedSizePt. */
+  lines: string[]
+  /** fit()'s output size - the width-safety ceiling nothing below may exceed. */
+  fittedSizePt: number
+  font: FontSpec
+  region: { bbox: RegionBBox; inkBBox?: RegionBBox; rotation?: 0 | 90 | -90 }
+}
+
+/**
+ * Final paint sizes for every region of ONE image, returned aligned with
+ * `items`: per-region translation-ink re-matching, then per-image cluster
+ * snapping - see the section comment above for what each step corrects.
+ * Deterministic: clustering sorts by refined size (ties broken by input
+ * order) and every snap is capped by that region's own fittedSizePt.
+ */
+export function refinePaintSizes(items: PaintSizeItem[]): number[] {
+  const refined = items.map((item) => {
+    if (item.lines.length !== 1) return item.fittedSizePt
+    const target = sizingAxesFor(item.region).inkHeightPx
+    return Math.min(item.fittedSizePt, inkMatchedFontSizePt(item.lines[0], item.font, target))
+  })
+
+  const order = refined
+    .map((sizePt, index) => ({ sizePt, index }))
+    .sort((a, b) => a.sizePt - b.sizePt || a.index - b.index)
+
+  const result = refined.slice()
+  let clusterStart = 0
+  for (let i = 1; i <= order.length; i++) {
+    const gapBreaks =
+      i === order.length || order[i].sizePt > order[i - 1].sizePt * CLUSTER_GAP_RATIO
+    if (!gapBreaks) continue
+    const cluster = order.slice(clusterStart, i)
+    if (cluster.length > 1) {
+      const median = cluster[Math.floor(cluster.length / 2)].sizePt
+      for (const member of cluster) {
+        result[member.index] = Math.min(median, items[member.index].fittedSizePt)
+      }
+    }
+    clusterStart = i
+  }
+  return result
+}

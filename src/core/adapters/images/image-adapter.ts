@@ -16,7 +16,7 @@ import {
 } from '../../images/regions'
 import { renderOverlay, type OverlayRegion } from '../../images/overlay'
 import { containsCjk, isSourceLanguageRegion } from '../../images/gating'
-import { inkMatchedFontSizePt, sizingAxesFor } from '../../images/sizing'
+import { inkMatchedFontSizePt, refinePaintSizes, sizingAxesFor } from '../../images/sizing'
 
 export interface ImageAdapterOpts {
   /** This run's source language, passed straight into isSourceLanguageRegion
@@ -192,20 +192,33 @@ export function createImageAdapter(engine: RegionEngine, opts: ImageAdapterOpts)
       }
 
       const bySegId = new Map(segments.map((s) => [s.id, s]))
-      const overlayRegions: OverlayRegion[] = []
+      const pending: { region: TextRegion; seg: TranslatedSegment }[] = []
       for (const [id, region] of paintable) {
         const seg = bySegId.get(id)
         if (!seg) continue
         if (seg.translation === seg.text) continue
-
-        overlayRegions.push({
-          bbox: region.bbox,
-          lines: seg.fittedLines,
-          fontSizePt: seg.fittedSizePt,
-          font: seg.font,
-          rotation: region.rotation
-        })
+        pending.push({ region, seg })
       }
+      // Final paint sizes resolved over the image's whole batch (sizing.ts's
+      // refinePaintSizes): each single-line TRANSLATION's ink re-matched to
+      // its region's original ink target, then noise-level size differences
+      // snapped to a shared per-image value - mirrors pptx-adapter.ts's
+      // media path so the two adapters can never paint-size differently.
+      const sizes = refinePaintSizes(
+        pending.map(({ region, seg }) => ({
+          lines: seg.fittedLines,
+          fittedSizePt: seg.fittedSizePt,
+          font: seg.font,
+          region
+        }))
+      )
+      const overlayRegions: OverlayRegion[] = pending.map(({ region, seg }, i) => ({
+        bbox: region.bbox,
+        lines: seg.fittedLines,
+        fontSizePt: sizes[i],
+        font: seg.font,
+        rotation: region.rotation
+      }))
 
       const buffer = await readFile(filePath)
       const result = await renderOverlay(buffer, overlayRegions)
