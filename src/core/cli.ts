@@ -28,6 +28,7 @@ import { adapterFor } from './adapters/adapter'
 import { buildAdapters } from './adapters/registry'
 import { DEFAULT_MODEL } from './defaults'
 import { createPPOcrEngine } from './images/engines/ppocr'
+import { withCellSplit } from './images/cellsplit'
 import { withRotationPasses } from './images/rotation'
 import {
   NOT_SOURCE_LANGUAGE_REASON,
@@ -281,8 +282,10 @@ export async function runCli(argv: string[], deps: CliDeps = defaultDeps): Promi
   // rotated chart-axis-style text also gets detected (via extra rotated-copy
   // passes) instead of only ever being flagged rotated-and-skipped - see its
   // own module doc comment (images/rotation.ts) for why this must rotate the
-  // IMAGE rather than trust an in-place read.
-  const regionEngine = withRotationPasses(createPPOcrEngine())
+  // IMAGE rather than trust an in-place read. withCellSplit (gate round 5)
+  // wraps OUTSIDE that so row-merged table detections get split at true cell
+  // gutters in final original-frame coordinates - see images/cellsplit.ts.
+  const regionEngine = withCellSplit(withRotationPasses(createPPOcrEngine()))
   const adapters = buildAdapters({ regionEngine, sourceLang: args.sourceLang })
   const adapter = adapterFor(args.file, adapters)
   if (!adapter) {
