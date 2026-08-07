@@ -105,9 +105,14 @@ export const CONFIDENCE_FLOOR = 0.6
  */
 export const DILATION_PX = 2
 
-// Regions under this in either dimension are noise (compression artifacts,
-// stray detector activations) - plan point 2.
-const NOISE_FLOOR_PX = 8
+// Regions under these are noise (compression artifacts, stray detector
+// activations) - plan point 2. The HEIGHT floor sits below the width floor:
+// cellsplit's vertical tighten emits honest 4-6px ink bands for genuinely
+// tiny text ("hours" measured 40x5 on the real slide-6 table), which the
+// original single 8px floor executed as noise; nothing readable is under
+// 8px WIDE, so width keeps the original guard strength.
+const NOISE_FLOOR_W_PX = 8
+const NOISE_FLOOR_H_PX = 4
 
 // Plan point 3: IoU strictly greater than this, OR containment at least the
 // second threshold below, triggers a merge.
@@ -217,6 +222,16 @@ function mergeOverlapping(regions: TextRegion[]): TextRegion[] {
         const merged: TextRegion = {
           id: first.id,
           bbox: unionBBox(current[i].bbox, current[j].bbox),
+          // Engine-provided ink bands merge like the boxes do; absent bands
+          // fall back to the box, matching the preservation rule in the
+          // validation ladder's inkBBox step.
+          inkBBox:
+            current[i].inkBBox || current[j].inkBBox
+              ? unionBBox(
+                  current[i].inkBBox ?? current[i].bbox,
+                  current[j].inkBBox ?? current[j].bbox
+                )
+              : undefined,
           text: `${first.text} ${second.text}`,
           confidence: Math.min(current[i].confidence, current[j].confidence),
           rotated: statusConflict
@@ -329,7 +344,7 @@ function sortReadingOrder(regions: TextRegion[]): TextRegion[] {
 export function validateRegions(raw: TextRegion[], imgW: number, imgH: number): TextRegion[] {
   let regions = raw.filter((r) => r.bbox.w > 0 && r.bbox.h > 0)
 
-  regions = regions.filter((r) => r.bbox.w >= NOISE_FLOOR_PX && r.bbox.h >= NOISE_FLOOR_PX)
+  regions = regions.filter((r) => r.bbox.w >= NOISE_FLOOR_W_PX && r.bbox.h >= NOISE_FLOOR_H_PX)
 
   regions = regions.map((r) => ({ ...r, text: r.text.trim() })).filter((r) => r.text.length > 0)
 
@@ -339,10 +354,15 @@ export function validateRegions(raw: TextRegion[], imgW: number, imgH: number): 
 
   regions = sortReadingOrder(regions)
 
-  // inkBBox: r.bbox reads the PRE-dilation box (r is never mutated by this
-  // map; the bbox: dilate(...) key below overwrites it in the OUTPUT object
-  // only), so both keys land correctly in one pass without a second map.
-  regions = regions.map((r) => ({ ...r, inkBBox: r.bbox, bbox: dilate(r.bbox, DILATION_PX) }))
+  // inkBBox: an ENGINE-provided inkBBox (cellsplit's measured ink band -
+  // the size authority) is preserved; otherwise the PRE-dilation box is
+  // snapshotted exactly as before (r is never mutated by this map; the
+  // bbox: dilate(...) key below overwrites it in the OUTPUT object only).
+  regions = regions.map((r) => ({
+    ...r,
+    inkBBox: r.inkBBox ?? r.bbox,
+    bbox: dilate(r.bbox, DILATION_PX)
+  }))
 
   regions = regions
     .map((r) => ({ ...r, bbox: clampToImage(r.bbox, imgW, imgH) }))

@@ -207,6 +207,7 @@ export function createImageAdapter(engine: RegionEngine, opts: ImageAdapterOpts)
       const sizes = refinePaintSizes(
         pending.map(({ region, seg }) => ({
           lines: seg.fittedLines,
+          sourceText: seg.text,
           fittedSizePt: seg.fittedSizePt,
           font: seg.font,
           region

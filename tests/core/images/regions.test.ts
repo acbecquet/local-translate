@@ -49,15 +49,22 @@ describe('validateRegions - clamping and degenerate drops (plan point 1)', () =>
 })
 
 describe('validateRegions - noise floor (plan point 2)', () => {
-  it('drops regions under 8px in either dimension, keeps a region exactly at the floor', () => {
+  it('drops regions under 8px wide or 4px tall, keeps small-but-real text at the floors', () => {
+    // The height floor sits BELOW the width floor since cellsplit's
+    // vertical tighten emits honest 4-6px ink bands for genuinely tiny
+    // text ("hours" measured 40x5 on the real slide-6 table) - an 8px
+    // height floor executed real cells. Width keeps the original 8px:
+    // nothing readable is under 8px wide, and the tighten never narrows
+    // boxes horizontally below their ink spans.
     const tooNarrow = region({ bbox: { x: 10, y: 10, w: 5, h: 20 }, text: 'TooNarrow' })
-    const tooShort = region({ bbox: { x: 10, y: 50, w: 20, h: 7 }, text: 'TooShort' })
+    const tooShort = region({ bbox: { x: 10, y: 50, w: 20, h: 3 }, text: 'TooShort' })
+    const tinyReal = region({ bbox: { x: 10, y: 120, w: 40, h: 5 }, text: 'hours' })
     const atFloor = region({ bbox: { x: 10, y: 80, w: 8, h: 8 }, text: 'AtFloor' })
 
-    const result = validateRegions([tooNarrow, tooShort, atFloor], 200, 200)
+    const result = validateRegions([tooNarrow, tooShort, tinyReal, atFloor], 200, 200)
 
-    expect(result).toHaveLength(1)
-    expect(result[0].text).toBe('AtFloor')
+    expect(result).toHaveLength(2)
+    expect(result.map((r) => r.text)).toEqual(['AtFloor', 'hours'])
     // atFloor {x:10,y:80,w:8,h:8} dilated by 2 -> {x:8,y:78,w:12,h:12}; well within
     // the 200x200 bounds so clamp is a no-op.
     expect(result[0].bbox).toEqual({ x: 8, y: 78, w: 12, h: 12 })

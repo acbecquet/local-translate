@@ -169,66 +169,97 @@ describe('sizingAxesFor - rotated +-90 text: axes swap (polish round Task E)', (
   })
 })
 
-describe('refinePaintSizes - apply-time paint sizing (gate round 3: pixel-perfect word replacement)', () => {
+describe('refinePaintSizes - apply-time paint sizing (feedback loop: cap-normalized band targeting)', () => {
   const latinFont: FontSpec = { family: 'Noto Sans', sizePt: 0 }
   const cjkFont: FontSpec = { family: 'Noto Sans CJK SC', sizePt: 0 }
 
   function item(
     lines: string[],
+    sourceText: string,
     fittedSizePt: number,
     font: FontSpec,
-    inkH: number
+    inkH: number,
+    boxW = 4000
   ): PaintSizeItem {
     return {
       lines,
+      sourceText,
       fittedSizePt,
       font,
       region: {
-        bbox: { x: 0, y: 0, w: 400, h: inkH + 4 },
-        inkBBox: { x: 2, y: 2, w: 396, h: inkH }
+        bbox: { x: 0, y: 0, w: boxW, h: inkH + 4 },
+        inkBBox: { x: 2, y: 2, w: boxW - 4, h: inkH }
       }
     }
   }
 
-  it("re-matches a single-line CJK TRANSLATION's ink to the original ink target instead of painting at the latin-derived author size", () => {
-    // The round-3 failure: a caps/digits row's author-size estimate paints
-    // its CJK replacement ~20% taller than the ink it replaces. The refined
-    // size must render the TRANSLATION at the target ink height.
-    const target = 20
-    const authorSizeEstimate = 28 // pt derived from a latin caps row - too big for CJK glyphs
-    const [size] = refinePaintSizes([item(['高温高湿结果'], authorSizeEstimate, cjkFont, target)])
-
-    expect(size).toBeLessThan(authorSizeEstimate)
-    expect(Math.abs(inkHeightAt('高温高湿结果', size, cjkFont) - target)).toBeLessThanOrEqual(2)
+  it('renders a CJK translation at ~1.3x the source CAP band - how a text-layer translation at the authored em looks', () => {
+    // The source band of a caps/ascender Latin string IS its cap height;
+    // office CJK glyph ink runs ~1.3x cap at the same em. Measuring the
+    // source's ratio in Noto (skia metrics) recovers the wrong em because
+    // the slide's real font has different cap/em - cap normalization from
+    // the string's own glyph classes is font-agnostic.
+    const band = 16
+    const [size] = refinePaintSizes([item(['高温高湿'], 'HIGH TEMP', 999, cjkFont, band)])
+    expect(Math.abs(inkHeightAt('高温高湿', size, cjkFont) - band * 1.3)).toBeLessThanOrEqual(2)
   })
 
-  it('never grows a paint size past the width-fitted ceiling', () => {
-    const [size] = refinePaintSizes([item(['高温高湿结果'], 5, cjkFont, 40)])
-    expect(size).toBe(5)
+  it('normalizes a descender-bearing source band to the same cap height, so descender rows and caps rows paint EQUAL sizes', () => {
+    // 'ABC' band = cap (16px); 'Abg' band = cap + descender (~1.28x cap =
+    // 20.5px). Both describe the same authored size and must come out equal.
+    const [a, b] = refinePaintSizes([
+      item(['甲乙丙'], 'ABC', 999, cjkFont, 16),
+      item(['丁戊己'], 'Abg', 999, cjkFont, 20.5)
+    ])
+    expect(Math.abs(a - b)).toBeLessThanOrEqual(1)
+  })
+
+  it('targets ink parity (1x band) for a non-CJK translation - same script, same ink', () => {
+    const band = 16
+    const [size] = refinePaintSizes([item(['Resultados'], 'RESULTS', 999, latinFont, band)])
+    expect(Math.abs(inkHeightAt('Resultados', size, latinFont) - band)).toBeLessThanOrEqual(2.5)
+  })
+
+  it('caps the size so the translation never exceeds the region width', () => {
+    // A long translation into a narrow box: the width cap binds, not the
+    // band target.
+    const [size] = refinePaintSizes([item(['很长的翻译文本超过格子'], 'HI', 999, cjkFont, 30, 60)])
+    const { family } = resolveFamily(cjkFont.family)
+    measureCtx.font = `${size}px "${family}"`
+    expect(measureCtx.measureText('很长的翻译文本超过格子').width).toBeLessThanOrEqual(60)
   })
 
   it('keeps the fitted size for a multi-line (wrapped) paint', () => {
-    const [size] = refinePaintSizes([item(['line one', 'line two'], 11, latinFont, 40)])
+    const [size] = refinePaintSizes([
+      item(['line one', 'line two'], 'line one line two', 11, latinFont, 40)
+    ])
     expect(size).toBe(11)
   })
 
-  it('snaps noise-level size differences across one image to a shared value while keeping genuinely distinct sizes apart', () => {
-    // Three rows of one table whose detection boxes carry +-1-2px of jitter
-    // (targets 20/21/22px) plus a genuinely larger heading (48px). The three
-    // rows must come out at ONE size; the heading must stay its own size.
-    const rows = [
-      item(['行一行一'], 100, cjkFont, 20),
-      item(['行二行二'], 100, cjkFont, 21),
-      item(['行三行三'], 100, cjkFont, 22),
-      item(['大标题大标题'], 100, cjkFont, 48)
-    ]
-    const sizes = refinePaintSizes(rows)
-
+  it('unifies same-row cells whose bands differ only by measurement noise to ONE shared size at least the smallest target', () => {
+    // Real slide-6 failure: Media/Voltage cells of one row recovered
+    // targets 7% apart but landed in different clusters and painted 20%
+    // apart. The widened, median-snapping cluster must give all three the
+    // same size, no smaller than the smallest member's own target.
+    const sizes = refinePaintSizes([
+      item(['介质一'], 'ABC', 999, cjkFont, 16),
+      item(['电压二'], 'Abg', 999, cjkFont, 21),
+      item(['存储三'], 'ABX', 999, cjkFont, 16.6)
+    ])
     expect(sizes[0]).toBe(sizes[1])
     expect(sizes[1]).toBe(sizes[2])
-    expect(sizes[3]).toBeGreaterThan(sizes[0] * 1.5)
-    for (let i = 0; i < rows.length; i++) {
-      expect(sizes[i]).toBeLessThanOrEqual(rows[i].fittedSizePt)
-    }
+    expect(sizes[0]).toBeGreaterThanOrEqual(16 * 1.3 * 0.9)
+  })
+
+  it('anchors the cluster gap to the SMALLEST member so a smooth size chain cannot collapse to one size (real slide-6 failure)', () => {
+    // Multi-line items pass through as their fitted size, so a fitted-size
+    // chain exercises the clustering in isolation: adjacent sizes each
+    // within 12% of the PREVIOUS one used to chain the whole table into a
+    // single cluster snapped to the global minimum. Anchoring to the
+    // cluster's first (smallest) member bounds any cluster's spread at 12%.
+    const rows = [8, 8.8, 9.7, 10.7, 11.8, 13].map((s) =>
+      item(['two', 'lines'], 'src', s, cjkFont, s)
+    )
+    expect(refinePaintSizes(rows)).toEqual([8, 8, 9.7, 9.7, 11.8, 11.8])
   })
 })

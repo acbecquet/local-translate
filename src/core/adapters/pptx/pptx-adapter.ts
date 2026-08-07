@@ -360,6 +360,7 @@ export class PptxAdapter implements FormatAdapter {
       const sizes = refinePaintSizes(
         pending.map(({ region, seg }) => ({
           lines: seg.fittedLines,
+          sourceText: seg.text,
           fittedSizePt: seg.fittedSizePt,
           font: seg.font,
           region

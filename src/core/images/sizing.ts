@@ -32,6 +32,7 @@
 // font-size measurement - bundling them would blur gating.ts's single job.
 import type { FontSpec } from '../segments'
 import { measureCtx, registerBundledFonts, resolveFamily } from '../fit/fonts'
+import { containsCjk } from './gating'
 import type { RegionBBox } from './regions'
 
 /** Returned when the target ink height is degenerate (<= 0) - matches
@@ -215,16 +216,63 @@ export function sizingAxesFor(region: {
 //    region by its own width-fitted ceiling, so snapping never reintroduces
 //    an overflow).
 
-/** Adjacent refined sizes whose ratio is within this are treated as the
- * same authored size observed through detection noise. 12% comfortably
- * covers the observed +-2-3px jitter on small text while keeping genuinely
+/** Sizes within this ratio of a cluster's smallest member are treated as
+ * the same authored size observed through band-measurement noise. 20%
+ * (anchored at the cluster minimum, so a cluster's TOTAL spread is bounded
+ * by it) covers the +-1px cap-normalization jitter on small text - live
+ * evidence: same-row cells recovered targets 7% apart yet fell across a
+ * tighter boundary and painted 20% apart - while keeping genuinely
  * distinct sizes (a 12pt body vs an 18pt heading, ratio 1.5) apart. */
-const CLUSTER_GAP_RATIO = 1.12
+const CLUSTER_GAP_RATIO = 1.2
+
+// ---- cap-normalized band targeting (feedback-loop round, 2026-08-06).
+//
+// The measured ink BAND of a Latin source string is its cap height when the
+// string has caps/ascenders/digits, cap + descender depth when it also has
+// descenders, and bare x-height when it has neither. Recovering the
+// authored em from that band THROUGH skia's Noto metrics is wrong in
+// principle: the slide's real font (e.g. Calibri, cap ~0.64em) shares no
+// metrics with Noto (skia's quantized actualBoundingBox ratios measured
+// 0.85-1.05 on real strings), so the recovered em undershot by ~30% on the
+// real slide-6 table. What IS font-agnostic: typographic proportions.
+// Descender depth ~0.28x cap and x-height ~0.72x cap hold across office
+// fonts within a few percent, and CJK glyph ink at the same em runs ~1.3x
+// the Latin cap. So the paint target is: normalize the band to CAP height
+// using the source string's own glyph classes, then render a CJK
+// translation's ink at 1.3x cap (a non-CJK translation at plain band
+// parity), capped so the line never exceeds the region width.
+const DESCENDER_RE = /[gjpqy]/
+const ASCENDER_RE = /[A-Z0-9bdfhklt]/
+const DESCENDER_BAND_TO_CAP = 1.28
+const X_HEIGHT_TO_CAP = 0.72
+const CJK_INK_TO_CAP = 1.3
+
+/** The source string's cap height implied by its measured ink band - see
+ * the section comment above. A CJK-scripted source's band is already ~1.3x
+ * cap-equivalent, mirroring CJK_INK_TO_CAP. */
+function capHeightFromBand(sourceText: string, bandPx: number): number {
+  if (containsCjk(sourceText)) return bandPx / CJK_INK_TO_CAP
+  if (DESCENDER_RE.test(sourceText)) return bandPx / DESCENDER_BAND_TO_CAP
+  if (ASCENDER_RE.test(sourceText)) return bandPx
+  return bandPx / X_HEIGHT_TO_CAP
+}
+
+/** The size at which `line` set in `font` exactly fills `widthPx` - the
+ * hard ceiling keeping a painted line inside its region horizontally.
+ * Width scales linearly with size, so one 100px measurement suffices. */
+function widthCappedSizePt(line: string, font: FontSpec, widthPx: number): number {
+  registerBundledFonts()
+  setFont(100, font)
+  const w = measureCtx().measureText(line).width
+  return w > 0 ? (100 * widthPx) / w : Number.MAX_SAFE_INTEGER
+}
 
 export interface PaintSizeItem {
-  /** fit()'s output lines - a single-line paint is re-matched to the ink target; multi-line keeps fittedSizePt. */
+  /** fit()'s output lines - a single-line paint is retargeted from the ink band; multi-line keeps fittedSizePt. */
   lines: string[]
-  /** fit()'s output size - the width-safety ceiling nothing below may exceed. */
+  /** The ORIGINAL (source) text - its glyph classes normalize the band to cap height. */
+  sourceText: string
+  /** fit()'s output size - kept as-is for multi-line (wrapped) paints. */
   fittedSizePt: number
   font: FontSpec
   region: { bbox: RegionBBox; inkBBox?: RegionBBox; rotation?: 0 | 90 | -90 }
@@ -232,33 +280,56 @@ export interface PaintSizeItem {
 
 /**
  * Final paint sizes for every region of ONE image, returned aligned with
- * `items`: per-region translation-ink re-matching, then per-image cluster
- * snapping - see the section comment above for what each step corrects.
- * Deterministic: clustering sorts by refined size (ties broken by input
- * order) and every snap is capped by that region's own fittedSizePt.
+ * `items`. Single-line paints are sized by cap-normalized band targeting
+ * (see the section comment above): the translation's ink is rendered at
+ * CJK_INK_TO_CAP x the source's cap height (plain band parity for non-CJK
+ * translations), hard-capped by the region width; multi-line (wrapped)
+ * paints keep fit()'s size. Then the per-image cluster snap: sizes within
+ * CLUSTER_GAP_RATIO of a cluster's smallest member are the same authored
+ * size seen through residual noise and snap to that smallest member, so
+ * rows come out uniform without any region ever growing.
  */
 export function refinePaintSizes(items: PaintSizeItem[]): number[] {
-  const refined = items.map((item) => {
-    if (item.lines.length !== 1) return item.fittedSizePt
-    const target = sizingAxesFor(item.region).inkHeightPx
-    return Math.min(item.fittedSizePt, inkMatchedFontSizePt(item.lines[0], item.font, target))
+  const sized = items.map((item) => {
+    if (item.lines.length !== 1) {
+      // Multi-line (wrapped) paints keep fit()'s size; it is also their
+      // ceiling - growing would re-wrap what fit() already laid out.
+      return { sizePt: item.fittedSizePt, ceilPt: item.fittedSizePt }
+    }
+    const axes = sizingAxesFor(item.region)
+    const cap = capHeightFromBand(item.sourceText, axes.inkHeightPx)
+    const targetInk = containsCjk(item.lines[0]) ? cap * CJK_INK_TO_CAP : axes.inkHeightPx
+    const ceilPt = widthCappedSizePt(item.lines[0], item.font, axes.fitBoxWPt)
+    return {
+      sizePt: Math.min(inkMatchedFontSizePt(item.lines[0], item.font, targetInk), ceilPt),
+      ceilPt
+    }
   })
 
-  const order = refined
-    .map((sizePt, index) => ({ sizePt, index }))
+  const order = sized
+    .map((s, index) => ({ ...s, index }))
     .sort((a, b) => a.sizePt - b.sizePt || a.index - b.index)
 
-  const result = refined.slice()
+  const result = sized.map((s) => s.sizePt)
   let clusterStart = 0
   for (let i = 1; i <= order.length; i++) {
+    // The gap test anchors to the cluster's FIRST (smallest) member, not
+    // the previous one: chaining member-to-member let a smooth size
+    // distribution link into one mega-cluster and snap an entire image to
+    // its global minimum (observed live on the slide-6 table). Anchoring
+    // bounds any cluster's total spread at CLUSTER_GAP_RATIO.
     const gapBreaks =
-      i === order.length || order[i].sizePt > order[i - 1].sizePt * CLUSTER_GAP_RATIO
+      i === order.length || order[i].sizePt > order[clusterStart].sizePt * CLUSTER_GAP_RATIO
     if (!gapBreaks) continue
     const cluster = order.slice(clusterStart, i)
     if (cluster.length > 1) {
+      // Snap to the MEDIAN, bounded by every member's own ceiling - the
+      // median tracks the authored size best, and the bound keeps the snap
+      // from pushing any member past what physically fits it.
       const median = cluster[Math.floor(cluster.length / 2)].sizePt
+      const snap = Math.min(median, ...cluster.map((m) => m.ceilPt))
       for (const member of cluster) {
-        result[member.index] = Math.min(median, items[member.index].fittedSizePt)
+        result[member.index] = snap
       }
     }
     clusterStart = i
