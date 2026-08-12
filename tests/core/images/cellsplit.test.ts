@@ -359,6 +359,40 @@ describe('withCellSplit - splits a row-merged detection at true cell gutters', (
     expect(cellB.bbox.x).toBeGreaterThanOrEqual(168)
   })
 
+  it('clips the fill box clear of a masked foreign neighbor - the mask hides its ink from the profile, so the zone itself must obstruct', async () => {
+    // Review finding on the foreign-ink exclusion: blanking a trustworthy
+    // neighbor out of the analysis buffer means it no longer appears as a
+    // band, so the band-based clip never sees it - and a raw detector box
+    // that already overlapped the neighbor kept covering it, letting the
+    // fill erase the neighbor's real glyphs with nothing repainted there.
+    // The foreign zones must constrain the fill box directly.
+    const canvas = createCanvas(300, 34)
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, 300, 34)
+    ctx.fillStyle = '#000000'
+    ctx.fillRect(70, 5, 220, 10) // the region's own line, rows 5..15
+    ctx.fillRect(5, 20, 50, 6) // the neighbor's real glyphs, rows 20..26
+    const buf = await canvas.toBuffer('png')
+    const merged = rawRegion({ bbox: { x: 0, y: 0, w: 300, h: 30 }, text: 'AAAA BBBB' })
+    const neighbor = rawRegion({
+      id: 'raw2',
+      bbox: { x: 3, y: 18, w: 54, h: 10 },
+      text: 'XX',
+      confidence: 0.95
+    })
+    const { engine } = fakeEngine([merged, neighbor])
+
+    const result = await withCellSplit(engine).detectRegions(buf)
+
+    const region = result.find((r) => r.text === 'AAAA BBBB')!
+    expect(region.inkBBox?.y).toBe(5)
+    expect(region.inkBBox?.h).toBe(10)
+    // The raw box ran to y=30, over the neighbor's rows 20..26; the fill
+    // box must stop at the neighbor's zone (18 - DILATION_PX = 16).
+    expect(region.bbox.y + region.bbox.h).toBeLessThanOrEqual(16)
+  })
+
   it('does not let a vertically-adjacent trustworthy neighbor gut the region band - exclusion is the neighbor RECT, not its whole columns', async () => {
     // Real slide-6 failure: "Step 1:..." sits directly above the trusted
     // "at60C, 60% RH" continuation line. Excluding the neighbor's COLUMNS

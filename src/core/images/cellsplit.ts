@@ -623,7 +623,8 @@ function tightenVertical(
   // Foreign RECTS are blanked to flat background before the row profile so
   // a row-merge bands to ITS OWN line instead of a union with the
   // neighbors it lassoed - see TRUSTWORTHY_MAX_ASPECT/foreignZones.
-  for (const z of foreignZones(region, others, ey0, ey1)) {
+  const zones = foreignZones(region, others, ey0, ey1)
+  for (const z of zones) {
     const fx0 = Math.max(x0, z.x0)
     const fx1 = Math.min(x1, z.x1)
     const fy0 = Math.max(ey0, z.y0)
@@ -662,6 +663,15 @@ function tightenVertical(
     if (!erased[r]) continue
     if (r < band.start) aboveLimit = Math.max(aboveLimit, ey0 + r + 1 + DILATION_PX)
     if (r >= band.end) belowLimit = Math.min(belowLimit, ey0 + r - DILATION_PX)
+  }
+  // The masked foreign zones must obstruct the fill box DIRECTLY (review
+  // finding): blanking hid their ink from `bands`, so the band-based clip
+  // above cannot see them - but a raw detector box that overlapped a
+  // neighbor would otherwise keep covering it and the fill would erase the
+  // neighbor's real glyphs. Zone edges already carry DILATION_PX margin.
+  for (const z of zones) {
+    if (z.y1 <= bandY) aboveLimit = Math.max(aboveLimit, z.y1)
+    if (z.y0 >= bandY + bandH) belowLimit = Math.min(belowLimit, z.y0)
   }
   // The clip never cuts into the chosen band itself: touching an adjacent
   // obstruction beats shaving the glyphs being replaced.
@@ -737,12 +747,20 @@ function trySplit(
   imgW: number,
   imgH: number,
   bg: number,
-  others: TextRegion[] = []
+  others: TextRegion[] = [],
+  loose?: { y0: number; y1: number }
 ): TextRegion[] {
   const x0 = Math.max(0, Math.floor(region.bbox.x))
-  const y0 = Math.max(0, Math.floor(region.bbox.y))
+  // The PRE-CLIP loose vertical extent: the fill box may have been clipped
+  // clear of a foreign zone (tightenVertical), but gridline candidacy and
+  // per-cell band search need the detector's original slack - in a
+  // band-tight crop every letter stem reads as a full-height border (the
+  // exact failure the loose-height rule below exists for; observed live
+  // when the zone clip shrank "Fill Volume:..."'s box to its band and the
+  // row split at its own stems).
+  const y0 = Math.max(0, Math.floor(loose?.y0 ?? region.bbox.y))
   const x1 = Math.min(imgW, Math.ceil(region.bbox.x + region.bbox.w))
-  const y1 = Math.min(imgH, Math.ceil(region.bbox.y + region.bbox.h))
+  const y1 = Math.min(imgH, Math.ceil(loose?.y1 ?? region.bbox.y + region.bbox.h))
   const w = x1 - x0
   const h = y1 - y0
   // The measured ink band (tightenVertical) is the LINE-HEIGHT authority
@@ -906,7 +924,11 @@ export function withCellSplit(engine: RegionEngine): RegionEngine {
       ctx.drawImage(img, 0, 0)
 
       const out: TextRegion[] = []
-      const pending: { region: TextRegion; bg: number | null }[] = []
+      const pending: {
+        region: TextRegion
+        bg: number | null
+        loose: { y0: number; y1: number }
+      }[] = []
       for (const region of regions) {
         if (region.rotation || region.rotated) {
           out.push(region)
@@ -918,6 +940,8 @@ export function withCellSplit(engine: RegionEngine): RegionEngine {
         // boxes hug their ink well enough to mask a row-merge's lassoed
         // neighbors out of its band measurement.
         const rawOthers = regions.filter((r) => r !== region)
+        const rawY0 = region.bbox.y
+        const rawY1 = region.bbox.y + region.bbox.h
         const { region: tightened, bg } = tightenVertical(
           region,
           ctx,
@@ -925,6 +949,15 @@ export function withCellSplit(engine: RegionEngine): RegionEngine {
           img.height,
           rawOthers
         )
+        // The PRE-CLIP loose extent (raw box unioned with the band) - the
+        // fill box above may be clipped clear of foreign zones, but the
+        // split's gridline candidacy needs the original slack (see
+        // trySplit's `loose` parameter).
+        const ink = tightened.inkBBox
+        const loose = {
+          y0: Math.min(rawY0, ink?.y ?? rawY0),
+          y1: Math.max(rawY1, ink ? ink.y + ink.h : rawY1)
+        }
         // Hallucination kill - a "reading" that cannot fit its own box is
         // dropped before it can paint or poison a merge (see cannotFitBox).
         if (cannotFitBox(tightened)) {
@@ -933,7 +966,7 @@ export function withCellSplit(engine: RegionEngine): RegionEngine {
           }
           continue
         }
-        pending.push({ region: tightened, bg })
+        pending.push({ region: tightened, bg, loose })
       }
       // Double-vote dedup runs on the whole band-measured set BEFORE
       // splitting - see dropDoubleVotes.
@@ -949,7 +982,7 @@ export function withCellSplit(engine: RegionEngine): RegionEngine {
         if (!kept.has(p.region)) continue
         if (p.bg !== null && isSplitCandidate(p.region)) {
           const others = [...kept].filter((r) => r !== p.region)
-          out.push(...trySplit(p.region, ctx, img.width, img.height, p.bg, others))
+          out.push(...trySplit(p.region, ctx, img.width, img.height, p.bg, others, p.loose))
         } else {
           out.push(p.region)
         }
