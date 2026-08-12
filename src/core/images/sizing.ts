@@ -189,6 +189,39 @@ export function sizingAxesFor(region: {
   return { inkHeightPx: inkBBox.h, fitBoxWPt: region.bbox.w, fitBoxHPtFloor: region.bbox.h }
 }
 
+// Mirrors fit-engine.ts's LINE_HEIGHT_FACTOR (module-private there) - the
+// same duplicated-constant approach overlay.ts/image-adapter.ts already
+// take, used here only to judge a wrapped block's height.
+const WRAP_LINE_HEIGHT_FACTOR = 1.2
+
+// A wrapped block may exceed the region's cross axis by this much before it
+// is judged unpaintable - dilation slack, not a layout allowance.
+const WRAP_OVERFLOW_SLACK_PX = 2
+
+/**
+ * True when a paint of `lineCount` lines at `sizePt` cannot fit inside the
+ * region's own fill box on the line-stacking axis (bbox.h, or bbox.w for a
+ * rotated region). fit() lays lines out against a fit BUDGET that is
+ * deliberately taller than the region (image-adapter.ts's box.hPt doc
+ * comment), so a translation can legally wrap into more lines than the
+ * region has room to paint - live slide-6 failure: "RH" -> a two-line CJK
+ * wrap in a one-line cell, the second line hanging over the neighbor's
+ * pixels. Such a paint violates the only-original-space constraint no
+ * matter the size, so the caller must skip it and keep the original pixels.
+ */
+export function wrappedPaintOverflows(
+  lineCount: number,
+  sizePt: number,
+  region: { bbox: RegionBBox; rotation?: 0 | 90 | -90 }
+): boolean {
+  // Single-line paints are band-sized (refinePaintSizes) and clamped inside
+  // the fill box at draw time (overlay.ts) - only WRAPPED blocks can hang
+  // whole lines outside the region.
+  if (lineCount <= 1) return false
+  const axisPx = region.rotation === 90 || region.rotation === -90 ? region.bbox.w : region.bbox.h
+  return lineCount * sizePt * WRAP_LINE_HEIGHT_FACTOR > axisPx + WRAP_OVERFLOW_SLACK_PX
+}
+
 // ---- apply-time paint-size refinement (gate round 3: "font sizes are all
 // off and furthermore all over the place... pixel-perfect word replacement")
 //

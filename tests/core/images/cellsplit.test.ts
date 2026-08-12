@@ -281,6 +281,177 @@ describe('withCellSplit - splits a row-merged detection at true cell gutters', (
     expect(result[0].bbox.y + result[0].bbox.h).toBeGreaterThanOrEqual(24)
   })
 
+  it('picks the band the detector box overlaps when neither band ink-dominates, and clips the fill box off the neighbor line', async () => {
+    // Real slide-6 failure: two stacked cell labels ("Date and Time" /
+    // "Starting.") have near-equal ink, so the dominance rule declined and
+    // the slack detector box became the size authority (18-27px "ink" for a
+    // 12px line). The detector box itself says WHICH line was read - it
+    // covers line A fully and only grazes line B - so the band it overlaps
+    // decisively must win, and the fill box must stop short of line B
+    // instead of erasing B's glyph tops.
+    const canvas = createCanvas(200, 60)
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, 200, 60)
+    ctx.fillStyle = '#000000'
+    ctx.fillRect(10, 20, 110, 12) // line A rows 20..32 (ink share ~0.56 - no dominance)
+    ctx.fillRect(10, 40, 88, 12) // line B rows 40..52
+    const buf = await canvas.toBuffer('png')
+    const region = rawRegion({ bbox: { x: 0, y: 18, w: 200, h: 26 }, text: 'AAAA BBBB' })
+    const { engine } = fakeEngine([region])
+
+    const result = await withCellSplit(engine).detectRegions(buf)
+
+    expect(result).toHaveLength(1)
+    expect(result[0].inkBBox?.y).toBe(20)
+    expect(result[0].inkBBox?.h).toBe(12)
+    expect(result[0].bbox.y).toBe(18) // loose top kept - nothing above to protect
+    // Bottom clipped clear of line B (post-validation dilation adds 2px
+    // back, so the pre-dilation box must stop at 40 - 2 = 38 or earlier).
+    expect(result[0].bbox.y + result[0].bbox.h).toBeGreaterThanOrEqual(32)
+    expect(result[0].bbox.y + result[0].bbox.h).toBeLessThanOrEqual(38)
+  })
+
+  it('excludes ink owned by another trustworthy detection from the span profile, so the remaining tokens distribute cleanly', async () => {
+    // Real slide-6 failure: PP-OCR's "Fill Volume: 2 Resistance: 2.3 60% RH"
+    // row-merge lassoed the neighboring "Storage Humidity:" cell's ink. That
+    // foreign span made the token DP impossible, so the WHOLE row dropped
+    // (Fill Volume:/Resistance: vanished); when it half-worked, a token got
+    // force-assigned onto the foreign span ("60%" onto the Humidity cell).
+    // Ink already accounted for by ANOTHER, trustworthy (not row-merged-
+    // shaped) detection is not this region's to distribute - those columns
+    // are excluded like gridlines, and the remaining spans split cleanly.
+    const canvas = createCanvas(240, 40)
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, 240, 40)
+    ctx.fillStyle = '#000000'
+    ctx.fillRect(10, 5, 50, 12) // blob 1 - "AAAA", rows 5..17
+    // The interloper mirrors the real "Storage Humidity:" shape: a
+    // two-line neighbor whose upper line GRAZES the merge's band rows
+    // (5 rows) while most of its ink sits below - so the band-level
+    // double-vote dedup correctly does not fire (different readings of
+    // different ink), yet the graze forms a foreign span in the merge's
+    // own column profile.
+    ctx.fillRect(90, 13, 50, 5) // interloper line 1 top graze, rows 13..18
+    ctx.fillRect(90, 22, 50, 5) // interloper line 2, rows 22..27
+    ctx.fillRect(170, 5, 50, 12) // blob 3 - "BBBB", rows 5..17
+    const buf = await canvas.toBuffer('png')
+    const merged = rawRegion({ bbox: { x: 0, y: 4, w: 240, h: 14 }, text: 'AAAA BBBB' })
+    const interloper = rawRegion({
+      id: 'raw2',
+      bbox: { x: 88, y: 12, w: 54, h: 22 },
+      text: 'XX',
+      confidence: 0.95
+    })
+    const { engine } = fakeEngine([merged, interloper])
+
+    const result = await withCellSplit(engine).detectRegions(buf)
+
+    const texts = result.map((r) => r.text).sort()
+    expect(texts).toEqual(['AAAA', 'BBBB', 'XX'])
+    const cellA = result.find((r) => r.text === 'AAAA')!
+    const cellB = result.find((r) => r.text === 'BBBB')!
+    // Without the exclusion this was a 3-span/2-token refusal -> the whole
+    // region dropped. With it, AAAA and BBBB hug their own blobs and the
+    // interloper's zone is left to region S.
+    expect(cellA.bbox.x + cellA.bbox.w).toBeLessThanOrEqual(62)
+    expect(cellB.bbox.x).toBeGreaterThanOrEqual(168)
+  })
+
+  it('does not let a vertically-adjacent trustworthy neighbor gut the region band - exclusion is the neighbor RECT, not its whole columns', async () => {
+    // Real slide-6 failure: "Step 1:..." sits directly above the trusted
+    // "at60C, 60% RH" continuation line. Excluding the neighbor's COLUMNS
+    // from the whole window also erased Step 1's own glyph rows wherever
+    // they shared x with the neighbor - the sparse cap rows fell under the
+    // ink threshold and the band (and the paint size) shrank. Only the
+    // neighbor's own ROWS may be masked.
+    const canvas = createCanvas(240, 44)
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, 240, 44)
+    ctx.fillStyle = '#000000'
+    ctx.fillRect(80, 5, 60, 2) // the line's cap tips - only inside the neighbor's x-range
+    ctx.fillRect(10, 7, 210, 11) // the line's body, rows 7..18
+    ctx.fillRect(60, 24, 100, 12) // the trusted neighbor line BELOW, rows 24..36
+    const buf = await canvas.toBuffer('png')
+    const line = rawRegion({ bbox: { x: 5, y: 4, w: 225, h: 15 }, text: 'AAAA BBBB' })
+    const neighbor = rawRegion({
+      id: 'raw2',
+      bbox: { x: 58, y: 23, w: 104, h: 14 },
+      text: 'XX',
+      confidence: 0.95
+    })
+    const { engine } = fakeEngine([line, neighbor])
+
+    const result = await withCellSplit(engine).detectRegions(buf)
+
+    const painted = result.find((r) => r.text === 'AAAA BBBB')
+    expect(painted).toBeDefined()
+    expect(painted!.inkBBox?.y).toBe(5)
+    expect(painted!.inkBBox?.h).toBe(13)
+  })
+
+  it('picks the heavier side when a drawn border row separates the candidate bands, even at a modest ink margin', async () => {
+    // Real slide-6 failures ("at60C, 60% RH", "Horizontal test"): PP-OCR's
+    // box straddled its own line and the NEXT ROW's line almost evenly, so
+    // the 2x decisive rule declined and the slack box painted a union-height
+    // smear across the table border. A drawn border BETWEEN the candidate
+    // bands is structural proof they belong to different cells - one
+    // detection reads one cell, so the band with more in-box ink wins at a
+    // much smaller margin.
+    const canvas = createCanvas(200, 70)
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, 200, 70)
+    ctx.fillStyle = '#000000'
+    ctx.fillRect(10, 20, 110, 10) // line A rows 20..30
+    ctx.fillRect(0, 34, 200, 2) // table border rows 34..36
+    ctx.fillRect(10, 40, 90, 10) // next row's line B rows 40..50
+    const buf = await canvas.toBuffer('png')
+    // Box rows 24..44: in-box ink A ~660 vs B ~360 - under the 2x plain
+    // rule, over the border-backed 1.2x rule.
+    const region = rawRegion({ bbox: { x: 0, y: 24, w: 200, h: 20 }, text: 'AAAA BBBB' })
+    const { engine } = fakeEngine([region])
+
+    const result = await withCellSplit(engine).detectRegions(buf)
+
+    expect(result).toHaveLength(1)
+    expect(result[0].inkBBox?.y).toBe(20)
+    expect(result[0].inkBBox?.h).toBe(10)
+    // Fill box clipped clear of the border (and of line B beyond it).
+    expect(result[0].bbox.y).toBe(20)
+    expect(result[0].bbox.y + result[0].bbox.h).toBeGreaterThanOrEqual(30)
+    expect(result[0].bbox.y + result[0].bbox.h).toBeLessThanOrEqual(32)
+  })
+
+  it('clips the fill box at a horizontal border row below the band instead of erasing it', async () => {
+    // Real slide-6 failure: the "hours" cell's box ran past the row border
+    // below it, so the fill erased a segment of the drawn table line and
+    // the repaint appeared struck-through. The erased-border rows found by
+    // the transposed gridline pass are drawn structure to PRESERVE: the
+    // fill box must stop short of them (dilation-adjusted), never cover.
+    const canvas = createCanvas(200, 40)
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, 200, 40)
+    ctx.fillStyle = '#000000'
+    ctx.fillRect(10, 10, 180, 12) // text band rows 10..22
+    ctx.fillRect(0, 30, 200, 2) // full-width table border rows 30..32
+    const buf = await canvas.toBuffer('png')
+    const region = rawRegion({ bbox: { x: 0, y: 8, w: 200, h: 28 }, text: 'AAAA BBBB' })
+    const { engine } = fakeEngine([region])
+
+    const result = await withCellSplit(engine).detectRegions(buf)
+
+    expect(result).toHaveLength(1)
+    expect(result[0].inkBBox?.y).toBe(10)
+    expect(result[0].inkBBox?.h).toBe(12)
+    expect(result[0].bbox.y).toBe(8)
+    expect(result[0].bbox.y + result[0].bbox.h).toBeGreaterThanOrEqual(22)
+    expect(result[0].bbox.y + result[0].bbox.h).toBeLessThanOrEqual(28)
+  })
+
   it('leaves a two-line (multi-band) detection box vertically untouched', async () => {
     const canvas = createCanvas(200, 44)
     const ctx = canvas.getContext('2d')
@@ -463,7 +634,10 @@ describe('withCellSplit - splits a row-merged detection at true cell gutters', (
     expect(result).toHaveLength(1)
     expect(result[0].inkBBox?.y).toBe(3)
     expect(result[0].inkBBox?.h).toBe(10)
-    expect(result[0].bbox).toEqual({ x: 0, y: 0, w: 120, h: 22 })
+    // The fill box is clipped clear of the neighbor line's glyph tops
+    // (rows 19..21) so the fill can never shave them: bottom stops at
+    // 19 - DILATION_PX = 17 (validation's dilation adds the 2px back).
+    expect(result[0].bbox).toEqual({ x: 0, y: 0, w: 120, h: 17 })
   })
 
   it('maps spans back into image coordinates for a region not at the origin', async () => {

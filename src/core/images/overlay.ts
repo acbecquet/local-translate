@@ -9,6 +9,18 @@ import { createCanvas, registerBundledFonts, resolveFamily } from '../fit/fonts'
 
 export interface OverlayRegion {
   bbox: RegionBBox
+  /**
+   * The region's measured ink band (regions.ts's TextRegion.inkBBox - the
+   * SIZE authority upstream). When present, a single-line unrotated paint
+   * anchors its INK on this band's vertical center (clamped inside `bbox`,
+   * the filled rect) instead of centering in the loose bbox - the box often
+   * carries slack past the original line, and centering in it painted
+   * replacements visibly below/above the text they replace (live: "hours"
+   * repainted sitting ON the table border its box overlapped). Absent, or
+   * for multi-line/rotated paints, layout is unchanged: block-centered in
+   * bbox.
+   */
+  inkBBox?: RegionBBox
   /** FitEngine's fittedLines. */
   lines: string[]
   /** FitEngine's fittedSizePt. */
@@ -62,6 +74,12 @@ const TEXT_CLUSTER_DISTANCE_FLOOR = 40
 // Plan point 3: fill luminance at/above this gets black fallback text,
 // below it gets white fallback text.
 const FILL_LUMINANCE_THRESHOLD = 140
+
+// The fraction of the far (text) cluster's pixels - ranked by distance from
+// the fill - whose mean becomes the paint color. Small rasterized text is
+// mostly antialiased blend pixels, so the whole cluster's mean is visibly
+// washed out next to the original; the top quarter is the glyph core.
+const TEXT_CORE_FRACTION = 0.25
 
 // skia-canvas's ExportOptions.quality is a 0.0-1.0 fraction, not the
 // conventional 0-100 JPEG quality scale the plan's "quality 90" refers to.
@@ -216,6 +234,7 @@ function textColorFor(pixels: RGB[], fill: RGB): RGB {
   let centroidNear: RGB = { ...fill }
   let centroidFar: RGB = { ...pixels[farIdx] }
 
+  let lastFarGroup: RGB[] = []
   for (let iter = 0; iter < 10; iter++) {
     const nearGroup: RGB[] = []
     const farGroup: RGB[] = []
@@ -223,6 +242,7 @@ function textColorFor(pixels: RGB[], fill: RGB): RGB {
       if (distance(p, centroidNear) <= distance(p, centroidFar)) nearGroup.push(p)
       else farGroup.push(p)
     }
+    lastFarGroup = farGroup
     const nextNear = meanColor(nearGroup) ?? centroidNear
     const nextFar = meanColor(farGroup) ?? centroidFar
     const converged = colorsEqual(nextNear, centroidNear) && colorsEqual(nextFar, centroidFar)
@@ -231,7 +251,17 @@ function textColorFor(pixels: RGB[], fill: RGB): RGB {
     if (converged) break
   }
 
-  return distance(centroidFar, fill) >= distance(centroidNear, fill) ? centroidFar : centroidNear
+  const textCluster =
+    distance(centroidFar, fill) >= distance(centroidNear, fill) ? centroidFar : centroidNear
+  if (textCluster !== centroidFar || lastFarGroup.length === 0) return textCluster
+  // The far cluster's MEAN is diluted by antialiased blend pixels - at
+  // small text sizes most glyph pixels ARE blend, so the mean lands
+  // mid-gray and every small repaint looks washed out (live slide-6
+  // failure). The true glyph color is the cluster's CORE: the mean of its
+  // pixels farthest from the fill.
+  const ranked = lastFarGroup.map((p) => ({ p, d: distance(p, fill) })).sort((a, b) => b.d - a.d)
+  const core = ranked.slice(0, Math.max(1, Math.ceil(ranked.length * TEXT_CORE_FRACTION)))
+  return meanColor(core.map((c) => c.p)) ?? textCluster
 }
 
 function toHex(c: RGB): string {
@@ -353,9 +383,44 @@ function paintRegion(
 
   if (region.rotation === 90 || region.rotation === -90) {
     paintRotatedLines(ctx, inner, region.rotation, region.lines, region.fontSizePt)
+  } else if (region.inkBBox && region.lines.length === 1) {
+    paintBandAnchoredLine(ctx, inner, region.inkBBox, region.lines[0])
   } else {
     drawLinesInBox(ctx, inner, region.lines, region.fontSizePt)
   }
+}
+
+/**
+ * Single-line paint anchored on the region's measured ink band (see
+ * OverlayRegion.inkBBox): the line's MEASURED ink (actualBoundingBox
+ * ascent/descent, the same metric sizing.ts matches sizes with) is centered
+ * on the band's vertical center, then clamped so the ink stays inside
+ * `inner` - the filled rect - because glyphs drawn outside the fill would
+ * overpaint original pixels (the only-original-space constraint). A line
+ * whose ink is taller than `inner` itself (CJK overshoot on a shallow box)
+ * centers in `inner`, the pre-band behavior. ctx.font/fillStyle/textAlign
+ * must already be set by the caller.
+ */
+function paintBandAnchoredLine(
+  ctx: CanvasRenderingContext2D,
+  inner: RegionBBox,
+  band: RegionBBox,
+  line: string
+): void {
+  ctx.save()
+  // Baseline set BEFORE measuring: skia's actualBoundingBox ascent/descent
+  // are reported relative to the CURRENT textBaseline, and the draw below
+  // must happen in the same frame the measurement was taken in.
+  ctx.textBaseline = 'alphabetic'
+  const m = ctx.measureText(line)
+  const ascent = m.actualBoundingBoxAscent
+  const descent = m.actualBoundingBoxDescent
+  const lo = inner.y + ascent
+  const hi = inner.y + inner.h - descent
+  const target = band.y + band.h / 2 + (ascent - descent) / 2
+  const baseline = lo > hi ? (lo + hi) / 2 : Math.min(hi, Math.max(lo, target))
+  ctx.fillText(line, inner.x, baseline)
+  ctx.restore()
 }
 
 /**

@@ -4,6 +4,7 @@ import {
   inkMatchedFontSizePt,
   refinePaintSizes,
   sizingAxesFor,
+  wrappedPaintOverflows,
   type PaintSizeItem
 } from '../../../src/core/images/sizing'
 import type { FontSpec } from '../../../src/core/segments'
@@ -261,5 +262,27 @@ describe('refinePaintSizes - apply-time paint sizing (feedback loop: cap-normali
       item(['two', 'lines'], 'src', s, cjkFont, s)
     )
     expect(refinePaintSizes(rows)).toEqual([8, 8, 9.7, 9.7, 11.8, 11.8])
+  })
+})
+
+describe('wrappedPaintOverflows - a wrapped block that cannot fit its region is unpaintable (slide-6 feedback loop)', () => {
+  it('flags a 2-line wrap in a single-line-tall region', () => {
+    // Real slide-6 failure: "RH" -> a two-line CJK wrap in a one-line cell,
+    // the second line hanging outside the cell over the neighbor's pixels.
+    const region = { bbox: { x: 0, y: 0, w: 40, h: 18 } }
+    expect(wrappedPaintOverflows(2, 12, region)).toBe(true)
+  })
+
+  it('passes a single-line paint and a genuine two-line region', () => {
+    expect(wrappedPaintOverflows(1, 12, { bbox: { x: 0, y: 0, w: 40, h: 18 } })).toBe(false)
+    // A real two-line detection's box is two lines tall - it fits.
+    expect(wrappedPaintOverflows(2, 12, { bbox: { x: 0, y: 0, w: 200, h: 32 } })).toBe(false)
+  })
+
+  it('checks the run axis (bbox.w) for rotated regions', () => {
+    const tall = { bbox: { x: 0, y: 0, w: 18, h: 200 }, rotation: 90 as const }
+    expect(wrappedPaintOverflows(2, 12, tall)).toBe(true)
+    const wide = { bbox: { x: 0, y: 0, w: 32, h: 200 }, rotation: 90 as const }
+    expect(wrappedPaintOverflows(2, 12, wide)).toBe(false)
   })
 })

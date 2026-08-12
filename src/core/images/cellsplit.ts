@@ -34,7 +34,7 @@
 import { loadImage } from 'skia-canvas'
 import { createCanvas, measureCtx, registerBundledFonts, resolveFamily } from '../fit/fonts'
 import { containsCjk } from './gating'
-import { iou, type RegionEngine, type TextRegion } from './regions'
+import { DILATION_PX, iou, type RegionEngine, type TextRegion } from './regions'
 import { inkMatchedFontSizePt } from './sizing'
 
 // A pixel is ink when its luminance differs from the crop's estimated
@@ -134,6 +134,25 @@ const DOMINANT_BAND_MIN_INK_SHARE = 0.7
 const BAND_SEARCH_EXPAND_RATIO = 0.75
 const BAND_SEARCH_EXPAND_MAX_PX = 14
 
+// When no band is ink-DOMINANT (stacked cell labels run near 50/50), the
+// detector box itself says which line was read: it covers the read line
+// (mostly) and only grazes the neighbor. The band whose IN-BOX INK beats
+// the runner-up's decisively wins - ink, not row count, because a grazed
+// neighbor contributes ascender-tip rows that carry almost nothing; a
+// near-tie means a genuine multi-line detection and banding declines
+// exactly as before. (Live failure: "Date and Time" over "Starting." split
+// ink 60/40, dominance declined, and the slack detector box became an 18px
+// "ink" height for a 12px line - every stacked label painted ~1.5x
+// oversized.) When an ERASED BORDER ROW lies between the two leading bands
+// the bar drops to BAND_REF_BORDER_RATIO: a drawn table border between
+// them is structural proof they belong to different cells, and one
+// detection reads one cell (live failures: "at60C" and "Horizontal test"
+// boxes straddled their own line and the next row's almost evenly, ink
+// ratios 1.5-2.5, and painted union-height smears across the border).
+const BAND_REF_MIN_OVERLAP_PX = 3
+const BAND_REF_DECISIVE_RATIO = 2
+const BAND_REF_BORDER_RATIO = 1.2
+
 // When distribution REFUSES, the refusal normally keeps the region painting
 // as one block (status quo). But a region whose profile shows at least this
 // many SUBSTANTIAL ink spans is demonstrably multi-cell content - and
@@ -150,6 +169,78 @@ const DROP_MIN_SUBSTANTIAL_SPANS = 3
 // "Substantial" = wide enough to survive regions.ts's own NOISE_FLOOR_PX
 // (8) - slivers and artifacts must not count as cell evidence.
 const SUBSTANTIAL_SPAN_MIN_PX = 8
+
+// Foreign-ink exclusion: a row-merged detection often lassoes ink that
+// ANOTHER detection already reads (live: "Fill Volume: 2 Resistance: 2.3
+// 60% RH" swallowed the neighboring "Storage Humidity:" cell's ink - the
+// foreign span made the token DP impossible and the whole row DROPPED, or
+// worse, force-assigned a token onto the foreign cell; the same foreign
+// rows also fused the row-merge's own band measurement into a multi-line
+// union band, which then chain-killed innocent neighbors through the
+// double-vote dedup). Ink accounted for by another region is not this
+// region's to distribute or to measure, so its columns are excluded from
+// BOTH the row-band profile (tightenVertical) and the span profile
+// (trySplit) - but only when the other region is TRUSTWORTHY: its box no
+// wider than this many times its own line height. A row-merged box (aspect
+// 20-60 on the real slide) must never veto ink out of a fellow row-merge.
+// As a second guard, exclusion is skipped when the other region's text
+// occurs inside this region's own text - that shape is double coverage
+// (both detections read the same cell), and erasing the span would cram
+// this region's matching tokens into the wrong cells.
+const TRUSTWORTHY_MAX_ASPECT = 12
+
+// An interloper is a PARTIAL x-slice of a wider region. Another region
+// whose zone would cover at least this fraction of the region's own width
+// is not an interloper but a COMPETING READING of the same ink - that
+// conflict belongs to the double-vote dedup, and mutual exclusion here
+// would blind both regions' band measurements instead (observed: the
+// phantom-vs-"1/2" dedup pair stopped converging on the shared band).
+const FOREIGN_ZONE_MAX_WIDTH_FRACTION = 0.5
+
+interface ForeignZone {
+  x0: number
+  x1: number
+  y0: number
+  y1: number
+}
+
+/**
+ * The image-space RECTS owned by trustworthy other regions whose rows
+ * intersect [rowFrom, rowTo) - see TRUSTWORTHY_MAX_ASPECT. Rects carry
+ * DILATION_PX of margin per side: the owner's box hugs its glyphs, and
+ * leaving the antialiased fringe behind forms a sliver span that poisons
+ * the token DP exactly like the full foreign span did. The vertical extent
+ * matters: masking a neighbor's whole COLUMNS also erased the REGION'S OWN
+ * ink wherever the two merely shared x (live: "Step 1"'s cap rows fell
+ * under the ink threshold because the trusted line BELOW it shared their
+ * columns, and the band undersized the paint).
+ */
+function foreignZones(
+  region: TextRegion,
+  others: TextRegion[],
+  rowFrom: number,
+  rowTo: number
+): ForeignZone[] {
+  const zones: ForeignZone[] = []
+  for (const other of others) {
+    const oBand = other.inkBBox ?? other.bbox
+    const oAspect = oBand.h > 0 ? other.bbox.w / oBand.h : Infinity
+    if (oAspect > TRUSTWORTHY_MAX_ASPECT) continue
+    if (Math.min(rowTo, oBand.y + oBand.h) - Math.max(rowFrom, oBand.y) <= 0) continue
+    if (region.text.includes(other.text.trim())) continue
+    const zx0 = Math.floor(other.bbox.x) - DILATION_PX
+    const zx1 = Math.ceil(other.bbox.x + other.bbox.w) + DILATION_PX
+    const inRegion = Math.min(zx1, region.bbox.x + region.bbox.w) - Math.max(zx0, region.bbox.x)
+    if (inRegion >= region.bbox.w * FOREIGN_ZONE_MAX_WIDTH_FRACTION) continue
+    zones.push({
+      x0: zx0,
+      x1: zx1,
+      y0: Math.floor(oBand.y) - DILATION_PX,
+      y1: Math.ceil(oBand.y + oBand.h) + DILATION_PX
+    })
+  }
+  return zones
+}
 
 interface ColumnStats {
   ink: number
@@ -381,24 +472,30 @@ function transposeRgba(data: Uint8ClampedArray, w: number, h: number): Uint8Clam
   return out
 }
 
+interface InkBand {
+  span: InkSpan
+  ink: number
+}
+
 /**
- * The crop's ink ROW band [start, end), or null when there is no usable
- * band. Gaps up to BAND_GAP_TOLERANCE_PX rows are bridged; wider gaps
- * separate distinct bands. With several bands, the ink-DOMINANT one wins
- * when it owns at least DOMINANT_BAND_MIN_INK_SHARE of the total ink (the
- * minority band is neighbor-line bleed the detection box caught - the real
- * slide's "Storage" box carried a 2px sliver of the next line and painted
- * ~2x oversized); BALANCED bands mean a genuine multi-line detection and
- * banding declines. Horizontal border lines are erased first, exactly like
- * vertical gridlines are for the column profile.
+ * The crop's ink ROW bands plus which rows were erased as horizontal border
+ * lines (exactly like vertical gridlines are for the column profile - the
+ * erased rows also mark drawn structure the fill box must never cover).
+ * Gaps up to BAND_GAP_TOLERANCE_PX rows are bridged; wider gaps separate
+ * distinct bands.
  */
-function inkRowBand(data: Uint8ClampedArray, w: number, h: number, bg: number): InkSpan | null {
+function inkRowBands(
+  data: Uint8ClampedArray,
+  w: number,
+  h: number,
+  bg: number
+): { bands: InkBand[]; erased: boolean[]; counts: number[] } {
   const rowStats = analyzeColumns(transposeRgba(data, w, h), h, w, bg)
-  const { counts } = eraseGridlineColumns(rowStats, w)
+  const { counts, erased } = eraseGridlineColumns(rowStats, w)
   const emptyMax = Math.max(1, Math.round(w * ROW_EMPTY_MAX_FRACTION))
   const isInk = counts.map((c) => c > emptyMax)
 
-  const bands: { span: InkSpan; ink: number }[] = []
+  const bands: InkBand[] = []
   let y = 0
   while (y < h) {
     if (!isInk[y]) {
@@ -422,28 +519,90 @@ function inkRowBand(data: Uint8ClampedArray, w: number, h: number, bg: number): 
     for (let r = start; r < end; r++) ink += counts[r]
     bands.push({ span: { start, end }, ink })
   }
+  return { bands, erased, counts }
+}
 
+/**
+ * The band to size from, or null when none is trustworthy. A single band
+ * wins outright; the ink-DOMINANT one wins when it owns at least
+ * DOMINANT_BAND_MIN_INK_SHARE of the total ink (the minority band is
+ * neighbor-line bleed the detection box caught - the real slide's "Storage"
+ * box carried a 2px sliver of the next line and painted ~2x oversized).
+ * With balanced bands, `ref` (the detector box's own rows) picks the band
+ * whose in-box ink beats the runner-up's decisively - a drawn border row
+ * between the two leading bands lowers the bar (see the BAND_REF_*
+ * constants above); a near-tie means a genuine multi-line detection and
+ * banding declines.
+ */
+function chooseBand(
+  bands: InkBand[],
+  ref: InkSpan,
+  counts: number[] = [],
+  erased: boolean[] = []
+): InkSpan | null {
   if (bands.length === 0) return null
   if (bands.length === 1) return bands[0].span
   const total = bands.reduce((a, b) => a + b.ink, 0)
   const dominant = bands.reduce((a, b) => (b.ink > a.ink ? b : a))
-  return dominant.ink >= total * DOMINANT_BAND_MIN_INK_SHARE ? dominant.span : null
+  if (dominant.ink >= total * DOMINANT_BAND_MIN_INK_SHARE) return dominant.span
+
+  const overlapRows = bands.map((b) =>
+    Math.max(0, Math.min(b.span.end, ref.end) - Math.max(b.span.start, ref.start))
+  )
+  const overlapInk = bands.map((b) => {
+    let ink = 0
+    const from = Math.max(b.span.start, ref.start)
+    const to = Math.min(b.span.end, ref.end)
+    for (let r = from; r < to; r++) ink += counts[r] ?? 0
+    return ink
+  })
+  let bestIdx = 0
+  let runnerIdx = -1
+  for (let i = 1; i < bands.length; i++) {
+    if (overlapInk[i] > overlapInk[bestIdx]) {
+      runnerIdx = bestIdx
+      bestIdx = i
+    } else if (runnerIdx === -1 || overlapInk[i] > overlapInk[runnerIdx]) {
+      runnerIdx = i
+    }
+  }
+  const borderBetween = (() => {
+    if (runnerIdx === -1 || overlapInk[runnerIdx] === 0) return false
+    const gapStart = Math.min(bands[bestIdx].span.end, bands[runnerIdx].span.end)
+    const gapEnd = Math.max(bands[bestIdx].span.start, bands[runnerIdx].span.start)
+    for (let r = gapStart; r < gapEnd; r++) {
+      if (erased[r]) return true
+    }
+    return false
+  })()
+  const ratio = borderBetween ? BAND_REF_BORDER_RATIO : BAND_REF_DECISIVE_RATIO
+  const runnerInk = runnerIdx === -1 ? 0 : overlapInk[runnerIdx]
+  return overlapRows[bestIdx] >= BAND_REF_MIN_OVERLAP_PX && overlapInk[bestIdx] >= runnerInk * ratio
+    ? bands[bestIdx].span
+    : null
 }
 
 /**
  * `region` with its inkBBox set to the measured ink row band (the SIZE
  * authority downstream - validateRegions preserves an engine-provided
  * inkBBox) - or unchanged (same object) when the band is absent,
- * multi-line, degenerate, or the full crop height. The bbox itself is
- * NEVER shrunk: it stays the loose detector box, the FILL/coverage
- * authority - painting only the band left the original's antialiased
- * fringe uncovered as a visible ghost around every repainted line.
+ * ambiguous, degenerate, or the full crop height. The bbox (FILL
+ * authority) grows to cover the full glyph band - painting only the band
+ * left the original's antialiased fringe uncovered as a visible ghost
+ * around every repainted line - but is then clipped away from FOREIGN ink:
+ * a neighbor line's band or an erased border row must never be erased by
+ * this region's fill (live failures: stacked-label boxes shaved the glyph
+ * tops off the line below; the "hours" box erased a segment of the table
+ * border under it). Clip limits stand DILATION_PX clear of the
+ * obstruction, so validateRegions's later dilation lands exactly at its
+ * edge; slack over genuinely EMPTY rows is kept as before.
  */
 function tightenVertical(
   region: TextRegion,
   ctx: Canvas2D,
   imgW: number,
-  imgH: number
+  imgH: number,
+  others: TextRegion[] = []
 ): { region: TextRegion; bg: number | null } {
   const x0 = Math.max(0, Math.floor(region.bbox.x))
   const y0 = Math.max(0, Math.floor(region.bbox.y))
@@ -461,15 +620,53 @@ function tightenVertical(
   const eh = ey1 - ey0
   const data = ctx.getImageData(x0, ey0, w, eh).data
   const bg = estimateBackground(data, w, eh)
-  const band = inkRowBand(data, w, eh, bg)
+  // Foreign RECTS are blanked to flat background before the row profile so
+  // a row-merge bands to ITS OWN line instead of a union with the
+  // neighbors it lassoed - see TRUSTWORTHY_MAX_ASPECT/foreignZones.
+  for (const z of foreignZones(region, others, ey0, ey1)) {
+    const fx0 = Math.max(x0, z.x0)
+    const fx1 = Math.min(x1, z.x1)
+    const fy0 = Math.max(ey0, z.y0)
+    const fy1 = Math.min(ey1, z.y1)
+    const flat = Math.round(bg)
+    for (let yy = fy0; yy < fy1; yy++) {
+      for (let xx = fx0; xx < fx1; xx++) {
+        const i = 4 * ((yy - ey0) * w + (xx - x0))
+        data[i] = flat
+        data[i + 1] = flat
+        data[i + 2] = flat
+      }
+    }
+  }
+  const { bands, erased, counts } = inkRowBands(data, w, eh, bg)
+  const band = chooseBand(bands, { start: y0 - ey0, end: y1 - ey0 }, counts, erased)
   if (!band) return { region, bg }
   const bandY = ey0 + band.start
   const bandH = band.end - band.start
   if (bandH < MIN_BAND_H_PX || bandH >= eh) return { region, bg }
-  // bbox (the FILL authority) grows to cover the full glyph band; it never
-  // shrinks. inkBBox (the SIZE authority) is the band itself.
-  const top = Math.min(region.bbox.y, bandY)
-  const bottom = Math.max(region.bbox.y + region.bbox.h, bandY + bandH)
+
+  let top = Math.min(region.bbox.y, bandY)
+  let bottom = Math.max(region.bbox.y + region.bbox.h, bandY + bandH)
+  let aboveLimit = -Infinity
+  let belowLimit = Infinity
+  for (const b of bands) {
+    if (b.span === band) continue
+    if (b.span.end <= band.start) {
+      aboveLimit = Math.max(aboveLimit, ey0 + b.span.end + DILATION_PX)
+    }
+    if (b.span.start >= band.end) {
+      belowLimit = Math.min(belowLimit, ey0 + b.span.start - DILATION_PX)
+    }
+  }
+  for (let r = 0; r < eh; r++) {
+    if (!erased[r]) continue
+    if (r < band.start) aboveLimit = Math.max(aboveLimit, ey0 + r + 1 + DILATION_PX)
+    if (r >= band.end) belowLimit = Math.min(belowLimit, ey0 + r - DILATION_PX)
+  }
+  // The clip never cuts into the chosen band itself: touching an adjacent
+  // obstruction beats shaving the glyphs being replaced.
+  top = Math.min(bandY, Math.max(top, aboveLimit))
+  bottom = Math.max(bandY + bandH, Math.min(bottom, belowLimit))
   return {
     region: {
       ...region,
@@ -539,7 +736,8 @@ function trySplit(
   ctx: Canvas2D,
   imgW: number,
   imgH: number,
-  bg: number
+  bg: number,
+  others: TextRegion[] = []
 ): TextRegion[] {
   const x0 = Math.max(0, Math.floor(region.bbox.x))
   const y0 = Math.max(0, Math.floor(region.bbox.y))
@@ -570,7 +768,24 @@ function trySplit(
     ? { erased: colsLoose.map(() => false) }
     : eraseGridlineColumns(colsLoose, h)
   const counts = cols.map((c, i) => (erased[i] ? 0 : c.ink))
+  // Foreign-ink exclusion - see TRUSTWORTHY_MAX_ASPECT: columns covered by
+  // another trustworthy region whose rows share this BAND are someone
+  // else's text, erased like gridlines (so a valley through them qualifies
+  // at gridline width). Column-scope is correct here - the profile below
+  // only spans the band's own rows.
+  for (const z of foreignZones(region, others, bandY0, bandY0 + bandH)) {
+    for (let cx = Math.max(x0, z.x0); cx < Math.min(x1, z.x1); cx++) {
+      counts[cx - x0] = 0
+      erased[cx - x0] = true
+    }
+  }
   const spans = inkSpans(counts, bandH, erased)
+  if (process.env.CELLSPLIT_DEBUG) {
+    console.error(
+      `[cellsplit] "${region.text.slice(0, 40)}" box=[${x0},${y0} ${w}x${h}] band=[${bandY0},${bandH}] ` +
+        `spans=${JSON.stringify(spans.map((s) => [x0 + s.start, x0 + s.end]))}`
+    )
+  }
   if (spans.length < 2) return [region]
 
   const { tokenWidths, spaceWidth } = measuredTokenWidths(tokens, region.text)
@@ -581,6 +796,9 @@ function trySplit(
   )
   if (!groups) {
     const substantial = spans.filter((s) => s.end - s.start >= SUBSTANTIAL_SPAN_MIN_PX).length
+    if (process.env.CELLSPLIT_DEBUG) {
+      console.error(`[cellsplit]   -> DP null, substantial=${substantial}`)
+    }
     return substantial >= DROP_MIN_SUBSTANTIAL_SPANS ? [] : [region]
   }
 
@@ -597,7 +815,11 @@ function trySplit(
     // refinePaintSizes's cluster snap exists to absorb.
     const spanW = span.end - span.start
     const cellData = ctx.getImageData(x0 + span.start, y0, spanW, h).data
-    const cellBand = inkRowBand(cellData, spanW, h, bg)
+    const cellRef: InkSpan = band
+      ? { start: bandY0 - y0, end: bandY0 - y0 + bandH }
+      : { start: 0, end: h }
+    const cellRows = inkRowBands(cellData, spanW, h, bg)
+    const cellBand = chooseBand(cellRows.bands, cellRef, cellRows.counts, cellRows.erased)
     return {
       ...region,
       id: `${region.id}c${i + 1}`,
@@ -650,6 +872,14 @@ function dropDoubleVotes(regions: TextRegion[]): TextRegion[] {
       const sameSpot =
         iou(boxA, boxB) > DOUBLE_VOTE_IOU || overlapOfSmaller(boxA, boxB) >= DOUBLE_VOTE_CONTAINMENT
       if (!sameSpot) continue
+      if (process.env.CELLSPLIT_DEBUG) {
+        console.error(
+          `[cellsplit] double-vote pair: "${a.text.slice(0, 30)}" (${a.confidence}) ` +
+            `vs "${b.text.slice(0, 30)}" (${b.confidence}) ` +
+            `iou=${iou(boxA, boxB).toFixed(2)} cont=${overlapOfSmaller(boxA, boxB).toFixed(2)} ` +
+            `boxA=[${boxA.x},${boxA.y} ${boxA.w}x${boxA.h}] boxB=[${boxB.x},${boxB.y} ${boxB.w}x${boxB.h}]`
+        )
+      }
       dropped.add(a.confidence >= b.confidence ? j : i)
     }
   }
@@ -684,19 +914,42 @@ export function withCellSplit(engine: RegionEngine): RegionEngine {
         }
         // Band-measure FIRST (tightenVertical sets inkBBox, the size
         // authority the split's thresholds and downstream sizing key off).
-        const { region: tightened, bg } = tightenVertical(region, ctx, img.width, img.height)
+        // Fellow RAW regions feed the foreign-column exclusion - their raw
+        // boxes hug their ink well enough to mask a row-merge's lassoed
+        // neighbors out of its band measurement.
+        const rawOthers = regions.filter((r) => r !== region)
+        const { region: tightened, bg } = tightenVertical(
+          region,
+          ctx,
+          img.width,
+          img.height,
+          rawOthers
+        )
         // Hallucination kill - a "reading" that cannot fit its own box is
         // dropped before it can paint or poison a merge (see cannotFitBox).
-        if (cannotFitBox(tightened)) continue
+        if (cannotFitBox(tightened)) {
+          if (process.env.CELLSPLIT_DEBUG) {
+            console.error(`[cellsplit] cannot-fit kill: "${tightened.text.slice(0, 40)}"`)
+          }
+          continue
+        }
         pending.push({ region: tightened, bg })
       }
       // Double-vote dedup runs on the whole band-measured set BEFORE
       // splitting - see dropDoubleVotes.
       const kept = new Set(dropDoubleVotes(pending.map((p) => p.region)))
+      if (process.env.CELLSPLIT_DEBUG) {
+        for (const p of pending) {
+          if (!kept.has(p.region)) {
+            console.error(`[cellsplit] double-vote drop: "${p.region.text.slice(0, 40)}"`)
+          }
+        }
+      }
       for (const p of pending) {
         if (!kept.has(p.region)) continue
         if (p.bg !== null && isSplitCandidate(p.region)) {
-          out.push(...trySplit(p.region, ctx, img.width, img.height, p.bg))
+          const others = [...kept].filter((r) => r !== p.region)
+          out.push(...trySplit(p.region, ctx, img.width, img.height, p.bg, others))
         } else {
           out.push(p.region)
         }

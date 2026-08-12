@@ -235,6 +235,45 @@ describe('renderOverlay - 2-means cluster branch (not just the uniform fallback)
   })
 })
 
+describe('renderOverlay - text color from the glyph CORE, not the antialiased mean (slide-6 feedback loop)', () => {
+  it('paints near-black text when the original glyphs are black with a wide antialiased gray fringe', async () => {
+    // Real slide-6 failure: small text is mostly antialiased blend pixels,
+    // so the far cluster's MEAN landed mid-gray and every small repaint
+    // looked washed out next to its near-black neighbors. The color must
+    // come from the cluster's core (the pixels farthest from the fill).
+    const canvas = createCanvas(300, 60)
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, 300, 60)
+    // Antialias-heavy fake glyphs inside the region: more gray blend pixels
+    // than black core pixels, as small rasterized text really has.
+    ctx.fillStyle = '#808080'
+    ctx.fillRect(60, 20, 120, 20) // blend fringe
+    ctx.fillStyle = '#000000'
+    ctx.fillRect(90, 25, 50, 10) // glyph core
+    const buf = await canvas.toBuffer('png')
+
+    const region: OverlayRegion = {
+      bbox: { x: 50, y: 15, w: 200, h: 30 },
+      lines: ['XX'],
+      fontSizePt: 20,
+      font: { family: 'Noto Sans', sizePt: 20 }
+    }
+    const result = await renderOverlay(buf, [region])
+    const decoded = await decode(result.image)
+
+    // Darkest painted pixel inside the region must be near-black (the
+    // glyph core color), not the fringe-diluted mean gray (~luminance 90+).
+    let darkest = 255
+    for (let y = 15; y < 45; y++) {
+      for (let x = 50; x < 250; x++) {
+        darkest = Math.min(darkest, luminance(pixelAt(decoded, x, y)))
+      }
+    }
+    expect(darkest).toBeLessThan(50)
+  })
+})
+
 describe('renderOverlay - text color contrast (behavior contract point 3)', () => {
   it('picks light text on a dark fill', async () => {
     const input = await solidImageBuffer(120, 60, '#101010', 'png')
@@ -460,6 +499,55 @@ describe('renderOverlay + inkMatchedFontSizePt - pixel-exact ink height (polish 
     // the painted replacement's rendered ink height must match the
     // original's, not the dilated fill box's inflated height.
     expect(Math.abs(paintedInkHeightPx - origInkHeightPx)).toBeLessThanOrEqual(2)
+  })
+})
+
+describe('renderOverlay - single-line paint anchors on the inkBBox band (slide-6 feedback loop)', () => {
+  it('centers the painted ink on the band rows, not on the loose box center', async () => {
+    // Real slide-6 failure: "hours" -> the replacement painted centered in
+    // a loose detector box that ran past the row border, so the glyphs sat
+    // ON the table line instead of where the original line of text was.
+    // With an inkBBox (the measured glyph band) present, a single-line
+    // paint must center its ink on the BAND, not the box.
+    const buffer = await solidImageBuffer(500, 120, '#ffffff')
+    const region: OverlayRegion = {
+      bbox: { x: 20, y: 10, w: 460, h: 100 },
+      inkBBox: { x: 20, y: 20, w: 460, h: 14 },
+      lines: ['XXXX'],
+      fontSizePt: 14,
+      font: { family: 'Noto Sans', sizePt: 14 }
+    }
+
+    const result = await renderOverlay(buffer, [region])
+    const decoded = await decode(result.image)
+
+    const ink = scanInkBBox(decoded, region.bbox, { r: 255, g: 255, b: 255 })
+    expect(ink).not.toBeNull()
+    const centerY = (ink!.minY + ink!.maxY) / 2
+    // Band center is y=27; box-center placement would land ~60.
+    expect(centerY).toBeGreaterThanOrEqual(21)
+    expect(centerY).toBeLessThanOrEqual(33)
+  })
+
+  it('keeps the ink inside the fill box when the band center would push it out', async () => {
+    // A band flush against the box top must not make the paint draw ABOVE
+    // the filled rect (text outside the fill overpaints original pixels).
+    const buffer = await solidImageBuffer(500, 120, '#ffffff')
+    const region: OverlayRegion = {
+      bbox: { x: 20, y: 40, w: 460, h: 30 },
+      inkBBox: { x: 20, y: 36, w: 460, h: 10 },
+      lines: ['XXXX'],
+      fontSizePt: 20,
+      font: { family: 'Noto Sans', sizePt: 20 }
+    }
+
+    const result = await renderOverlay(buffer, [region])
+    const decoded = await decode(result.image)
+
+    const ink = scanInkBBox(decoded, { x: 0, y: 0, w: 500, h: 120 }, { r: 255, g: 255, b: 255 })
+    expect(ink).not.toBeNull()
+    expect(ink!.minY).toBeGreaterThanOrEqual(region.bbox.y)
+    expect(ink!.maxY).toBeLessThan(region.bbox.y + region.bbox.h)
   })
 })
 

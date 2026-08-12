@@ -16,7 +16,12 @@ import {
 } from '../../images/regions'
 import { renderOverlay, type OverlayRegion } from '../../images/overlay'
 import { containsCjk, isSourceLanguageRegion } from '../../images/gating'
-import { inkMatchedFontSizePt, refinePaintSizes, sizingAxesFor } from '../../images/sizing'
+import {
+  inkMatchedFontSizePt,
+  refinePaintSizes,
+  sizingAxesFor,
+  wrappedPaintOverflows
+} from '../../images/sizing'
 
 export interface ImageAdapterOpts {
   /** This run's source language, passed straight into isSourceLanguageRegion
@@ -213,13 +218,20 @@ export function createImageAdapter(engine: RegionEngine, opts: ImageAdapterOpts)
           region
         }))
       )
-      const overlayRegions: OverlayRegion[] = pending.map(({ region, seg }, i) => ({
-        bbox: region.bbox,
-        lines: seg.fittedLines,
-        fontSizePt: sizes[i],
-        font: seg.font,
-        rotation: region.rotation
-      }))
+      const overlayRegions: OverlayRegion[] = pending
+        .map(({ region, seg }, i) => ({ region, seg, sizePt: sizes[i] }))
+        // A wrapped block that cannot fit the region's own box would hang
+        // lines over neighboring pixels - unpaintable; originals stay
+        // (sizing.ts's wrappedPaintOverflows).
+        .filter((p) => !wrappedPaintOverflows(p.seg.fittedLines.length, p.sizePt, p.region))
+        .map(({ region, seg, sizePt }) => ({
+          bbox: region.bbox,
+          inkBBox: region.inkBBox,
+          lines: seg.fittedLines,
+          fontSizePt: sizePt,
+          font: seg.font,
+          rotation: region.rotation
+        }))
 
       const buffer = await readFile(filePath)
       const result = await renderOverlay(buffer, overlayRegions)
