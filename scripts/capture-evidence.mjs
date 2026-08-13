@@ -90,28 +90,54 @@ const reportOnly = process.argv.includes('--report-only')
 
 // Commit-headroom preflight (Windows): a live run charges system commit from
 // two sides at once - the CLI's node process (OCR sessions, image buffers,
-// extract working set) plus ollama's model load (ROCm host allocations). On a
-// machine whose commit is already mostly leaked away (this box's documented
-// driver-leak pattern: tens of GB of commit charged with no owning process),
-// that combination dies as a raw access violation mid-run AND deepens the
-// leak. Refusing up front with a clear message is the machine rule ("never
-// overcommit, never crash-retry") in code. Threshold is deliberately generous:
-// a healthy reboot leaves 25+ GB free, a leaked state leaves < 10.
+// extract working set) plus ollama's model load (ROCm host allocations).
+// Exhausting commit mid-load dies as a raw access violation AND deepens the
+// damage. Refusing up front with a clear message is the machine rule ("never
+// overcommit, never crash-retry") in code.
+//
+// Headroom = STATIC free commit (limit - committed) PLUS the pagefile's
+// EXPANDABLE room (configured maximum minus current size, bounded by free
+// disk on its volume). The static number alone systematically undercounts
+// on this box: the pagefile floor is 1.5 GB against a 48 GB configured max,
+// so the advertised limit sits ~1.5 GB above RAM while any ordinary desktop
+// day charges most of it - yet Windows demonstrably (measured 2026-08-12: an
+// 18 GB untouched commit granted in seconds, auto-trimmed after release)
+// expands the file on demand well past the static limit. A truly exhausted
+// machine fails BOTH terms: commit charged high AND no expandable room left.
 const MIN_COMMIT_HEADROOM_GB = 12
 function commitHeadroomGb() {
   if (process.platform !== 'win32') return Infinity
   try {
-    const kb = Number(
-      execSync(
-        'powershell -NoProfile -Command "(Get-CimInstance Win32_OperatingSystem).FreeVirtualMemory"',
-        { timeout: 30_000 }
-      )
-        .toString()
-        .trim()
+    const out = execFileSync(
+      'powershell',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        '$os = Get-CimInstance Win32_OperatingSystem; ' +
+          '$free = [double]$os.FreeVirtualMemory; ' +
+          '$exp = 0.0; ' +
+          'foreach ($u in @(Get-CimInstance Win32_PageFileUsage)) { ' +
+          '$s = @(Get-CimInstance Win32_PageFileSetting) | Where-Object { $_.Name -ieq $u.Name } | Select-Object -First 1; ' +
+          'if ($s -and $s.MaximumSize -gt 0) { ' +
+          '$roomMb = [math]::Max(0, $s.MaximumSize - $u.AllocatedBaseSize); ' +
+          '$qual = Split-Path $u.Name -Qualifier; ' +
+          "$freeDiskMb = ((Get-PSDrive ($qual.TrimEnd(':'))).Free / 1MB) - 10240; " +
+          '$exp += [math]::Max(0, [math]::Min($roomMb, $freeDiskMb)) } }; ' +
+          'Write-Output ("{0} {1}" -f $free, [math]::Floor($exp))'
+      ],
+      { timeout: 30_000 }
     )
+      .toString()
+      .trim()
+    const [freeKb, expandableMb] = out.split(/\s+/).map(Number)
     // Unparseable output must not block a run - this guard only ever refuses
     // on a POSITIVE reading of exhaustion, never on a failed measurement.
-    return Number.isFinite(kb) && kb > 0 ? (kb * 1024) / 1024 ** 3 : Infinity
+    if (!Number.isFinite(freeKb) || freeKb <= 0) return Infinity
+    const staticGb = (freeKb * 1024) / 1024 ** 3
+    const expandableGb =
+      Number.isFinite(expandableMb) && expandableMb > 0 ? (expandableMb * 1024 ** 2) / 1024 ** 3 : 0
+    return staticGb + expandableGb
   } catch {
     return Infinity
   }
@@ -160,10 +186,11 @@ if (!reportOnly) {
   const headroom = commitHeadroomGb()
   if (headroom < MIN_COMMIT_HEADROOM_GB) {
     console.error(
-      `[evidence] REFUSING to run: only ${headroom.toFixed(1)} GB of system commit ` +
-        `headroom is available (need ${MIN_COMMIT_HEADROOM_GB} GB). This machine is ` +
-        `likely in its leaked-commit state - running now would crash mid-run with an ` +
-        `access violation and deepen the leak. Reboot, then re-run.`
+      `[evidence] REFUSING to run: only ${headroom.toFixed(1)} GB of usable commit ` +
+        `headroom (static free + expandable pagefile room) is available (need ` +
+        `${MIN_COMMIT_HEADROOM_GB} GB). Commit is genuinely near its ceiling: free ` +
+        `disk on the pagefile volume or a larger configured pagefile maximum would ` +
+        `raise it; otherwise reboot to clear leaked commit, then re-run.`
     )
     process.exit(3)
   }
