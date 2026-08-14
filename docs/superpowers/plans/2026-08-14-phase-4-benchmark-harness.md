@@ -131,13 +131,58 @@ export function loadRoster(rosterPath: string): Roster
 ```json
 {
   "items": [
-    { "id": "real-deck-en-zh", "file": "fixtures/real/CCELL 3.0 AIO Lab Test Updates Mandarin.pptx", "sourceLang": "English", "targetLang": "Chinese (Simplified)", "kind": "pptx" },
-    { "id": "real-deck-zh-en", "file": "fixtures/real/CCELL 3.0 AIO Lab Test Updates Mandarin.pptx", "sourceLang": "Chinese (Simplified)", "targetLang": "English", "kind": "pptx" },
-    { "id": "german-compounds-en-de", "file": "fixtures/bench/decks/german-compounds.pptx", "sourceLang": "English", "targetLang": "German", "kind": "pptx", "regenerate": "npm run make-bench-decks" },
-    { "id": "cjk-table-en-zh", "file": "fixtures/bench/decks/cjk-table.pptx", "sourceLang": "English", "targetLang": "Chinese (Simplified)", "kind": "pptx", "regenerate": "npm run make-bench-decks" },
-    { "id": "tiny-boxes-en-zh", "file": "fixtures/bench/decks/tiny-boxes.pptx", "sourceLang": "English", "targetLang": "Chinese (Simplified)", "kind": "pptx", "regenerate": "npm run make-bench-decks" },
-    { "id": "chart-image-en-zh", "file": "fixtures/image-regions/real/real-chart-en.png", "sourceLang": "English", "targetLang": "Chinese (Simplified)", "kind": "image" },
-    { "id": "photo-image-en-zh", "file": "fixtures/image-regions/real/real-photo-1.jpg", "sourceLang": "English", "targetLang": "Chinese (Simplified)", "kind": "image" }
+    {
+      "id": "real-deck-en-zh",
+      "file": "fixtures/real/CCELL 3.0 AIO Lab Test Updates Mandarin.pptx",
+      "sourceLang": "English",
+      "targetLang": "Chinese (Simplified)",
+      "kind": "pptx"
+    },
+    {
+      "id": "real-deck-zh-en",
+      "file": "fixtures/real/CCELL 3.0 AIO Lab Test Updates Mandarin.pptx",
+      "sourceLang": "Chinese (Simplified)",
+      "targetLang": "English",
+      "kind": "pptx"
+    },
+    {
+      "id": "german-compounds-en-de",
+      "file": "fixtures/bench/decks/german-compounds.pptx",
+      "sourceLang": "English",
+      "targetLang": "German",
+      "kind": "pptx",
+      "regenerate": "npm run make-bench-decks"
+    },
+    {
+      "id": "cjk-table-en-zh",
+      "file": "fixtures/bench/decks/cjk-table.pptx",
+      "sourceLang": "English",
+      "targetLang": "Chinese (Simplified)",
+      "kind": "pptx",
+      "regenerate": "npm run make-bench-decks"
+    },
+    {
+      "id": "tiny-boxes-en-zh",
+      "file": "fixtures/bench/decks/tiny-boxes.pptx",
+      "sourceLang": "English",
+      "targetLang": "Chinese (Simplified)",
+      "kind": "pptx",
+      "regenerate": "npm run make-bench-decks"
+    },
+    {
+      "id": "chart-image-en-zh",
+      "file": "fixtures/image-regions/real/real-chart-en.png",
+      "sourceLang": "English",
+      "targetLang": "Chinese (Simplified)",
+      "kind": "image"
+    },
+    {
+      "id": "photo-image-en-zh",
+      "file": "fixtures/image-regions/real/real-photo-1.jpg",
+      "sourceLang": "English",
+      "targetLang": "Chinese (Simplified)",
+      "kind": "image"
+    }
   ]
 }
 ```
@@ -262,7 +307,9 @@ export interface HarnessDeps {
   /** POST /api/generate { model, keep_alive: 0 } - frees VRAM before the next model loads. */
   unloadModel: (baseUrl: string, model: string) => Promise<void>
   /** Injectable so tests use a fake adapter set instead of loading PP-OCR. Same signature as registry.ts's buildAdapters. */
-  buildAdapters: (deps: import('../adapters/registry').AdapterDeps) => import('../adapters/adapter').FormatAdapter[]
+  buildAdapters: (
+    deps: import('../adapters/registry').AdapterDeps
+  ) => import('../adapters/adapter').FormatAdapter[]
 }
 export type HarnessEvent =
   | { type: 'model-start' | 'model-done'; model: string }
@@ -344,7 +391,10 @@ export interface QualityMetric {
   meanFormat: number | null
   meanOverall: number | null // mean of the three dimension means; null when judged === 0
 }
-export function judgementQuality(judgement: StoredJudgement | null, translatedCount: number): QualityMetric
+export function judgementQuality(
+  judgement: StoredJudgement | null,
+  translatedCount: number
+): QualityMetric
 export type Tier = 'A' | 'B' | 'C' | 'D'
 export function tierFor(meanOverall: number): Tier // >= 4.5 A, >= 3.5 B, >= 2.5 C, else D
 export function pairKey(sourceLang: string, targetLang: string): string // 'English -> German'
@@ -467,7 +517,11 @@ export interface BenchReport {
   /** Per item: rows of segment-level A/B - source + each model's translation with its overall judge score. */
   abByItem: Record<
     string,
-    { segmentId: string; source: string; byModel: Record<string, { translation: string | null; overall: number | null }> }[]
+    {
+      segmentId: string
+      source: string
+      byModel: Record<string, { translation: string | null; overall: number | null }>
+    }[]
   >
 }
 export function buildReport(store: BenchStore, corpus: Corpus, judgeModel: string): BenchReport
@@ -522,7 +576,11 @@ export function writeChampion(state: ChampionState, repoRoot: string): void // a
 Initial committed `config/champion.json`:
 
 ```json
-{ "model": "gemma4:e4b", "crownedAt": "2026-08-14T00:00:00.000Z", "note": "pre-benchmark placeholder, equals DEFAULT_MODEL until the phase-4 cohort crowns" }
+{
+  "model": "gemma4:e4b",
+  "crownedAt": "2026-08-14T00:00:00.000Z",
+  "note": "pre-benchmark placeholder, equals DEFAULT_MODEL until the phase-4 cohort crowns"
+}
 ```
 
 **Behavior contract (each point a test; resolution helper takes an injectable candidate-dir list like fonts.ts's internals do):**
