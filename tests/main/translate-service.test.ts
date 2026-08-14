@@ -30,6 +30,9 @@ const FAKE_REPORT: RunReport = {
   translated: 1,
   keptOriginal: [],
   overflowed: [],
+  segments: [
+    { id: 's1', sourceText: 'Hello', translation: 'Bonjour', fittedSizePt: 12, lineCount: 1 }
+  ],
   skippedUnsupported: [],
   durationMs: 5,
   stats: {

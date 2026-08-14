@@ -16,6 +16,15 @@ export interface TranslateRunRequest {
   targetLang: string
 }
 
+/** Hand-kept structural copy of src/core/pipeline.ts's SegmentDetail - same reasoning as RunReport below. */
+export interface SegmentDetail {
+  id: string
+  sourceText: string
+  translation: string | null
+  fittedSizePt?: number
+  lineCount?: number
+}
+
 export interface RunReport {
   file: string
   outPath: string
@@ -23,6 +32,7 @@ export interface RunReport {
   translated: number
   keptOriginal: { id: string; reason: string }[]
   overflowed: { id: string; fontSizePt: number }[]
+  segments: SegmentDetail[]
   skippedUnsupported: { id: string; reason: string }[]
   durationMs: number
   stats: {

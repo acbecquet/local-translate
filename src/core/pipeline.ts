@@ -13,6 +13,24 @@ import type { TextSegment, TranslatedSegment } from './segments'
 import type { TranslationBackend } from './translate/backend'
 import { groupSegments, hasTranslatableContent } from './translate/batching'
 
+/**
+ * Per-segment detail for one extracted segment - a benchmark-consumption
+ * counterpart to the aggregate counts elsewhere in RunReport (see
+ * RunReport.segments below): the judge needs (source, translation) pairs,
+ * the A/B report needs the same, and the fidelity metric needs per-segment
+ * fitted sizes, so a stored RunReport must carry the texts, not just counts.
+ */
+export interface SegmentDetail {
+  id: string
+  sourceText: string
+  /** null when the segment kept its original text (untranslatable, gated, failed). */
+  translation: string | null
+  /** Populated for every segment that went through fit (i.e. translation !== null). */
+  fittedSizePt?: number
+  /** Wrapped line count fit() produced for this segment; populated alongside fittedSizePt. */
+  lineCount?: number
+}
+
 export interface RunReport {
   file: string
   outPath: string
@@ -20,6 +38,8 @@ export interface RunReport {
   translated: number
   keptOriginal: { id: string; reason: string }[]
   overflowed: { id: string; fontSizePt: number }[]
+  /** One entry per extracted segment, in extract order - see SegmentDetail. */
+  segments: SegmentDetail[]
   /** Unsupported-but-present content the adapter skipped entirely (never a segment, never touched on apply) - e.g. a chart, WordArt, or an unresolvable SmartArt part. Populated from the adapter's optional `collectSkips()` (adapter.ts); `[]` for an adapter that never implements it. */
   skippedUnsupported: { id: string; reason: string }[]
   durationMs: number
@@ -139,6 +159,7 @@ export async function runPipeline(opts: PipelineOpts): Promise<RunReport> {
   const fitStart = Date.now()
   const { translatedSegments, overflowed } = fitSegments(opts, segments, translationById)
   const fitMs = Date.now() - fitStart
+  const segmentDetails = collectSegmentDetails(segments, translationById, translatedSegments)
 
   const outPath = opts.out ?? defaultOutPath(opts.file, opts.adapter)
   const applyStart = Date.now()
@@ -160,6 +181,7 @@ export async function runPipeline(opts: PipelineOpts): Promise<RunReport> {
     translated,
     keptOriginal,
     overflowed,
+    segments: segmentDetails,
     skippedUnsupported,
     durationMs,
     stats: {
@@ -418,6 +440,40 @@ function fitSegments(
   }
 
   return { translatedSegments, overflowed }
+}
+
+/**
+ * Builds RunReport.segments straight from the two structures translation and
+ * fit already produced - no extra pass over the adapter or the backend.
+ * `translatedSegments` has exactly one entry per `segments` entry, pushed in
+ * the same extract-order loop inside fitSegments, so zipping the two arrays
+ * by index (rather than building yet another id-keyed map) is safe and
+ * preserves extract order for free. A segment kept as original text
+ * (untranslatable, gated, or a backend failure - i.e. absent from
+ * `translationById`) reports `translation: null` and omits the fit fields
+ * entirely: fitSegments still runs fit() on its original text (so apply()
+ * has a size for it too), but that size was never a translation decision,
+ * so the benchmark-facing detail record doesn't claim one.
+ */
+function collectSegmentDetails(
+  segments: TextSegment[],
+  translationById: Map<string, string>,
+  translatedSegments: TranslatedSegment[]
+): SegmentDetail[] {
+  return segments.map((seg, i) => {
+    const translation = translationById.get(seg.id)
+    if (translation === undefined) {
+      return { id: seg.id, sourceText: seg.text, translation: null }
+    }
+    const fitted = translatedSegments[i]
+    return {
+      id: seg.id,
+      sourceText: seg.text,
+      translation,
+      fittedSizePt: fitted.fittedSizePt,
+      lineCount: fitted.fittedLines.length
+    }
+  })
 }
 
 /**

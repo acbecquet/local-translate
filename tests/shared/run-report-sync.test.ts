@@ -29,6 +29,10 @@ describe('RunReport type sync (compile-time drift guard)', () => {
       translated: 1,
       keptOriginal: [{ id: 's2', reason: 'skipped-untranslatable' }],
       overflowed: [{ id: 's1', fontSizePt: 10 }],
+      segments: [
+        { id: 's1', sourceText: 'Hello', translation: 'Bonjour', fittedSizePt: 10, lineCount: 1 },
+        { id: 's2', sourceText: '12345', translation: null }
+      ],
       skippedUnsupported: [{ id: 's3', reason: 'chart' }],
       durationMs: 5,
       stats: {

@@ -907,3 +907,178 @@ describe('runPipeline: per-segment source-language gate', () => {
     expect(applied.segments[0]).toMatchObject({ fittedSizePt: 18, translation: '你好' })
   })
 })
+
+describe('runPipeline: RunReport.segments', () => {
+  it('every extracted segment appears exactly once in report.segments, in extract order, with sourceText verbatim', async () => {
+    // Extract order deliberately not id-sorted, to prove the report follows
+    // extract order rather than re-sorting by id.
+    const s1 = seg({ id: 's3', text: 'Third', context: 'doc' })
+    const s2 = seg({ id: 's1', text: 'First', context: 'doc' })
+    const s3 = seg({ id: 's2', text: 'Second', context: 'doc' })
+    const { file } = writeFixture([s1, s2, s3])
+
+    const backend = makeBackend((req) => ({
+      translations: req.segments.map((s) => ({ id: s.id, translation: `[${s.text}]` }))
+    }))
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    expect(report.segments.map((s) => s.id)).toEqual(['s3', 's1', 's2'])
+    expect(report.segments.map((s) => s.sourceText)).toEqual(['Third', 'First', 'Second'])
+  })
+
+  it('translated segment: translation is the resolved translation, and fittedSizePt/lineCount match what apply() received', async () => {
+    const s1 = seg({ id: 's1', text: 'Hello', context: 'doc' })
+    const { file } = writeFixture([s1])
+
+    const multiline = 'Line one\nLine two\nLine three'
+    const backend = makeBackend(() => ({
+      translations: [{ id: 's1', translation: multiline }]
+    }))
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    const detail = report.segments.find((s) => s.id === 's1')
+    expect(detail?.translation).toBe(multiline)
+
+    const applied = readApplied(report.outPath)
+    const appliedSeg = applied.segments.find((s) => s.id === 's1') as {
+      fittedSizePt: number
+      fittedLines: string[]
+    }
+    // "matching what apply() received" - compared against the exact
+    // TranslatedSegment the adapter's apply() wrote, not a hardcoded guess.
+    expect(detail?.fittedSizePt).toBe(appliedSeg.fittedSizePt)
+    expect(detail?.lineCount).toBe(appliedSeg.fittedLines.length)
+    expect(detail?.lineCount).toBeGreaterThan(1)
+  })
+
+  it('a keptOriginal segment (untranslatable, not-source-language, or backend failure) has translation: null and no fit fields', async () => {
+    const untranslatable = seg({ id: 's1', text: '12345', context: 'doc' })
+    const gated = seg({ id: 's2', text: '你好世界', context: 'doc' })
+    const failed = seg({ id: 's3', text: 'Sometext', context: 'doc' })
+    const translated = seg({ id: 's4', text: 'Hello', context: 'doc' })
+    const { file } = writeFixture([untranslatable, gated, failed, translated])
+
+    const backend = makeBackend((req) => ({
+      translations: req.segments
+        .filter((s) => s.id !== 's3')
+        .map((s) => ({ id: s.id, translation: `[${s.text}]` })),
+      failures: [{ id: 's3', reason: 'echo' }]
+    }))
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    const byId = new Map(report.segments.map((s) => [s.id, s]))
+    for (const id of ['s1', 's2', 's3']) {
+      const detail = byId.get(id)
+      expect(detail?.translation).toBeNull()
+      expect(detail?.fittedSizePt).toBeUndefined()
+      expect(detail?.lineCount).toBeUndefined()
+    }
+
+    expect(byId.get('s4')).toMatchObject({ translation: '[Hello]' })
+  })
+
+  it('report.segments.length === report.total always, including the zero-segment document case (empty array)', async () => {
+    const s1 = seg({ id: 's1', text: 'Hello', context: 'doc' })
+    const { file } = writeFixture([s1])
+    const backend = makeBackend(() => ({ translations: [{ id: 's1', translation: 'Bonjour' }] }))
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+    expect(report.segments.length).toBe(report.total)
+
+    const { file: emptyFile } = writeFixture([])
+    const translateBatch = vi.fn()
+    const emptyBackend: TranslationBackend = {
+      listModels: vi.fn().mockResolvedValue([]),
+      pullModel: vi.fn().mockResolvedValue(undefined),
+      translateBatch
+    }
+
+    const emptyReport = await runPipeline({
+      file: emptyFile,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend: emptyBackend
+    })
+
+    expect(emptyReport.total).toBe(0)
+    expect(emptyReport.segments).toEqual([])
+    expect(emptyReport.segments.length).toBe(emptyReport.total)
+  })
+
+  it('adding segments is purely additive: every pre-existing RunReport field keeps its previous shape and value, unchanged for printReport', async () => {
+    const s1 = seg({ id: 's1', text: 'Hello', context: 'doc' })
+    const { file } = writeFixture([s1])
+    const backend = makeBackend(() => ({ translations: [{ id: 's1', translation: 'Bonjour' }] }))
+
+    const report = await runPipeline({
+      file,
+      sourceLang: 'English',
+      targetLang: 'French',
+      model: 'test-model',
+      adapter,
+      backend
+    })
+
+    // segments is the ONLY new top-level key - nothing pre-existing was
+    // renamed or removed alongside it.
+    expect(Object.keys(report).sort()).toEqual(
+      [
+        'file',
+        'outPath',
+        'total',
+        'translated',
+        'keptOriginal',
+        'overflowed',
+        'skippedUnsupported',
+        'durationMs',
+        'stats',
+        'segments'
+      ].sort()
+    )
+
+    // The pre-existing fields printReport (cli.ts) actually reads keep
+    // their exact previous values - the same values asserted for this
+    // fixture/backend pair by the pre-segments tests above.
+    expect(report.file).toBe(file)
+    expect(report.total).toBe(1)
+    expect(report.translated).toBe(1)
+    expect(report.keptOriginal).toEqual([])
+    expect(report.overflowed).toEqual([])
+    expect(report.skippedUnsupported).toEqual([])
+    expect(typeof report.durationMs).toBe('number')
+    expect(report.stats.model).toBe('test-model')
+  })
+})
