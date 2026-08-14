@@ -1118,3 +1118,42 @@ describe('withCellSplit - rescued pieces reconcile against existing pieces', () 
     expect(texts).not.toContain('XX') // conflicted - original pixels stay
   })
 })
+
+describe('withCellSplit - the foreign-ink exclusion is scored even when it only NARROWS a span (review finding)', () => {
+  it('prefers the unexcluded hypothesis when an edge-trimming zone distorts the width shares', async () => {
+    // A sloppy neighbor box (bandless - its two balanced lines decline
+    // banding) overlaps the LEADING columns of this region's first span.
+    // The zone erases those columns without changing the span COUNT, so
+    // the old length-based gate never scored the unexcluded hypothesis -
+    // and the artificially narrowed span flipped the token grouping,
+    // painting a word into the wrong cell.
+    const canvas = createCanvas(400, 40)
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, 400, 40)
+    ctx.fillStyle = '#000000'
+    ctx.fillRect(8, 2, 54, 6) // neighbor line 1
+    ctx.fillRect(8, 28, 54, 6) // neighbor line 2 - balanced, so it cannot band
+    ctx.fillRect(10, 12, 40, 12) // "AA" blob
+    ctx.fillRect(66, 12, 40, 12) // "BB" blob - 16px word gap, same span as AA
+    ctx.fillRect(150, 12, 96, 12) // "CCCC" blob - own span across a 44px valley
+    const buf = await canvas.toBuffer('png')
+    const merged = rawRegion({ bbox: { x: 0, y: 8, w: 400, h: 20 }, text: 'AA BB CCCC' })
+    const neighbor = rawRegion({
+      id: 'raw2',
+      bbox: { x: 6, y: 0, w: 58, h: 36 },
+      text: 'XX',
+      confidence: 0.95
+    })
+    const { engine } = fakeEngine([merged, neighbor])
+
+    const result = await withCellSplit(engine).detectRegions(buf)
+
+    const texts = result.map((r) => r.text)
+    // The unexcluded fit ([AA BB][CCCC]) scores far better than the
+    // trimmed fit ([AA][BB CCCC]) - the tokens must stay in their cells.
+    expect(texts).toContain('AA BB')
+    expect(texts).toContain('CCCC')
+    expect(texts).not.toContain('BB CCCC')
+  })
+})

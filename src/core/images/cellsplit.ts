@@ -813,8 +813,10 @@ function trySplit(
   // only spans the band's own rows.
   const counts = countsPlain.slice()
   const erased = erasedPlain.slice()
+  let zonesApplied = false
   for (const z of foreignZones(region, others, bandY0, bandY0 + bandH)) {
     for (let cx = Math.max(x0, z.x0); cx < Math.min(x1, z.x1); cx++) {
+      if (counts[cx - x0] > 0) zonesApplied = true
       counts[cx - x0] = 0
       erased[cx - x0] = true
     }
@@ -848,7 +850,11 @@ function trySplit(
   // neither paints).
   const excluded = attempt(spans)
   const plainSpans = dropSlivers(inkSpans(countsPlain, bandH, erasedPlain))
-  const plain = plainSpans.length !== spans.length ? attempt(plainSpans) : null
+  // Scored whenever exclusion actually erased ink - not only when it
+  // changed the span COUNT: a zone that merely NARROWS an outer span
+  // (a neighbor's box bleeding over this region's edge columns) distorts
+  // the width shares just as silently (review finding on 9f2f843).
+  const plain = zonesApplied ? attempt(plainSpans) : null
   let useSpans = spans
   let fit = excluded
   if (plain && (!excluded || plain.cost < excluded.cost)) {
