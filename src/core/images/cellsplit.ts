@@ -170,6 +170,14 @@ const DROP_MIN_SUBSTANTIAL_SPANS = 3
 // (8) - slivers and artifacts must not count as cell evidence.
 const SUBSTANTIAL_SPAN_MIN_PX = 8
 
+// Spans narrower than this are dropped from the profile BEFORE token
+// distribution: no real glyph column is 1-3px wide (the noise floor is 8),
+// so such spans are border antialiasing or photo edge artifacts - and a
+// span in the DP must receive a token, so a single 1px sliver between real
+// cells shifts every group (live: the "Upside Down" row's carrier grouped
+// [Orientation][...] one span over and painted wrong-cell text).
+const MIN_SPAN_WIDTH_PX = 4
+
 // Foreign-ink exclusion: a row-merged detection often lassoes ink that
 // ANOTHER detection already reads (live: "Fill Volume: 2 Resistance: 2.3
 // 60% RH" swallowed the neighboring "Storage Humidity:" cell's ink - the
@@ -384,15 +392,17 @@ function inkSpans(counts: number[], h: number, erased: boolean[] = []): InkSpan[
  * groups (token order is reading order - it must never be reshuffled)
  * minimizing the summed squared difference between each group's width share
  * (including intra-group space advances) and its span's width share.
- * Returns tokens-per-span counts, or null when no acceptable partition
- * exists: fewer tokens than spans, degenerate widths, or a best partition
- * that still leaves some span off by more than MAX_SPAN_FRACTION_ERROR.
+ * Returns tokens-per-span counts plus the partition's total cost (so
+ * competing span hypotheses can be compared - see trySplit), or null when
+ * no acceptable partition exists: fewer tokens than spans, degenerate
+ * widths, or a best partition that still leaves some span off by more than
+ * MAX_SPAN_FRACTION_ERROR.
  */
 function distributeTokens(
   tokenWidths: number[],
   spaceWidth: number,
   spanWidths: number[]
-): number[] | null {
+): { counts: number[]; cost: number } | null {
   const m = tokenWidths.length
   const n = spanWidths.length
   if (n === 0 || m < n) return null
@@ -451,7 +461,7 @@ function distributeTokens(
     const smaller = Math.min(groupShare, spanShare)
     if (larger > smaller * MAX_SPAN_SHARE_RATIO) return null
   }
-  return counts
+  return { counts, cost: dp[n - 1][m] }
 }
 
 /** `data` (wxh RGBA) transposed to hxw - so per-ROW analysis can reuse the
@@ -544,7 +554,17 @@ function chooseBand(
   if (bands.length === 1) return bands[0].span
   const total = bands.reduce((a, b) => a + b.ink, 0)
   const dominant = bands.reduce((a, b) => (b.ink > a.ink ? b : a))
-  if (dominant.ink >= total * DOMINANT_BAND_MIN_INK_SHARE) return dominant.span
+  // Even an ink-dominant band must TOUCH the detector box: a band with no
+  // ref overlap is a neighbor's line the search window happened to catch,
+  // and choosing it hands this region another region's ink (surfaced by the
+  // rescue pass: a thin rescued box just under a real line "dominantly"
+  // banded onto that line).
+  if (
+    dominant.ink >= total * DOMINANT_BAND_MIN_INK_SHARE &&
+    Math.min(dominant.span.end, ref.end) - Math.max(dominant.span.start, ref.start) > 0
+  ) {
+    return dominant.span
+  }
 
   const overlapRows = bands.map((b) =>
     Math.max(0, Math.min(b.span.end, ref.end) - Math.max(b.span.start, ref.start))
@@ -782,73 +802,100 @@ function trySplit(
   // glyphs (see NARROW_STROKE_TOKEN_RE).
   const cols = analyzeColumns(ctx.getImageData(x0, bandY0, w, bandH).data, w, bandH, bg)
   const colsLoose = analyzeColumns(ctx.getImageData(x0, y0, w, h).data, w, h, bg)
-  const { erased } = tokens.some((t) => NARROW_STROKE_TOKEN_RE.test(t))
+  const { erased: erasedPlain } = tokens.some((t) => NARROW_STROKE_TOKEN_RE.test(t))
     ? { erased: colsLoose.map(() => false) }
     : eraseGridlineColumns(colsLoose, h)
-  const counts = cols.map((c, i) => (erased[i] ? 0 : c.ink))
+  const countsPlain = cols.map((c, i) => (erasedPlain[i] ? 0 : c.ink))
   // Foreign-ink exclusion - see TRUSTWORTHY_MAX_ASPECT: columns covered by
   // another trustworthy region whose rows share this BAND are someone
   // else's text, erased like gridlines (so a valley through them qualifies
   // at gridline width). Column-scope is correct here - the profile below
   // only spans the band's own rows.
+  const counts = countsPlain.slice()
+  const erased = erasedPlain.slice()
   for (const z of foreignZones(region, others, bandY0, bandY0 + bandH)) {
     for (let cx = Math.max(x0, z.x0); cx < Math.min(x1, z.x1); cx++) {
       counts[cx - x0] = 0
       erased[cx - x0] = true
     }
   }
-  const spans = inkSpans(counts, bandH, erased)
+  const dropSlivers = (sp: InkSpan[]) => sp.filter((s) => s.end - s.start >= MIN_SPAN_WIDTH_PX)
+  const spans = dropSlivers(inkSpans(counts, bandH, erased))
   if (process.env.CELLSPLIT_DEBUG) {
     console.error(
       `[cellsplit] "${region.text.slice(0, 40)}" box=[${x0},${y0} ${w}x${h}] band=[${bandY0},${bandH}] ` +
         `spans=${JSON.stringify(spans.map((s) => [x0 + s.start, x0 + s.end]))}`
     )
   }
-  if (spans.length < 2) return [region]
 
   const { tokenWidths, spaceWidth } = measuredTokenWidths(tokens, region.text)
-  const groups = distributeTokens(
-    tokenWidths,
-    spaceWidth,
-    spans.map((s) => s.end - s.start)
-  )
-  if (!groups) {
-    const substantial = spans.filter((s) => s.end - s.start >= SUBSTANTIAL_SPAN_MIN_PX).length
-    if (process.env.CELLSPLIT_DEBUG) {
-      console.error(`[cellsplit]   -> DP null, substantial=${substantial}`)
-    }
-    return substantial >= DROP_MIN_SUBSTANTIAL_SPANS ? [] : [region]
+  const attempt = (sp: InkSpan[]) =>
+    sp.length >= 2
+      ? distributeTokens(
+          tokenWidths,
+          spaceWidth,
+          sp.map((s) => s.end - s.start)
+        )
+      : null
+  // The exclusion is a HYPOTHESIS ("that ink is another region's") that can
+  // contradict this region's own reading - its text may genuinely carry a
+  // token for the contested cell (the rescued header re-read carried a
+  // "Charlie" token for a cell the main pass also claims; excluding the
+  // cell shifted every token one span over, and the widths happened to
+  // tolerate it). Both hypotheses are scored and the better FIT wins; a
+  // contested cell surviving as a piece is then arbitrated by the rescue
+  // pass's piece reconciliation (agree -> dupe skipped; disagree ->
+  // neither paints).
+  const excluded = attempt(spans)
+  const plainSpans = dropSlivers(inkSpans(countsPlain, bandH, erasedPlain))
+  const plain = plainSpans.length !== spans.length ? attempt(plainSpans) : null
+  let useSpans = spans
+  let fit = excluded
+  if (plain && (!excluded || plain.cost < excluded.cost)) {
+    useSpans = plainSpans
+    fit = plain
   }
+  if (!fit) {
+    if (spans.length < 2) return [region]
+    const substantial = spans.filter((s) => s.end - s.start >= SUBSTANTIAL_SPAN_MIN_PX).length
+    // A refusal normally keeps the region painting as one block (photos -
+    // see DROP_MIN_SUBSTANTIAL_SPANS). But when a drawn gridline (or a
+    // foreign-owned zone) separates the spans, the box PROVABLY straddles
+    // table cells, and a whole-box paint is the smear this module exists to
+    // end (live: a refused "Down 6" painted one green-filled block across
+    // the label column and the fraction cells) - two substantial spans
+    // suffice to drop.
+    let ruledApart = false
+    for (let cx = spans[0].end; cx < spans[spans.length - 1].start && !ruledApart; cx++) {
+      ruledApart = erased[cx] === true
+    }
+    if (process.env.CELLSPLIT_DEBUG) {
+      console.error(`[cellsplit]   -> DP null, substantial=${substantial}, ruled=${ruledApart}`)
+    }
+    return substantial >= (ruledApart ? 2 : DROP_MIN_SUBSTANTIAL_SPANS) ? [] : [region]
+  }
+  const groups = fit.counts
 
   let tokenIndex = 0
-  return spans.map((span, i) => {
+  return useSpans.map((span, i) => {
     const cellTokens = tokens.slice(tokenIndex, tokenIndex + groups[i])
     tokenIndex += groups[i]
-    // Each cell gets its OWN vertical ink band (from its own span columns
-    // over the FULL loose extent - cells sit at different heights, and a
-    // cell's tips can be sparse at whole-row level; its own narrow crop
-    // has a proportionate floor and keeps them). The cell's bbox keeps the
-    // loose vertical extent for FILL coverage; the band goes to inkBBox,
-    // the size authority. Residual per-cell jitter is what
+    // Each cell is re-measured with the FULL tightenVertical machinery
+    // (expanded band search, box-overlap band choice, neighbor/border fill
+    // clipping) - cells sit at different heights, and an inline cell-band
+    // over the parent extent clipped sparse cap tips and painted undersized
+    // with the original glyph tops ghosting above the fill (live:
+    // "Orientation - Upright"). Residual per-cell jitter is what
     // refinePaintSizes's cluster snap exists to absorb.
     const spanW = span.end - span.start
-    const cellData = ctx.getImageData(x0 + span.start, y0, spanW, h).data
-    const cellRef: InkSpan = band
-      ? { start: bandY0 - y0, end: bandY0 - y0 + bandH }
-      : { start: 0, end: h }
-    const cellRows = inkRowBands(cellData, spanW, h, bg)
-    const cellBand = chooseBand(cellRows.bands, cellRef, cellRows.counts, cellRows.erased)
-    return {
+    const base: TextRegion = {
       ...region,
       id: `${region.id}c${i + 1}`,
       bbox: { x: x0 + span.start, y: region.bbox.y, w: spanW, h: region.bbox.h },
       text: cellTokens.join(' '),
-      inkBBox: cellBand
-        ? { x: x0 + span.start, y: y0 + cellBand.start, w: spanW, h: cellBand.end - cellBand.start }
-        : band
-          ? { x: x0 + span.start, y: band.y, w: spanW, h: band.h }
-          : undefined
+      inkBBox: undefined
     }
+    return tightenVertical(base, ctx, imgW, imgH, others).region
   })
 }
 
@@ -861,8 +908,21 @@ function trySplit(
 const DOUBLE_VOTE_IOU = 0.5
 // ...or when the SMALLER tightened box sits mostly inside the other - the
 // live signature: the true "1/2" band was 100% contained in the phantom
-// "Upside" box while their IoU hovered at the 0.5 boundary.
+// "Upside" box while their IoU hovered at the 0.5 boundary. The containment
+// shortcut applies only when BOTH regions actually banded: a bandless slack
+// box (a multi-row merge whose banding declined) has no defined ink of its
+// own to claim, and letting it containment-swallow every banded region
+// inside it chain-killed the real slide's entire bottom block.
 const DOUBLE_VOTE_CONTAINMENT = 0.8
+
+/** True when `a` and `b` claim the same ink - see DOUBLE_VOTE_IOU /
+ * DOUBLE_VOTE_CONTAINMENT (and the both-banded rule on the latter). */
+function sameInkSpot(a: TextRegion, b: TextRegion): boolean {
+  const boxA = a.inkBBox ?? a.bbox
+  const boxB = b.inkBBox ?? b.bbox
+  if (iou(boxA, boxB) > DOUBLE_VOTE_IOU) return true
+  return Boolean(a.inkBBox && b.inkBBox) && overlapOfSmaller(boxA, boxB) >= DOUBLE_VOTE_CONTAINMENT
+}
 
 function overlapOfSmaller(a: TextRegion['bbox'], b: TextRegion['bbox']): number {
   const ix = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)
@@ -885,17 +945,11 @@ function dropDoubleVotes(regions: TextRegion[]): TextRegion[] {
       // Compared on the measured BANDS (bbox falls back): phantom and true
       // readings converge on the same ink band while their loose boxes can
       // stay comfortably apart.
-      const boxA = a.inkBBox ?? a.bbox
-      const boxB = b.inkBBox ?? b.bbox
-      const sameSpot =
-        iou(boxA, boxB) > DOUBLE_VOTE_IOU || overlapOfSmaller(boxA, boxB) >= DOUBLE_VOTE_CONTAINMENT
-      if (!sameSpot) continue
+      if (!sameInkSpot(a, b)) continue
       if (process.env.CELLSPLIT_DEBUG) {
         console.error(
           `[cellsplit] double-vote pair: "${a.text.slice(0, 30)}" (${a.confidence}) ` +
-            `vs "${b.text.slice(0, 30)}" (${b.confidence}) ` +
-            `iou=${iou(boxA, boxB).toFixed(2)} cont=${overlapOfSmaller(boxA, boxB).toFixed(2)} ` +
-            `boxA=[${boxA.x},${boxA.y} ${boxA.w}x${boxA.h}] boxB=[${boxB.x},${boxB.y} ${boxB.w}x${boxB.h}]`
+            `vs "${b.text.slice(0, 30)}" (${b.confidence})`
         )
       }
       dropped.add(a.confidence >= b.confidence ? j : i)
@@ -904,13 +958,78 @@ function dropDoubleVotes(regions: TextRegion[]): TextRegion[] {
   return regions.filter((_, idx) => !dropped.has(idx))
 }
 
+// Rescue pass (slide-6 bottom block): page-scale PP-OCR emits detections
+// there that span MULTIPLE table rows (the step-3 sentence merged with the
+// comment cell's second line, orientation labels merged with fraction
+// cells...), the tangle dies in refusals and dedup - correctly, nothing
+// wrong paints - and the whole block stays untranslated. The SAME area
+// detected at 2x comes back as clean per-line regions (measured 2026-08-12).
+// So zones whose raw detections produced NO survivors are re-detected at
+// RESCUE_SCALE, the boxes mapped back, and the results pushed through the
+// identical tighten/kill/dedup/split machinery - with one extra rule: a
+// rescued region claiming ink an existing survivor already owns is dropped
+// unconditionally (survivors are never displaced), so the pass is strictly
+// additive. Rotated rescued regions are discarded: a rotated re-read inside
+// a dead horizontal-table zone is a phantom, and vertical content already
+// has its own dedicated passes (rotation.ts).
+const RESCUE_SCALE = 2
+const RESCUE_ZONE_PAD_PX = 6
+const RESCUE_MIN_ZONE_PX = 12
+
+function padAndClampRect(
+  b: TextRegion['bbox'],
+  pad: number,
+  imgW: number,
+  imgH: number
+): TextRegion['bbox'] {
+  const x0 = Math.max(0, Math.floor(b.x) - pad)
+  const y0 = Math.max(0, Math.floor(b.y) - pad)
+  const x1 = Math.min(imgW, Math.ceil(b.x + b.w) + pad)
+  const y1 = Math.min(imgH, Math.ceil(b.y + b.h) + pad)
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+}
+
+function rectsIntersect(a: TextRegion['bbox'], b: TextRegion['bbox']): boolean {
+  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+}
+
+/** Overlapping rects unioned to a fixpoint - a dead block re-detects as ONE
+ * crop instead of several overlapping ones. */
+function mergeRects(rects: TextRegion['bbox'][]): TextRegion['bbox'][] {
+  const merged = rects.slice()
+  let changed = true
+  while (changed) {
+    changed = false
+    outer: for (let i = 0; i < merged.length; i++) {
+      for (let j = i + 1; j < merged.length; j++) {
+        if (!rectsIntersect(merged[i], merged[j])) continue
+        const a = merged[i]
+        const b = merged[j]
+        const x = Math.min(a.x, b.x)
+        const y = Math.min(a.y, b.y)
+        merged[i] = {
+          x,
+          y,
+          w: Math.max(a.x + a.w, b.x + b.w) - x,
+          h: Math.max(a.y + a.h, b.y + b.h) - y
+        }
+        merged.splice(j, 1)
+        changed = true
+        break outer
+      }
+    }
+  }
+  return merged
+}
+
 /**
  * Wraps `engine` so row-merged table detections get split at true cell
  * gutters while keeping the trusted page-scale text - see the module doc
  * comment for the full design and the falsified alternatives it replaces.
  * Decodes the image once (CPU canvas - the sanctioned constructor) and only
  * when at least one candidate region exists; every non-candidate or
- * refused region passes through byte-identical.
+ * refused region passes through byte-identical. Zones whose detections all
+ * died are given one 2x re-detection pass - see the rescue constants above.
  */
 export function withCellSplit(engine: RegionEngine): RegionEngine {
   return {
@@ -923,23 +1042,22 @@ export function withCellSplit(engine: RegionEngine): RegionEngine {
       const ctx = canvas.getContext('2d')
       ctx.drawImage(img, 0, 0)
 
-      const out: TextRegion[] = []
-      const pending: {
+      interface Pending {
+        raw: TextRegion
         region: TextRegion
         bg: number | null
         loose: { y0: number; y1: number }
-      }[] = []
-      for (const region of regions) {
-        if (region.rotation || region.rotated) {
-          out.push(region)
-          continue
-        }
+      }
+
+      const processOne = (
+        region: TextRegion,
+        rawOthers: TextRegion[]
+      ): { pending?: Pending; deadRect?: TextRegion['bbox'] } => {
         // Band-measure FIRST (tightenVertical sets inkBBox, the size
         // authority the split's thresholds and downstream sizing key off).
         // Fellow RAW regions feed the foreign-column exclusion - their raw
         // boxes hug their ink well enough to mask a row-merge's lassoed
         // neighbors out of its band measurement.
-        const rawOthers = regions.filter((r) => r !== region)
         const rawY0 = region.bbox.y
         const rawY1 = region.bbox.y + region.bbox.h
         const { region: tightened, bg } = tightenVertical(
@@ -964,27 +1082,170 @@ export function withCellSplit(engine: RegionEngine): RegionEngine {
           if (process.env.CELLSPLIT_DEBUG) {
             console.error(`[cellsplit] cannot-fit kill: "${tightened.text.slice(0, 40)}"`)
           }
+          return { deadRect: region.bbox }
+        }
+        return { pending: { raw: region, region: tightened, bg, loose } }
+      }
+
+      const out: TextRegion[] = []
+      const deadRects: TextRegion['bbox'][] = []
+      const pending: Pending[] = []
+      for (const region of regions) {
+        if (region.rotation || region.rotated) {
+          out.push(region)
           continue
         }
-        pending.push({ region: tightened, bg, loose })
+        const one = processOne(
+          region,
+          regions.filter((r) => r !== region)
+        )
+        if (one.deadRect) deadRects.push(one.deadRect)
+        if (one.pending) pending.push(one.pending)
       }
       // Double-vote dedup runs on the whole band-measured set BEFORE
       // splitting - see dropDoubleVotes.
       const kept = new Set(dropDoubleVotes(pending.map((p) => p.region)))
-      if (process.env.CELLSPLIT_DEBUG) {
-        for (const p of pending) {
-          if (!kept.has(p.region)) {
+      const survivors: TextRegion[] = []
+      for (const p of pending) {
+        if (!kept.has(p.region)) {
+          if (process.env.CELLSPLIT_DEBUG) {
             console.error(`[cellsplit] double-vote drop: "${p.region.text.slice(0, 40)}"`)
           }
+          deadRects.push(p.raw.bbox)
+          continue
         }
+        const pieces =
+          p.bg !== null && isSplitCandidate(p.region)
+            ? trySplit(
+                p.region,
+                ctx,
+                img.width,
+                img.height,
+                p.bg,
+                [...kept].filter((r) => r !== p.region),
+                p.loose
+              )
+            : [p.region]
+        if (pieces.length === 0) {
+          deadRects.push(p.raw.bbox)
+          continue
+        }
+        out.push(...pieces)
+        survivors.push(p.region)
       }
-      for (const p of pending) {
-        if (!kept.has(p.region)) continue
-        if (p.bg !== null && isSplitCandidate(p.region)) {
-          const others = [...kept].filter((r) => r !== p.region)
-          out.push(...trySplit(p.region, ctx, img.width, img.height, p.bg, others, p.loose))
-        } else {
-          out.push(p.region)
+
+      // ---- rescue pass (see the RESCUE_* constants' doc comment). Fails
+      // open: any error skips the rescue, never the main output.
+      try {
+        const zones = mergeRects(
+          deadRects.map((r) => padAndClampRect(r, RESCUE_ZONE_PAD_PX, img.width, img.height))
+        ).filter((z) => z.w >= RESCUE_MIN_ZONE_PX && z.h >= RESCUE_MIN_ZONE_PX)
+        const rescuedRaw: TextRegion[] = []
+        for (let zi = 0; zi < zones.length; zi++) {
+          const z = zones[zi]
+          const zoomCanvas = createCanvas(z.w * RESCUE_SCALE, z.h * RESCUE_SCALE)
+          const zoomCtx = zoomCanvas.getContext('2d')
+          zoomCtx.imageSmoothingEnabled = true
+          zoomCtx.drawImage(img, z.x, z.y, z.w, z.h, 0, 0, z.w * RESCUE_SCALE, z.h * RESCUE_SCALE)
+          const found = await engine.detectRegions(await zoomCanvas.toBuffer('png'))
+          for (const r of found) {
+            if (r.rotation || r.rotated) continue
+            // Mapped back OUTWARD-rounded - a half-pixel inward bias at 2x
+            // clips glyph edges on the original.
+            const bx0 = Math.floor(z.x + r.bbox.x / RESCUE_SCALE)
+            const by0 = Math.floor(z.y + r.bbox.y / RESCUE_SCALE)
+            const bx1 = Math.ceil(z.x + (r.bbox.x + r.bbox.w) / RESCUE_SCALE)
+            const by1 = Math.ceil(z.y + (r.bbox.y + r.bbox.h) / RESCUE_SCALE)
+            const bbox = { x: bx0, y: by0, w: bx1 - bx0, h: by1 - by0 }
+            if (bbox.w <= 0 || bbox.h <= 0) continue
+            rescuedRaw.push({ ...r, id: `z${zi}-${r.id}`, bbox })
+          }
+        }
+        if (process.env.CELLSPLIT_DEBUG) {
+          for (const r of rescuedRaw) {
+            console.error(`[cellsplit] rescued raw: "${r.text.slice(0, 40)}"`)
+          }
+        }
+        // Rescued regions tighten and split against the main pass's split
+        // PIECES, not its pre-split parents: a raw fraction-row merge is
+        // aspect-wide (untrustworthy as a foreign-ink owner), but its
+        // per-cell pieces are narrow and banded - without them the digit
+        // ink chains a rescued label line's band into the fraction row's
+        // and the dedup containment kills the label (the real bottom
+        // block's second/third orientation rows). TWO rounds, because that
+        // ordering problem also exists WITHIN the rescued set: the rescued
+        // fraction row's pieces only exist after round 1, and the rescued
+        // "Upside Down" label needs them - candidates that produced nothing
+        // in round 1 get one more chance with round 1's adoptions in place.
+        let candidates = rescuedRaw
+        for (let round = 0; round < 2 && candidates.length > 0; round++) {
+          const mainPieces = out.filter((r) => !r.rotation && !r.rotated)
+          const pendingRescued: Pending[] = []
+          for (const region of candidates) {
+            const one = processOne(region, [
+              ...mainPieces,
+              ...candidates.filter((r) => r !== region)
+            ])
+            if (one.pending) pendingRescued.push(one.pending)
+          }
+          // Survivors are never displaced: a rescued band claiming a
+          // survivor's ink is dropped outright, whatever the confidences.
+          const additive = pendingRescued.filter(
+            (p) => !survivors.some((s) => sameInkSpot(p.region, s))
+          )
+          const keptRescued = new Set(dropDoubleVotes(additive.map((p) => p.region)))
+          // Piece-level reconciliation against what already painted: a WIDE
+          // rescued parent can pass the guard above and still split into a
+          // piece over an existing piece's cell (the real header: a rescued
+          // row-merge's "Charlie" cell landed on the main pass's DP-shifted
+          // "Tester:" cell). Same text -> the rescued dupe is skipped;
+          // DIFFERENT text -> two independent readings disagree about one
+          // cell and neither can be proven right, so NEITHER paints -
+          // original pixels stay, per the firm constraint.
+          const removeMain = new Set<TextRegion>()
+          const adopted: TextRegion[] = []
+          const consumed = new Set<TextRegion>()
+          for (const p of additive) {
+            if (!keptRescued.has(p.region)) continue
+            const split =
+              p.bg !== null && isSplitCandidate(p.region)
+                ? trySplit(
+                    p.region,
+                    ctx,
+                    img.width,
+                    img.height,
+                    p.bg,
+                    [...keptRescued, ...mainPieces].filter((r) => r !== p.region),
+                    p.loose
+                  )
+                : [p.region]
+            if (split.length > 0) consumed.add(p.raw)
+            for (const piece of split) {
+              const conflict = mainPieces.find((m) => sameInkSpot(piece, m))
+              if (!conflict) {
+                adopted.push(piece)
+              } else if (conflict.text.trim() !== piece.text.trim()) {
+                removeMain.add(conflict)
+                if (process.env.CELLSPLIT_DEBUG) {
+                  console.error(
+                    `[cellsplit] piece conflict: main "${conflict.text.slice(0, 30)}" vs ` +
+                      `rescued "${piece.text.slice(0, 30)}" - neither paints`
+                  )
+                }
+              }
+            }
+          }
+          if (removeMain.size > 0) {
+            for (let i = out.length - 1; i >= 0; i--) {
+              if (removeMain.has(out[i])) out.splice(i, 1)
+            }
+          }
+          out.push(...adopted)
+          candidates = candidates.filter((r) => !consumed.has(r))
+        }
+      } catch (err) {
+        if (process.env.CELLSPLIT_DEBUG) {
+          console.error(`[cellsplit] rescue pass failed open: ${String(err)}`)
         }
       }
       return out

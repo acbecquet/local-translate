@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { loadImage } from 'skia-canvas'
 import { createCanvas, registerBundledFonts } from '../../../src/core/fit/fonts'
 import { validateRegions, type TextRegion } from '../../../src/core/images/regions'
 import { _internals, withCellSplit } from '../../../src/core/images/cellsplit'
@@ -141,7 +142,7 @@ describe('distributeTokens', () => {
   it('partitions tokens contiguously so group width shares track span width shares', () => {
     // "Media: D8 | Voltage: 3.2V" shape: widths 60,20 vs 80,40 against
     // spans 95,125 - the 2|2 partition is the clear width-share winner.
-    expect(distributeTokens([60, 20, 80, 40], 10, [95, 125])).toEqual([2, 2])
+    expect(distributeTokens([60, 20, 80, 40], 10, [95, 125])?.counts).toEqual([2, 2])
   })
 
   it('returns null when there are fewer tokens than spans', () => {
@@ -168,7 +169,9 @@ describe('distributeTokens', () => {
     // Real slide-6 Media row shape: label/value cells down to 18px wide -
     // token and span shares agree within ~1.2x, so the ratio guard must
     // not kill it.
-    expect(distributeTokens([330, 140, 380, 150], 25, [44, 18, 52, 21])).toEqual([1, 1, 1, 1])
+    expect(distributeTokens([330, 140, 380, 150], 25, [44, 18, 52, 21])?.counts).toEqual([
+      1, 1, 1, 1
+    ])
   })
 })
 
@@ -199,7 +202,15 @@ function rawRegion(
 }
 
 function fakeEngine(regions: TextRegion[]) {
-  const detectRegions = vi.fn().mockResolvedValue(regions)
+  // Returns `regions` only for the ORIGINAL image buffer (the first one
+  // seen) - the rescue pass re-detects dead zones on 2x CROP buffers, and a
+  // real engine reports crop-relative detections there, never the original
+  // full-image list. An empty rescue result models "nothing new found".
+  let firstBuffer: Buffer | null = null
+  const detectRegions = vi.fn().mockImplementation(async (buffer: Buffer) => {
+    if (firstBuffer === null) firstBuffer = buffer
+    return buffer.equals(firstBuffer) ? regions : []
+  })
   return { engine: { detectRegions }, detectRegions }
 }
 
@@ -767,10 +778,15 @@ describe('withCellSplit - refuses to split when the evidence does not support it
     expect(result).toEqual([{ ...region, inkBBox: { x: 0, y: 3, w: 220, h: 14 } }])
   })
 
-  it('leaves a region alone when the profile finds sliver spans no token can plausibly own (photo edge artifacts)', async () => {
-    // Photo-shaped failure from the real deck's image39: real text blobs at
+  it('ignores sliver spans no token can plausibly own and splits at the REAL blobs (photo edge artifacts)', async () => {
+    // Photo-shaped case from the real deck's image39: real text blobs at
     // the ends plus two partial-height 1-2px edge artifacts in the middle
     // (partial height so the gridline erase correctly leaves them alone).
+    // Slivers under MIN_SPAN_WIDTH_PX are dropped from the profile - no
+    // real glyph column is that narrow - so the two genuine blobs split
+    // cleanly instead of the old whole-box refusal (which painted one
+    // block ACROSS the photo gap; a live sliver between table cells also
+    // shifted every DP group and painted wrong-cell text).
     const canvas = createCanvas(700, 45)
     const ctx = canvas.getContext('2d')
     ctx.fillStyle = '#ffffff'
@@ -786,9 +802,9 @@ describe('withCellSplit - refuses to split when the evidence does not support it
 
     const result = await withCellSplit(engine).detectRegions(buffer)
 
-    // Only 2 substantial spans (the slivers don't count), so no drop and no
-    // split - the region survives with just the vertical tighten applied.
-    expect(result).toEqual([{ ...region, inkBBox: { x: 0, y: 3, w: 700, h: 39 } }])
+    expect(result.map((r) => r.text)).toEqual(['NEW COIL2', 'OLD COIL1'])
+    expect(result[0].bbox.x + result[0].bbox.w).toBeLessThanOrEqual(162)
+    expect(result[1].bbox.x).toBeGreaterThanOrEqual(498)
   })
 
   it('never mistakes a glyph STEM for a gridline after tightening - candidacy is judged against the LOOSE box height', async () => {
@@ -931,5 +947,174 @@ describe('withCellSplit - refuses to split when the evidence does not support it
     const result = await withCellSplit(engine).detectRegions(buffer)
 
     expect(result).toEqual([{ ...region, inkBBox: { x: 10, y: 3, w: 30, h: 14 } }])
+  })
+})
+
+describe('withCellSplit - rescue pass: dead zones re-detected at 2x (slide-6 bottom block)', () => {
+  // The real slide-6 bottom block: page-scale PP-OCR emits detections that
+  // span MULTIPLE table rows (step-3 sentence merged with the comment
+  // cell's second line, etc.), the whole tangle dies in refusals/dedup, and
+  // the block stays untranslated. At 2x the same area detects as clean
+  // per-line regions. The rescue pass re-detects ONLY the zones whose raw
+  // detections produced no survivors, maps the 2x boxes back, runs them
+  // through the identical machinery, and never displaces an existing
+  // survivor - strictly additive.
+  it('re-detects a dropped detection zone at 2x and adopts the clean per-line regions', async () => {
+    // Page-scale scene: three ink blobs in a row -> the fake page-scale
+    // detection is a 3-span/2-token region, which drop-all removes.
+    const canvas = createCanvas(300, 30)
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, 300, 30)
+    ctx.fillStyle = '#000000'
+    ctx.fillRect(10, 8, 60, 12)
+    ctx.fillRect(120, 8, 60, 12)
+    ctx.fillRect(230, 8, 60, 12)
+    const pageBuf = await canvas.toBuffer('png')
+
+    const frankenstein = rawRegion({ bbox: { x: 0, y: 2, w: 300, h: 24 }, text: 'AAAA BBBB' })
+    const detectRegions = vi.fn().mockImplementation(async (buffer: Buffer) => {
+      const img = await loadImage(buffer)
+      if (img.width === 300) return [frankenstein]
+      // The 2x rescue crop: clean per-blob detections in CROP coordinates
+      // (zone-relative, scaled 2x).
+      return [
+        rawRegion({ id: 'x1', bbox: { x: 14, y: 10, w: 128, h: 24 }, text: 'AAAA' }),
+        rawRegion({ id: 'x2', bbox: { x: 234, y: 10, w: 128, h: 24 }, text: 'BBBB' }),
+        rawRegion({ id: 'x3', bbox: { x: 454, y: 10, w: 128, h: 24 }, text: 'CCCC' })
+      ]
+    })
+
+    const result = await withCellSplit({ detectRegions }).detectRegions(pageBuf)
+
+    // The rescue ran exactly once, on a crop (not the full image).
+    expect(detectRegions).toHaveBeenCalledTimes(2)
+    const texts = result.map((r) => r.text).sort()
+    expect(texts).toEqual(['AAAA', 'BBBB', 'CCCC'])
+    // Boxes mapped back to ORIGINAL image coordinates: each hugs its blob.
+    const cellA = result.find((r) => r.text === 'AAAA')!
+    expect(cellA.bbox.x).toBeGreaterThanOrEqual(0)
+    expect(cellA.bbox.x + cellA.bbox.w).toBeLessThanOrEqual(80)
+    expect(cellA.inkBBox?.y).toBe(8)
+    expect(cellA.inkBBox?.h).toBe(12)
+  })
+
+  it('never lets a rescued region displace an existing survivor claiming the same ink', async () => {
+    // The realizable displace shape: a Frankenstein whose RAW box covers
+    // BOTH its own blobs and a clean survivor's line dies in the dedup, so
+    // its dead zone overlaps the survivor's area. The rescue re-detection
+    // then returns a re-read box directly over the survivor's ink with
+    // DIFFERENT text - the survivor must win unconditionally, whatever the
+    // confidences.
+    const canvas = createCanvas(300, 60)
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, 300, 60)
+    ctx.fillStyle = '#000000'
+    ctx.fillRect(10, 6, 100, 12) // the survivor's ink, rows 6..18
+    ctx.fillRect(10, 24, 50, 12) // the Frankenstein's blobs, rows 24..36
+    ctx.fillRect(120, 24, 50, 12)
+    ctx.fillRect(230, 24, 50, 12)
+    const pageBuf = await canvas.toBuffer('png')
+
+    const survivor = rawRegion({ bbox: { x: 8, y: 4, w: 104, h: 16 }, text: 'GOOD ONE' })
+    const frankenstein = rawRegion({
+      id: 'raw2',
+      bbox: { x: 0, y: 2, w: 300, h: 38 }, // covers the survivor's rows too
+      text: 'AAAA BBBB'
+    })
+    const detectRegions = vi.fn().mockImplementation(async (buffer: Buffer) => {
+      const img = await loadImage(buffer)
+      if (img.width === 300) return [survivor, frankenstein]
+      return [
+        // Crop coords mapped back: directly over the survivor's line.
+        rawRegion({ id: 'x1', bbox: { x: 16, y: 8, w: 208, h: 24 }, text: 'EVIL', confidence: 1 })
+      ]
+    })
+
+    const result = await withCellSplit({ detectRegions }).detectRegions(pageBuf)
+
+    const texts = result.map((r) => r.text)
+    expect(texts).toContain('GOOD ONE')
+    expect(texts).not.toContain('EVIL')
+  })
+})
+
+describe('withCellSplit - bandless boxes cannot containment-claim other regions ink', () => {
+  it('keeps a banded region that sits inside a bandless two-line box (the bottom-block chain-killer)', async () => {
+    // Real slide-6 failure: slack multi-row boxes with NO measurable band
+    // containment-swallowed every banded region inside them, and the whole
+    // bottom block died in a dedup chain. A region that could not band has
+    // no defined ink to claim - the containment shortcut needs bands on
+    // BOTH sides (plain IoU still applies to everything).
+    const canvas = createCanvas(300, 60)
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, 300, 60)
+    ctx.fillStyle = '#000000'
+    ctx.fillRect(10, 8, 120, 12) // line 1 - the banded region's ink
+    ctx.fillRect(10, 40, 110, 12) // line 2 - balanced, so the big box cannot band
+    const buf = await canvas.toBuffer('png')
+    const banded = rawRegion({ bbox: { x: 8, y: 6, w: 126, h: 16 }, text: 'GOOD' })
+    const bandless = rawRegion({
+      id: 'raw2',
+      bbox: { x: 0, y: 0, w: 300, h: 60 }, // covers both lines about equally
+      text: 'BIG BOX',
+      confidence: 0.99
+    })
+    const { engine } = fakeEngine([banded, bandless])
+
+    const result = await withCellSplit(engine).detectRegions(buf)
+
+    expect(result.map((r) => r.text)).toContain('GOOD')
+  })
+})
+
+describe('withCellSplit - rescued pieces reconcile against existing pieces', () => {
+  it('drops a rescued dupe piece, drops BOTH pieces on a text conflict, adopts genuinely new pieces', async () => {
+    // The real header shape: the main pass split a row-merge into cells,
+    // one of which carries a token the DP shifted from another cell. The
+    // rescue re-reads the area and its own split produces a piece at the
+    // same spot with DIFFERENT text. Neither reading can be proven right,
+    // so neither paints - original pixels stay - while pieces with no
+    // counterpart are adopted.
+    const canvas = createCanvas(420, 30)
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, 420, 30)
+    ctx.fillStyle = '#000000'
+    ctx.fillRect(10, 8, 80, 12) // blob A - main "PP"
+    ctx.fillRect(150, 8, 80, 12) // blob B - main "QQ" vs rescued "XX"
+    ctx.fillRect(290, 8, 80, 12) // blob C - rescued "YY", no counterpart
+    const pageBuf = await canvas.toBuffer('png')
+
+    const mainMerge = rawRegion({ bbox: { x: 0, y: 4, w: 240, h: 20 }, text: 'PP QQ' })
+    // Two hallucination boxes whose zones merge into one dead zone over
+    // blobs B and C (cannot-fit kills - text far wider than the box).
+    const dead1 = rawRegion({
+      id: 'raw2',
+      bbox: { x: 140, y: 8, w: 120, h: 12 },
+      text: 'WWWWWWWWWWWWWWWWWWWWWWWWWWWWWW'
+    })
+    const dead2 = rawRegion({
+      id: 'raw3',
+      bbox: { x: 220, y: 8, w: 160, h: 12 },
+      text: 'WWWWWWWWWWWWWWWWWWWWWWWWWWWWWW'
+    })
+    const detectRegions = vi.fn().mockImplementation(async (buffer: Buffer) => {
+      const img = await loadImage(buffer)
+      if (img.width === 420) return [mainMerge, dead1, dead2]
+      // The rescue crop: one wide re-read spanning blobs B and C, in crop
+      // coordinates (zone starts at x=134, scale 2).
+      return [rawRegion({ id: 'x1', bbox: { x: 0, y: 4, w: 500, h: 36 }, text: 'XX YY' })]
+    })
+
+    const result = await withCellSplit({ detectRegions }).detectRegions(pageBuf)
+
+    const texts = result.map((r) => r.text).sort()
+    expect(texts).toContain('PP') // untouched main piece
+    expect(texts).toContain('YY') // genuinely new rescued piece
+    expect(texts).not.toContain('QQ') // conflicted - original pixels stay
+    expect(texts).not.toContain('XX') // conflicted - original pixels stay
   })
 })
