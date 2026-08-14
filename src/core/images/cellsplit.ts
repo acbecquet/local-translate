@@ -823,12 +823,6 @@ function trySplit(
   }
   const dropSlivers = (sp: InkSpan[]) => sp.filter((s) => s.end - s.start >= MIN_SPAN_WIDTH_PX)
   const spans = dropSlivers(inkSpans(counts, bandH, erased))
-  if (process.env.CELLSPLIT_DEBUG) {
-    console.error(
-      `[cellsplit] "${region.text.slice(0, 40)}" box=[${x0},${y0} ${w}x${h}] band=[${bandY0},${bandH}] ` +
-        `spans=${JSON.stringify(spans.map((s) => [x0 + s.start, x0 + s.end]))}`
-    )
-  }
 
   const { tokenWidths, spaceWidth } = measuredTokenWidths(tokens, region.text)
   const attempt = (sp: InkSpan[]) =>
@@ -874,9 +868,6 @@ function trySplit(
     let ruledApart = false
     for (let cx = spans[0].end; cx < spans[spans.length - 1].start && !ruledApart; cx++) {
       ruledApart = erased[cx] === true
-    }
-    if (process.env.CELLSPLIT_DEBUG) {
-      console.error(`[cellsplit]   -> DP null, substantial=${substantial}, ruled=${ruledApart}`)
     }
     return substantial >= (ruledApart ? 2 : DROP_MIN_SUBSTANTIAL_SPANS) ? [] : [region]
   }
@@ -952,12 +943,6 @@ function dropDoubleVotes(regions: TextRegion[]): TextRegion[] {
       // readings converge on the same ink band while their loose boxes can
       // stay comfortably apart.
       if (!sameInkSpot(a, b)) continue
-      if (process.env.CELLSPLIT_DEBUG) {
-        console.error(
-          `[cellsplit] double-vote pair: "${a.text.slice(0, 30)}" (${a.confidence}) ` +
-            `vs "${b.text.slice(0, 30)}" (${b.confidence})`
-        )
-      }
       dropped.add(a.confidence >= b.confidence ? j : i)
     }
   }
@@ -1085,9 +1070,6 @@ export function withCellSplit(engine: RegionEngine): RegionEngine {
         // Hallucination kill - a "reading" that cannot fit its own box is
         // dropped before it can paint or poison a merge (see cannotFitBox).
         if (cannotFitBox(tightened)) {
-          if (process.env.CELLSPLIT_DEBUG) {
-            console.error(`[cellsplit] cannot-fit kill: "${tightened.text.slice(0, 40)}"`)
-          }
           return { deadRect: region.bbox }
         }
         return { pending: { raw: region, region: tightened, bg, loose } }
@@ -1114,9 +1096,6 @@ export function withCellSplit(engine: RegionEngine): RegionEngine {
       const survivors: TextRegion[] = []
       for (const p of pending) {
         if (!kept.has(p.region)) {
-          if (process.env.CELLSPLIT_DEBUG) {
-            console.error(`[cellsplit] double-vote drop: "${p.region.text.slice(0, 40)}"`)
-          }
           deadRects.push(p.raw.bbox)
           continue
         }
@@ -1165,11 +1144,6 @@ export function withCellSplit(engine: RegionEngine): RegionEngine {
             const bbox = { x: bx0, y: by0, w: bx1 - bx0, h: by1 - by0 }
             if (bbox.w <= 0 || bbox.h <= 0) continue
             rescuedRaw.push({ ...r, id: `z${zi}-${r.id}`, bbox })
-          }
-        }
-        if (process.env.CELLSPLIT_DEBUG) {
-          for (const r of rescuedRaw) {
-            console.error(`[cellsplit] rescued raw: "${r.text.slice(0, 40)}"`)
           }
         }
         // Rescued regions tighten and split against the main pass's split
@@ -1232,12 +1206,6 @@ export function withCellSplit(engine: RegionEngine): RegionEngine {
                 adopted.push(piece)
               } else if (conflict.text.trim() !== piece.text.trim()) {
                 removeMain.add(conflict)
-                if (process.env.CELLSPLIT_DEBUG) {
-                  console.error(
-                    `[cellsplit] piece conflict: main "${conflict.text.slice(0, 30)}" vs ` +
-                      `rescued "${piece.text.slice(0, 30)}" - neither paints`
-                  )
-                }
               }
             }
           }
@@ -1249,10 +1217,8 @@ export function withCellSplit(engine: RegionEngine): RegionEngine {
           out.push(...adopted)
           candidates = candidates.filter((r) => !consumed.has(r))
         }
-      } catch (err) {
-        if (process.env.CELLSPLIT_DEBUG) {
-          console.error(`[cellsplit] rescue pass failed open: ${String(err)}`)
-        }
+      } catch {
+        // Fail open: a rescue-pass error must never take down the main output.
       }
       return out
     }

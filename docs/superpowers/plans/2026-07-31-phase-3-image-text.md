@@ -1,4 +1,4 @@
-# Phase 3: Image Text (Vision Pipeline) Implementation Plan
+﻿# Phase 3: Image Text (Vision Pipeline) Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development.
 > Tasks run sequentially (the region engine chosen by the Task 1 spike feeds every later task).
@@ -74,7 +74,7 @@ export const DEFAULT_MODEL = 'gemma4:e4b'
 4. `electron-builder.yml` gains an `extraResources` entry shipping `src/core/fit/fonts/**` into `resources/fonts/`, and `fonts.ts`'s `findAppRoot` resolution order already covers that path (add a unit test on the resolution helper with a faked resources layout).
    Full installer verification stays a Phase 6 gate item; this task only makes the config + resolution correct.
 
-- [ ] Steps: failing tests -> implement -> green -> scoped check -> commit `fix: phase-2 review riders (default model dedup, fonts packaging, ole/box-null tests)`.
+- [x] Steps: failing tests -> implement -> green -> scoped check -> commit `fix: phase-2 review riders (default model dedup, fonts packaging, ole/box-null tests)`.
 
 ---
 
@@ -126,7 +126,7 @@ Plus `real/`: extract 4 representative media parts from the benchmark deck (2 pn
    The decision doc must say which single design Task 2 implements.
 4. Nothing viable -> STOP, phase re-plan with Charlie.
 
-- [ ] Steps: fixture generator -> labels sanity check -> harness + mock-engine self-test -> agent runs OCR leg -> hand Charlie the VLM legs -> decision doc -> commit `feat: phase-3 image fixtures and region-engine spike harness` (+ decision doc commit).
+- [x] Steps: fixture generator -> labels sanity check -> harness + mock-engine self-test -> agent runs OCR leg -> hand Charlie the VLM legs -> decision doc -> commit `feat: phase-3 image fixtures and region-engine spike harness` (+ decision doc commit).
 
 ---
 
@@ -173,7 +173,7 @@ export function validateRegions(raw: TextRegion[], imgW: number, imgH: number): 
 7. The engine implementation matches the spike decision doc exactly (VLM: normalized-coord denormalization + JSON-schema request + temperature 0; OCR: det/rec invocation + box conversion; hybrid: det boxes -> crop -> read).
    Engine tests mock the transport (fake Ollama response / fake ONNX session) - no model loads in tests.
 
-- [ ] Steps: failing validateRegions tests -> implement -> engine impl w/ mocked transport tests -> green -> scoped check -> commit `feat: image text regions with validation ladder (<winner> engine)`.
+- [x] Steps: failing validateRegions tests -> implement -> engine impl w/ mocked transport tests -> green -> scoped check -> commit `feat: image text regions with validation ladder (<winner> engine)`.
 
 ---
 
@@ -221,7 +221,7 @@ export function renderOverlay(image: Buffer, regions: OverlayRegion[]): Promise<
 5. Output format matches input magic bytes for both png and jpeg inputs.
 6. CJK lines render non-empty glyphs (draw, then assert bbox interior is not 100% fill color) - proves CJK font registration reaches skia draw, not just measure.
 
-- [ ] Steps: failing tests -> implement -> green -> scoped check -> commit `feat: image overlay rendering with background-sampled fill`.
+- [x] Steps: failing tests -> implement -> green -> scoped check -> commit `feat: image overlay rendering with background-sampled fill`.
 
 ---
 
@@ -262,7 +262,7 @@ export function buildAdapters(deps: AdapterDeps): FormatAdapter[]
 5. Registry: `buildAdapters({ regionEngine: null })` yields no image adapter; with an engine, `adapterFor('x.png', ...)` resolves it; cli/translate-service construct the engine right after backend connect and pass it in.
 6. img10-style no-text image: extract() returns zero segments and runPipeline completes with a zero-segment report (already supported - test proves it end-to-end through the adapter with a mocked engine).
 
-- [ ] Steps: failing tests -> implement -> green -> wire cli/service/renderer accept-list -> scoped check + one full `npm run check` -> commit `feat: png/jpg image adapter over region engine`.
+- [x] Steps: failing tests -> implement -> green -> wire cli/service/renderer accept-list -> scoped check + one full `npm run check` -> commit `feat: png/jpg image adapter over region engine`.
 
 ---
 
@@ -296,7 +296,7 @@ export function writeMediaBytes(archive: PptxArchive, mediaPath: string, bytes: 
 6. Image bytes written back keep their original format (overlay.ts guarantees it; the test asserts magic bytes of the rewritten part match the original part).
 7. Source-language gating + confidence gating behave identically to Task 4 (shared code path through validateRegions + the same gating helper - no copy-paste divergence; test imports both adapters and asserts the same helper instance).
 
-- [ ] Steps: failing tests -> implement -> green -> scoped check + full check -> commit `feat: pptx embedded image translation via media re-embedding`.
+- [x] Steps: failing tests -> implement -> green -> scoped check + full check -> commit `feat: pptx embedded image translation via media re-embedding`.
 
 ---
 
@@ -315,7 +315,7 @@ export function writeMediaBytes(archive: PptxArchive, mediaPath: string, bytes: 
 4. Run report: every skip is one of the sanctioned reasons (vector metafile, low-confidence, rotated); keptOriginal regions left unpainted (verified on at least one).
 5. All commands GPU-touching -> run-tagged blocks for Charlie; capture script stays `--report-only`-capable.
 
-- [ ] Steps: extend capture script -> hand Charlie the run block -> collect artifacts -> README tables -> commit `docs: phase 3 evidence (image translation artifacts)` -> ledger + master-plan checkboxes.
+- [x] Steps: extend capture script -> hand Charlie the run block -> collect artifacts -> README tables -> commit `docs: phase 3 evidence (image translation artifacts)` -> ledger + master-plan checkboxes.
 
 ---
 
