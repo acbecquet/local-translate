@@ -431,7 +431,7 @@ export function recommendChampion(ranked: ModelAggregate[]): string | null
 5. `aggregate` weights completeness by segment counts (not per-cell mean of pcts), fills `tiersByPair` per corpus pair, and sets `completedAll` false when any corpus item lacks a cell.
 6. `rankModels` orders by the documented tri-key and `recommendChampion` skips a higher-scored model that is missing cells or judgements.
 
-- [ ] Steps: failing tests -> implement (pure functions only, no I/O) -> green -> scoped check -> commit `feat: benchmark metric families, per-pair tiers, and champion ranking`.
+- [x] Steps: failing tests -> implement (pure functions only, no I/O) -> green -> scoped check -> commit `feat: benchmark metric families, per-pair tiers, and champion ranking`.
 
 ---
 
