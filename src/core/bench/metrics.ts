@@ -10,20 +10,34 @@
  * explicit null where the interface says so), never NaN - a partially-run
  * benchmark still has to render a report mid-run.
  *
- * Cross-cell aggregates are POOLED, not averaged. completenessPct sums
- * translated and total segments across a model's cells before dividing
- * (segment-weighted); segmentsPerMin sums translated segments over summed
- * duration (duration-weighted) - both are the same "sum of the numerator
- * over sum of the denominator" shape as the per-cell rate they generalize.
- * tokensPerSec and meanOverall instead take a weighted mean of each cell's
- * own already-computed rate, weighted by completionTokens and judged-
- * segment count respectively: the true pooled numerator/denominator for
- * those two isn't available at this layer (RunReport never stores eval
- * duration, and judgementQuality already collapsed raw scores into means),
- * so weighting the per-cell rate by its natural "how much work" measure is
- * the closest equivalent. In every case a naive unweighted mean of per-cell
- * numbers would let a tiny cell's perfect score cancel out a huge cell's
- * failure; pooling/weighting by volume is what a benchmark needs instead.
+ * Cross-cell aggregates are POOLED, not averaged - every one of them sums a
+ * numerator across a model's cells and a denominator across the same cells
+ * before dividing ONCE, rather than averaging each cell's own already-
+ * divided rate. A rate never pools as a mean of rates (weighted or not) -
+ * pooling "tokens per second" the way you'd pool "dollars per hour" means
+ * total tokens over total seconds, full stop; a weighted arithmetic mean of
+ * per-cell rates is a DIFFERENT, systematically-too-high number whenever
+ * the rates differ (AM >= HM), because it lets a cell that ran briefly at a
+ * high rate outvote a cell that ran a long time at a lower one.
+ *
+ * completenessPct sums translated/total segments (segment-weighted);
+ * segmentsPerMin sums translated segments over summed duration (duration-
+ * weighted); tokensPerSec sums completionTokens over summed eval-seconds
+ * (eval-weighted). RunReport.stats never stores eval-seconds directly, but
+ * it is recoverable by algebra from the two fields it DOES store: since
+ * `tokensPerSec = completionTokens / evalSeconds` (pipeline.ts's
+ * `safeRate`), a cell's own evalSeconds = completionTokens / tokensPerSec
+ * (guarded to 0 when tokensPerSec is 0, since a 0 rate means that cell
+ * contributed no eval time and no tokens either - never a division by 0).
+ *
+ * meanOverall is the one field that genuinely IS a judged-segment-weighted
+ * MEAN, not a pooled rate: judgementQuality's per-cell meanOverall is
+ * already a mean of a mean (dimension means, then their mean), and
+ * combining several sample means into one overall mean by weighting each
+ * by its own sample size (judged count) is the exact arithmetic identity
+ * for reconstructing the true pooled mean over every underlying score - so
+ * this one weighted-arithmetic-mean shape is correct as written, unlike a
+ * weighted mean of rates.
  */
 import { NOT_SOURCE_LANGUAGE_REASON, UNTRANSLATABLE_REASON, type RunReport } from '../pipeline'
 import type { StoredCell, StoredJudgement } from './store'
@@ -170,7 +184,7 @@ export interface ModelAggregate {
   ladderHits: number
   /** Duration-weighted. */
   segmentsPerMin: number
-  /** Eval-weighted mean across cells. */
+  /** Eval-weighted: pooled as total completionTokens over total eval-seconds across cells (a true rate, not a mean of per-cell rates - see the module doc comment). */
   tokensPerSec: number
   /** Judged-segment-weighted. */
   meanOverall: number | null
@@ -183,15 +197,18 @@ function pooledRatio(numeratorSum: number, denominatorSum: number, zeroFallback:
   return denominatorSum > 0 ? numeratorSum / denominatorSum : zeroFallback
 }
 
-/** Weighted mean of `value`s by `weight`, 0 when every weight is <= 0 (never NaN) - the eval-weighted shape tokensPerSec follows, since RunReport never stores the raw eval-duration denominator needed to pool a true rate. */
-function weightedMean(items: { value: number; weight: number }[]): number {
-  const weightSum = items.reduce((sum, item) => sum + item.weight, 0)
-  if (weightSum <= 0) return 0
-  const valueSum = items.reduce((sum, item) => sum + item.value * item.weight, 0)
-  return valueSum / weightSum
+/**
+ * Recovers a cell's eval-seconds from the two fields RunReport actually
+ * stores (completionTokens, tokensPerSec), by inverting
+ * `tokensPerSec = completionTokens / evalSeconds` (pipeline.ts's
+ * `safeRate`). 0 when tokensPerSec is <= 0 - a 0 rate means that cell
+ * contributed no eval time and no tokens, never a division by 0.
+ */
+function evalSecondsFor(completionTokens: number, tokensPerSec: number): number {
+  return tokensPerSec > 0 ? completionTokens / tokensPerSec : 0
 }
 
-/** Same shape as weightedMean, but for `number | null` values (a null value is excluded from both sums) and a null fallback instead of 0 - the judged-segment-weighted shape meanOverall follows. */
+/** Weighted mean of `number | null` values by `weight` (a null value is excluded from both sums), null when every included weight is 0 or nothing was non-null - the judged-segment-weighted shape meanOverall follows (see the module doc comment for why this shape, unlike a pooled rate, is correct for a mean). */
 function weightedMeanOrNull(items: { value: number | null; weight: number }[]): number | null {
   let weightSum = 0
   let valueSum = 0
@@ -240,11 +257,14 @@ function aggregateOneModel(
     perCell.reduce((sum, c) => sum + c.report.durationMs, 0) / 60000,
     0
   )
-  const tokensPerSec = weightedMean(
-    perCell.map((c) => ({
-      value: c.report.stats.tokensPerSec,
-      weight: c.report.stats.completionTokens
-    }))
+  const tokensPerSec = pooledRatio(
+    perCell.reduce((sum, c) => sum + c.report.stats.completionTokens, 0),
+    perCell.reduce(
+      (sum, c) =>
+        sum + evalSecondsFor(c.report.stats.completionTokens, c.report.stats.tokensPerSec),
+      0
+    ),
+    0
   )
   const meanOverall = weightedMeanOrNull(
     perCell.map((c) => ({ value: c.quality.meanOverall, weight: c.quality.judged }))

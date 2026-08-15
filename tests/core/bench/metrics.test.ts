@@ -427,14 +427,16 @@ describe('aggregate - weighting (contract point 5)', () => {
     expect(result.segmentsPerMin).not.toBeCloseTo(54.5, 1)
   })
 
-  it('tokensPerSec is eval-weighted (by completionTokens) across cells, not a naive mean', () => {
+  it('tokensPerSec pools as a true rate (total tokens over total eval-seconds), not a weighted mean of per-cell rates', () => {
     const corpus: Corpus = {
       items: [makeCorpusItem({ id: 'item-heavy' }), makeCorpusItem({ id: 'item-light' })]
     }
+    // item-heavy: 100 tokens at 10 tok/s -> 10 eval-seconds spent generating them.
     const cellHeavy = makeCell({
       config: makeConfig({ model: 'model-a', itemId: 'item-heavy' }),
       report: makeReport({ stats: makeStats({ tokensPerSec: 10, completionTokens: 100 }) })
     })
+    // item-light: 1 token at 50 tok/s -> 0.02 eval-seconds spent generating it.
     const cellLight = makeCell({
       config: makeConfig({ model: 'model-a', itemId: 'item-light' }),
       report: makeReport({ stats: makeStats({ tokensPerSec: 50, completionTokens: 1 }) })
@@ -448,10 +450,21 @@ describe('aggregate - weighting (contract point 5)', () => {
       corpus
     )
 
-    // Naive mean: (10 + 50) / 2 = 30.
-    // completionTokens-weighted mean: (10*100 + 50*1) / 101 = 10.396...
-    expect(result.tokensPerSec).toBeCloseTo(10.396, 2)
+    // A rate pools as total-numerator / total-denominator, never as a mean
+    // of the two per-cell rates (arithmetic OR weighted) - that is exactly
+    // what completenessPct and segmentsPerMin already do above. Per-cell
+    // eval-seconds is recoverable by algebra from the two fields RunReport
+    // actually stores: evalSeconds_i = completionTokens_i / tokensPerSec_i.
+    //   True pooled rate: (100 + 1) tokens / (100/10 + 1/50) seconds
+    //                    = 101 / 10.02 = 10.0798...
+    // Two DIFFERENT wrong answers must both be excluded:
+    //   naive unweighted mean of rates:        (10 + 50) / 2 = 30
+    //   completionTokens-weighted arithmetic mean of rates (the old bug,
+    //   which AM-HM guarantees always overstates a pooled rate):
+    //                                           (10*100 + 50*1) / 101 = 10.396...
+    expect(result.tokensPerSec).toBeCloseTo(10.0798, 3)
     expect(result.tokensPerSec).not.toBeCloseTo(30, 1)
+    expect(result.tokensPerSec).not.toBeCloseTo(10.396, 1)
   })
 
   it('meanOverall is judged-segment-weighted across cells, not a naive mean of per-cell means', () => {
@@ -595,6 +608,91 @@ describe('aggregate - tiersByPair (contract point 5)', () => {
     expect(result.tiersByPair[pairKey('English', 'French')]).toBeNull()
     expect(result.tiersByPair[pairKey('English', 'Spanish')]).toBeNull()
     expect(result.completedAll).toBe(false)
+  })
+})
+
+// --- aggregate: multiple models, no cross-contamination (Minor) -----------
+
+describe('aggregate - multiple models', () => {
+  it("scopes each ModelAggregate to only its own model's cells, judgements, and pairs", () => {
+    const corpus: Corpus = {
+      items: [
+        makeCorpusItem({ id: 'item-de', sourceLang: 'English', targetLang: 'German' }),
+        makeCorpusItem({ id: 'item-fr', sourceLang: 'English', targetLang: 'French' })
+      ]
+    }
+
+    // model-a: completes both items, judged perfectly (tier A on both pairs).
+    const cellA_de = makeCell({
+      config: makeConfig({
+        model: 'model-a',
+        itemId: 'item-de',
+        sourceLang: 'English',
+        targetLang: 'German'
+      }),
+      report: makeReport({ total: 10, translated: 10 })
+    })
+    const cellA_fr = makeCell({
+      config: makeConfig({
+        model: 'model-a',
+        itemId: 'item-fr',
+        sourceLang: 'English',
+        targetLang: 'French'
+      }),
+      report: makeReport({ total: 10, translated: 10 })
+    })
+    const judgementAPerfect = makeJudgement({
+      scores: [{ segmentId: 's1', accuracy: 5, fluency: 5, format: 5 }]
+    })
+
+    // model-b: only completes item-de (item-fr missing entirely), judged
+    // poorly (tier D) - deliberately the opposite shape of model-a on every
+    // axis, so any leakage between the two aggregates would be visible.
+    const cellB_de = makeCell({
+      config: makeConfig({
+        model: 'model-b',
+        itemId: 'item-de',
+        sourceLang: 'English',
+        targetLang: 'German'
+      }),
+      report: makeReport({ total: 10, translated: 5 })
+    })
+    const judgementBPoor = makeJudgement({
+      scores: [{ segmentId: 's1', accuracy: 1, fluency: 1, format: 1 }]
+    })
+
+    const results = aggregate(
+      [
+        { cell: cellA_de, judgement: judgementAPerfect },
+        { cell: cellA_fr, judgement: judgementAPerfect },
+        { cell: cellB_de, judgement: judgementBPoor }
+      ],
+      corpus
+    )
+
+    expect(results).toHaveLength(2)
+    const modelA = results.find((r) => r.model === 'model-a')
+    const modelB = results.find((r) => r.model === 'model-b')
+    expect(modelA).not.toBeUndefined()
+    expect(modelB).not.toBeUndefined()
+
+    expect(modelA!.cells).toBe(2)
+    expect(modelA!.completedAll).toBe(true)
+    expect(modelA!.judgedAll).toBe(true)
+    expect(modelA!.completenessPct).toBe(100)
+    expect(modelA!.meanOverall).toBe(5)
+    expect(modelA!.tiersByPair[pairKey('English', 'German')]).toBe('A')
+    expect(modelA!.tiersByPair[pairKey('English', 'French')]).toBe('A')
+
+    expect(modelB!.cells).toBe(1)
+    expect(modelB!.completedAll).toBe(false)
+    expect(modelB!.judgedAll).toBe(false)
+    expect(modelB!.completenessPct).toBe(50)
+    expect(modelB!.meanOverall).toBe(1)
+    expect(modelB!.tiersByPair[pairKey('English', 'German')]).toBe('D')
+    // model-b has no cell at all for the French pair - must stay null, not
+    // borrow model-a's tier A for the same pair.
+    expect(modelB!.tiersByPair[pairKey('English', 'French')]).toBeNull()
   })
 })
 
