@@ -342,6 +342,13 @@ async function judgeBatch(
  * current cell is skipped on resume, so saving a partial result would lock
  * the gap in permanently, and a later `bench judge` re-run would never
  * revisit the segments that never actually got scored.
+ *
+ * Known narrower gap: `partialScores` carries whole COMPLETED batches only.
+ * Scores resolved inside the batch that failed are discarded with it, since
+ * judgeBatch resolves fully or rejects with nothing and has no partial-carry
+ * contract of its own. That loss is bounded by JUDGE_BATCH_SIZE - 1 rather
+ * than by the total input size, which is why it is left as-is; closing it
+ * would mean giving judgeBatch its own partial-carrying interface.
  */
 export class JudgeBatchFailure extends Error {
   readonly partialScores: JudgeScore[]
