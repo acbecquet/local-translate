@@ -592,7 +592,7 @@ Initial committed `config/champion.json`:
 5. translate-service.ts compiles against the same helper (its existing service test keeps passing with the import swapped).
 6. `defaults.ts`'s doc comment is updated to point at champion.ts as the config layer (DEFAULT_MODEL stays as the ultimate fallback; no literal duplication anywhere - the existing defaults test still enforces it).
 
-- [ ] Steps: failing tests -> implement -> wire both call sites + electron-builder.yml -> green -> full `npm run check` -> commit `feat: champion model config resolved as app default`.
+- [x] Steps: failing tests -> implement -> wire both call sites + electron-builder.yml -> green -> full `npm run check` -> commit `feat: champion model config resolved as app default`.
 
 ---
 
