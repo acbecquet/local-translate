@@ -283,7 +283,7 @@ Layout: `cells/<modelSlug>/<itemId>.json`, `judgements/<judgeSlug>/<modelSlug>/<
 6. `listCells` returns every stored cell across models, skipping corrupt files.
 7. `modelSlug('qwen3.5:9b') === 'qwen3.5-9b'` and slugs never contain path separators.
 
-- [ ] Steps: failing tests -> implement -> green -> scoped check -> commit `feat: atomic benchmark checkpoint store with config-hash cells`.
+- [x] Steps: failing tests -> implement -> green -> scoped check -> commit `feat: atomic benchmark checkpoint store with config-hash cells`.
 
 ---
 
