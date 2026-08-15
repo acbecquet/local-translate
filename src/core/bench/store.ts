@@ -110,10 +110,13 @@ function readJsonSafe<T>(filePath: string): T | null {
 }
 
 export class BenchStore {
+  /** Root directory this store was constructed with - callers (e.g. harness.ts's artifact copy) resolve a store-relative path like artifactPathFor's return value against this. */
+  readonly dir: string
   private readonly cellsDir: string
   private readonly judgementsDir: string
 
   constructor(dir: string) {
+    this.dir = dir
     this.cellsDir = path.join(dir, 'cells')
     this.judgementsDir = path.join(dir, 'judgements')
     mkdirSync(this.cellsDir, { recursive: true })

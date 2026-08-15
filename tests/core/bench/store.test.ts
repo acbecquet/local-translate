@@ -269,6 +269,15 @@ describe('BenchStore construction', () => {
     expect(existsSync(path.join(storeDir, 'judgements'))).toBe(true)
     expect(existsSync(path.join(storeDir, 'artifacts'))).toBe(true)
   })
+
+  it('exposes the constructor argument as .dir, so callers can resolve store-relative paths (e.g. artifactPathFor) to absolute ones', async () => {
+    const root = await makeTempDir('bench-store-dir-field-')
+    const storeDir = path.join(root, 'nested-store-dir')
+
+    const store = new BenchStore(storeDir)
+
+    expect(store.dir).toBe(storeDir)
+  })
 })
 
 describe('artifactPathFor', () => {
