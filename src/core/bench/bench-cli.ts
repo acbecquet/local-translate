@@ -18,7 +18,11 @@
 //             every cell after it in processing order is never attempted -
 //             see the HARD constraint note on judgeOneCell below for why a
 //             partial judgement must never reach disk. Exit 0 when every
-//             judged cell saved, 1 on any abort.
+//             judged cell saved, or when every stored cell already has a
+//             current judgement (a benign steady state); exit 1 on any
+//             abort, or when the store has no cells at all (a setup
+//             mistake, not a steady state - printed with its own distinct
+//             message so it never reads as "judging already happened").
 //   judge --stability - scores the FIRST stored cell (deterministic:
 //             sorted by model then itemId, not raw store iteration order)
 //             3 times fresh, saving nothing, and gates at
@@ -26,21 +30,28 @@
 //             FAIL -> exit 1 - the master plan's judge-prompt stability
 //             test.
 //   report  - buildReport, write <store>/report.json + <store>/report.html,
-//             print the ranking table to stdout. Exit 0 on success.
+//             print the resolved store path (see defaultStorePath below -
+//             it no longer lives under the repo tree, so this is the only
+//             way to find it without already knowing the convention) and
+//             the ranking table to stdout. Exit 0 on success.
 //   crown [model] - with no arg, recommendChampion (refuse with exit 1 and
 //             a stated reason when it returns null - no model is both
 //             completedAll and judgedAll yet); with an arg, that model must
 //             already have at least one stored cell (appear in the
-//             ranking), else refuse. Either way writeChampion into
-//             config/champion.json and print "old -> new".
+//             ranking), else refuse - kept deliberately weaker than the
+//             no-arg bar, but a stderr note fires when the crowned model is
+//             not itself completedAll/judgedAll, so a deliberate partial
+//             override is visibly different from a fully-vetted crown.
+//             Either way writeChampion into config/champion.json and print
+//             "old -> new".
 //   status  - a model x item grid (roster models x corpus items) of
 //             missing/done, and each done cell's judgement state (current /
-//             stale / unjudged). Reads roster+corpus+store only - NEVER
-//             touches ensureOllama, harnessDeps, or createJudgeTransport,
-//             so it never touches the network even with real deps (a
-//             HARD machine rule, verified by this module's own test suite
-//             stubbing global fetch to throw and asserting it's never
-//             called).
+//             stale / unjudged), plus the resolved store path. Reads
+//             roster+corpus+store only - NEVER touches ensureOllama,
+//             harnessDeps, or createJudgeTransport, so it never touches the
+//             network even with real deps (a HARD machine rule, verified by
+//             this module's own test suite stubbing global fetch to throw
+//             and asserting it's never called).
 //
 // repoRoot (used to resolve corpus item files, and as writeChampion's
 // target repo) is resolved once via findAppRoot from this module's own
@@ -53,6 +64,12 @@
 // (setRepoRootForTesting, exposed via _internals) mirrors champion.ts's own
 // configDirOverride escape hatch, so tests never read or write the real
 // repo's fixtures/config - see _internals below.
+//
+// The default --store, by contrast, is deliberately NOT under repoRoot at
+// all - see defaultStorePath's own doc comment for the full rationale
+// (harness.ts's "never litter fixtures/ with generated files" rule, applied
+// to the store's own permanent, unbounded copy of every artifact, not just
+// harness.ts's scratch copy).
 import { readFileSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -89,19 +106,6 @@ function resolveRepoRoot(): string {
   return repoRootOverride ?? findAppRoot(path.dirname(fileURLToPath(import.meta.url)))
 }
 
-function defaultCorpusPath(): string {
-  return path.join(resolveRepoRoot(), 'fixtures', 'bench', 'corpus.json')
-}
-
-function defaultRosterPath(): string {
-  return path.join(resolveRepoRoot(), 'fixtures', 'bench', 'roster.json')
-}
-
-/** Not a committed fixture like corpus.json/roster.json - a generated, gitignored working directory (fixtures/bench/store/, mirroring the already-established fixtures/bench/decks/ precedent) that a real run's cells/judgements/artifacts land in by default. */
-function defaultStorePath(): string {
-  return path.join(resolveRepoRoot(), 'fixtures', 'bench', 'store')
-}
-
 /**
  * Same resolution cli.ts's resolveAppDataDir uses (LOCALAPPDATA when set,
  * else homedir()/AppData/Local), duplicated here rather than imported: that
@@ -114,6 +118,45 @@ function defaultStorePath(): string {
 function resolveAppDataDir(): string {
   const localAppData = process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local')
   return path.join(localAppData, 'local_translate')
+}
+
+function defaultCorpusPath(): string {
+  return path.join(resolveRepoRoot(), 'fixtures', 'bench', 'corpus.json')
+}
+
+function defaultRosterPath(): string {
+  return path.join(resolveRepoRoot(), 'fixtures', 'bench', 'roster.json')
+}
+
+/**
+ * Anchored under resolveAppDataDir(), deliberately NOT resolveRepoRoot() the
+ * way --corpus/--roster's defaults are - this must never default under the
+ * repo working tree. harness.ts's own module doc comment (runCell's scratch
+ * output) states the rule this follows verbatim: "a real run must never
+ * litter fixtures/ (part of the repo working tree) with generated
+ * _translated files." That rule previously covered only harness.ts's
+ * scratch pre-fit copy (staged under appDataDir/bench-runs/ before being
+ * copied into the store) - it did not yet cover the store's own copy, which
+ * is not scratch: it is the PERMANENT checkpoint database runMatrix builds
+ * (cells + judgements + every translated artifact copied in full, plus,
+ * once `report` runs, a report.html that embeds artifact bytes as base64),
+ * unbounded and ever-growing with every model, every corpus item, and every
+ * re-run, with no cleanup path of its own - unlike fixtures/bench/decks/, a
+ * small, bounded, regenerable fixture set the store default used to be
+ * modeled on (that analogy does not hold; do not reintroduce it). A
+ * secondary reason this must be appDataDir-based rather than merely
+ * "somewhere under repoRoot but gitignored": BenchStore's constructor
+ * unconditionally mkdirs cells/judgements/artifacts on construction, so even
+ * a read-only `bench status` with no flags at all must not create
+ * directories inside the tracked repo tree.
+ *
+ * DO NOT move this back under resolveRepoRoot() or any other path inside the
+ * repo tree - see status/report's own "Store: <path>" printouts, added
+ * specifically because this default is no longer somewhere a repo-relative
+ * glance would find it.
+ */
+function defaultStorePath(): string {
+  return path.join(resolveAppDataDir(), 'bench-store')
 }
 
 // --- usage/parseArgs (pure) -------------------------------------------------
@@ -137,12 +180,15 @@ type ParseResult = { ok: true; command: BenchCommand } | { ok: false; error: str
 
 /**
  * Built fresh on every call, never cached at module scope - the default
- * --corpus/--roster/--store paths it names are resolved via
- * resolveRepoRoot(), which a test can redirect mid-suite
- * (setRepoRootForTesting); a cached string would keep advertising a stale
- * repoRoot. Mirrors cli.ts's own usage() (resolveDefaultModel() read live on
- * every call) - the pattern this task's brief calls out explicitly to
- * mirror, not just cli.ts's specific champion-file reason for it.
+ * --corpus/--roster paths it names are resolved via resolveRepoRoot(),
+ * which a test can redirect mid-suite (setRepoRootForTesting); the default
+ * --store path is resolved via resolveAppDataDir() instead (deliberately
+ * NOT repoRoot - see defaultStorePath's own doc comment), which is not
+ * test-overridable but is itself a fresh env-read on every call. Either
+ * way, a cached string would keep advertising a stale value. Mirrors
+ * cli.ts's own usage() (resolveDefaultModel() read live on every call) -
+ * the pattern this task's brief calls out explicitly to mirror, not just
+ * cli.ts's specific champion-file reason for it.
  */
 function usage(): string {
   return (
@@ -384,7 +430,21 @@ async function runJudgeMain(
   roster: Roster,
   deps: BenchCliDeps
 ): Promise<number> {
-  const cellsToJudge = sortedCells(store.listCells()).filter(
+  // Split from the "already current" check below on purpose: an empty store
+  // means nothing has ever been run (bench run was skipped, or pointed at
+  // the wrong --store), which reads as a setup mistake, not a benign
+  // steady state - the SAME distinction judge --stability already makes for
+  // the identical condition (see its own "no stored cells to score" message
+  // below). Collapsing the two into one "nothing to do" message (the
+  // previous behavior) made a genuinely empty store misleadingly read as
+  // "judging already happened".
+  const allCells = sortedCells(store.listCells())
+  if (allCells.length === 0) {
+    console.error('judge: no stored cells to judge - run "bench run" first.')
+    return 1
+  }
+
+  const cellsToJudge = allCells.filter(
     (cell) =>
       !isJudgementCurrent(
         cell,
@@ -553,14 +613,23 @@ async function runReport(command: Extract<BenchCommand, { cmd: 'report' }>): Pro
   const report = buildReport(store, corpus, roster.judge)
   const html = renderHtml(report, store)
 
+  const reportJsonPath = path.join(store.dir, 'report.json')
+  const reportHtmlPath = path.join(store.dir, 'report.html')
   try {
-    writeFileSync(path.join(store.dir, 'report.json'), JSON.stringify(report, null, 2))
-    writeFileSync(path.join(store.dir, 'report.html'), html)
+    writeFileSync(reportJsonPath, JSON.stringify(report, null, 2))
+    writeFileSync(reportHtmlPath, html)
   } catch (err) {
     printError(err)
     return 1
   }
 
+  // The store defaults outside the repo tree (see defaultStorePath's own
+  // doc comment) - printing exactly where the report landed, resolved to an
+  // absolute path, is the only way the person running this can find it
+  // without already knowing that convention.
+  console.log(`Store: ${path.resolve(store.dir)}`)
+  console.log(`Wrote ${path.resolve(reportJsonPath)}`)
+  console.log(`Wrote ${path.resolve(reportHtmlPath)}`)
   printRankingTable(report)
   return 0
 }
@@ -614,12 +683,24 @@ async function runCrown(command: Extract<BenchCommand, { cmd: 'crown' }>): Promi
     // stored cell here), not full completeness/judgement - that stricter
     // bar is recommendChampion's own, for the no-arg auto-recommend path
     // only. An explicit crown is a human accepting responsibility for an
-    // incomplete or unproven model.
-    if (!ranking.some((r) => r.model === command.model)) {
+    // incomplete or unproven model. Kept exactly as-is (not tightened) -
+    // instead, a deliberate partial override now says so out loud: without
+    // this, an explicit crown of a fully-vetted model and an explicit crown
+    // of a model with one item translated and zero judgements print the
+    // identical "old -> new" line, so the partial case looks exactly as
+    // trustworthy as the vetted one when it is not.
+    const found = ranking.find((r) => r.model === command.model)
+    if (!found) {
       console.error(
         `crown: model "${command.model}" has no stored cells under this store/corpus - run "bench run" for it first.`
       )
       return 1
+    }
+    if (!found.completedAll || !found.judgedAll) {
+      console.error(
+        `crown: note - "${command.model}" is a deliberate override, not a fully-vetted recommendation ` +
+          `(completedAll: ${found.completedAll}, judgedAll: ${found.judgedAll}).`
+      )
     }
     chosen = command.model
   } else {
@@ -681,6 +762,11 @@ async function runStatus(command: Extract<BenchCommand, { cmd: 'status' }>): Pro
   const store = new BenchStore(command.store)
 
   console.log(`Status: ${roster.models.length} model(s) x ${corpus.items.length} item(s)`)
+  // The store defaults outside the repo tree (see defaultStorePath's own doc
+  // comment) - print exactly where it resolved to, absolute, so status is
+  // useful for finding the artifacts/report.html without already knowing
+  // that convention.
+  console.log(`Store: ${path.resolve(store.dir)}`)
   console.log('')
 
   let missing = 0
@@ -762,7 +848,7 @@ export const _internals = {
   usage,
   resolveAppDataDir,
   resolveRepoRoot,
-  /** Test-only: redirects resolveRepoRoot() (and therefore every default path, and writeChampion's target) away from the real repo. Pass null to restore real findAppRoot()-based resolution. Mirrors champion.ts's own setConfigDirForTesting escape hatch. */
+  /** Test-only: redirects resolveRepoRoot() (and therefore the --corpus/--roster defaults, and writeChampion's target) away from the real repo. Does NOT affect the --store default - that one is deliberately anchored to resolveAppDataDir() instead, independent of repoRoot (see defaultStorePath's own doc comment). Pass null to restore real findAppRoot()-based resolution. Mirrors champion.ts's own setConfigDirForTesting escape hatch. */
   setRepoRootForTesting(dir: string | null): void {
     repoRootOverride = dir
   }

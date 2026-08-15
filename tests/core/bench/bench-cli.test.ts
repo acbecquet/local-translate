@@ -292,7 +292,7 @@ describe('runBenchCli - unknown subcommand or bad flag prints usage and exits 1 
 })
 
 describe('_internals.usage - dynamic default paths, never a hardcoded runtime-resolved value (mirrors cli.ts)', () => {
-  it('names the current repoRoot override in the default --corpus/--roster/--store paths', async () => {
+  it('names the current repoRoot override in the default --corpus/--roster paths, and the store default under resolveAppDataDir()', async () => {
     const tempRepoRoot = await makeTempDir('bench-cli-usage-')
     _internals.setRepoRootForTesting(tempRepoRoot)
 
@@ -300,10 +300,14 @@ describe('_internals.usage - dynamic default paths, never a hardcoded runtime-re
 
     expect(text).toContain(path.join(tempRepoRoot, 'fixtures', 'bench', 'corpus.json'))
     expect(text).toContain(path.join(tempRepoRoot, 'fixtures', 'bench', 'roster.json'))
-    expect(text).toContain(path.join(tempRepoRoot, 'fixtures', 'bench', 'store'))
+    // --store deliberately does NOT live under repoRoot - see bench-cli.ts's
+    // defaultStorePath doc comment (must never litter the repo working tree
+    // with the store's unbounded, ever-growing checkpoint database).
+    expect(text).toContain(path.join(_internals.resolveAppDataDir(), 'bench-store'))
+    expect(text).not.toContain(path.join(tempRepoRoot, 'fixtures', 'bench', 'store'))
   })
 
-  it('changes when the repoRoot override changes - proves the text is computed fresh, not cached', async () => {
+  it('--corpus/--roster change when the repoRoot override changes (proves the text is computed fresh, not cached), but --store stays anchored to appDataDir regardless - it must never depend on repoRoot', async () => {
     const rootOne = await makeTempDir('bench-cli-usage-one-')
     const rootTwo = await makeTempDir('bench-cli-usage-two-')
 
@@ -315,6 +319,10 @@ describe('_internals.usage - dynamic default paths, never a hardcoded runtime-re
     expect(textOne).not.toBe(textTwo)
     expect(textTwo).toContain(rootTwo)
     expect(textTwo).not.toContain(rootOne)
+
+    const storeDefault = path.join(_internals.resolveAppDataDir(), 'bench-store')
+    expect(textOne).toContain(storeDefault)
+    expect(textTwo).toContain(storeDefault)
   })
 })
 
@@ -471,6 +479,12 @@ describe('report - buildReport, writes report.json/report.html, prints the ranki
     expect(output).toContain('Ranking')
     expect(output).toContain('model-a')
     expect(output).toContain('Recommended champion: model-a')
+    // The store defaults outside the repo tree now - report must print
+    // exactly where it (and report.json/report.html) landed, resolved to
+    // an absolute path.
+    expect(output).toContain(`Store: ${path.resolve(storeDir)}`)
+    expect(output).toContain(`Wrote ${path.resolve(path.join(storeDir, 'report.json'))}`)
+    expect(output).toContain(`Wrote ${path.resolve(path.join(storeDir, 'report.html'))}`)
   })
 
   it('exits 1 and writes nothing when the corpus manifest is invalid', async () => {
@@ -596,6 +610,31 @@ describe('judge - skips current judgements, re-judges stale ones, exact transpor
 
     expect(code).toBe(0)
     expect(ensureOllama).not.toHaveBeenCalled()
+  })
+
+  it('exits 1 with a distinct message (not "nothing to do") and never connects when the store has no cells at all', async () => {
+    const repoRoot = await makeTempDir('bench-cli-judge-emptystore-')
+    _internals.setRepoRootForTesting(repoRoot)
+    const storeDir = await makeTempDir('bench-cli-judge-emptystore-store-')
+    const rosterPath = await writeRoster(repoRoot, { models: ['model-a'], judge: 'judge-x' })
+
+    const ensureOllama = vi.fn()
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    const code = await runBenchCli(
+      ['judge', '--roster', rosterPath, '--store', storeDir],
+      fakeDeps({ ensureOllama })
+    )
+
+    expect(code).toBe(1)
+    expect(ensureOllama).not.toHaveBeenCalled()
+    const errText = errSpy.mock.calls.map((c) => String(c[0] ?? '')).join('\n')
+    expect(errText).toContain('no stored cells to judge')
+    // Must NOT be the "already has a current judgement" message - a genuinely
+    // empty store is a setup mistake, not "judging already happened".
+    const logText = logSpy.mock.calls.map((c) => String(c[0] ?? '')).join('\n')
+    expect(logText).not.toContain('already has a current judgement')
   })
 
   it('exits 1 and never connects when the roster manifest is invalid', async () => {
@@ -861,10 +900,13 @@ describe('crown - refuses with no stored cells, writes+round-trips otherwise (co
     )
 
     const logs: string[] = []
+    const errs: string[] = []
     vi.spyOn(console, 'log').mockImplementation((msg?: unknown) => {
       logs.push(String(msg ?? ''))
     })
-    vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.spyOn(console, 'error').mockImplementation((msg?: unknown) => {
+      errs.push(String(msg ?? ''))
+    })
 
     const code = await runBenchCli(
       ['crown', '--roster', rosterPath, '--corpus', corpusPath, '--store', storeDir],
@@ -873,6 +915,10 @@ describe('crown - refuses with no stored cells, writes+round-trips otherwise (co
 
     expect(code).toBe(0)
     expect(logs.join('\n')).toContain('old-model -> model-a')
+    // model-a IS completedAll and judgedAll here (its one item is done and
+    // judged) - no "deliberate override" note should fire for a fully
+    // vetted crown, whether via the no-arg or explicit-model path.
+    expect(errs.join('\n')).not.toContain('deliberate override')
 
     const written = JSON.parse(readFileSync(path.join(repoRoot, 'config', 'champion.json'), 'utf8'))
     expect(written.model).toBe('model-a')
@@ -926,7 +972,8 @@ describe('crown - refuses with no stored cells, writes+round-trips otherwise (co
     // model-a only has item-1 - incomplete, unjudged - still crownable explicitly.
     store.saveCell(makeCell({ config: makeConfig({ model: 'model-a', itemId: 'item-1' }) }))
 
-    silenceConsole()
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.spyOn(console, 'log').mockImplementation(() => {})
 
     const code = await runBenchCli(
       ['crown', 'model-a', '--roster', rosterPath, '--corpus', corpusPath, '--store', storeDir],
@@ -936,6 +983,15 @@ describe('crown - refuses with no stored cells, writes+round-trips otherwise (co
     expect(code).toBe(0)
     const written = JSON.parse(readFileSync(path.join(repoRoot, 'config', 'champion.json'), 'utf8'))
     expect(written.model).toBe('model-a')
+
+    // The bar itself stays exactly as-is (still crowns) - but since this
+    // model is NOT completedAll (missing item-2) and NOT judgedAll, a
+    // deliberate-override note must fire so this doesn't print an "old ->
+    // new" line indistinguishable from a fully-vetted crown.
+    const errText = errSpy.mock.calls.map((c) => String(c[0] ?? '')).join('\n')
+    expect(errText).toContain('deliberate override')
+    expect(errText).toContain('completedAll: false')
+    expect(errText).toContain('judgedAll: false')
   })
 })
 
@@ -1000,6 +1056,31 @@ describe('status - lists every roster model x corpus item with its state (contra
     expect(out).toContain('item-2:missing')
     expect(out).toContain('item-1:done/unjudged')
     expect(out).toContain('item-2:done/stale-judgement')
+  })
+
+  it('prints the resolved absolute store path, so the store is discoverable now that it defaults outside the repo tree', async () => {
+    const repoRoot = await makeTempDir('bench-cli-status-storepath-')
+    _internals.setRepoRootForTesting(repoRoot)
+    const storeDir = await makeTempDir('bench-cli-status-storepath-store-')
+    const rosterPath = await writeRoster(repoRoot, { models: ['model-a'], judge: 'judge-x' })
+    const itemFile = await writeFakeItemFile(repoRoot, 'item-1', [seg({ id: 's1', text: 'Hi' })])
+    const corpusPath = await writeCorpus(repoRoot, [
+      { id: 'item-1', file: itemFile, sourceLang: 'English', targetLang: 'German', kind: 'pptx' }
+    ])
+
+    const logs: string[] = []
+    vi.spyOn(console, 'log').mockImplementation((msg?: unknown) => {
+      logs.push(String(msg ?? ''))
+    })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const code = await runBenchCli(
+      ['status', '--roster', rosterPath, '--corpus', corpusPath, '--store', storeDir],
+      fakeDeps()
+    )
+
+    expect(code).toBe(0)
+    expect(logs.join('\n')).toContain(`Store: ${path.resolve(storeDir)}`)
   })
 
   it('never touches ensureOllama/harnessDeps/createJudgeTransport', async () => {
