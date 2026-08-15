@@ -3,6 +3,7 @@ import type { JudgeScore } from '../../../src/core/bench/store'
 import {
   createOllamaJudgeTransport,
   judgeSegments,
+  JudgeBatchFailure,
   JUDGE_BATCH_SIZE,
   JUDGE_PROMPT_VERSION,
   type JudgeInput,
@@ -221,6 +222,40 @@ describe('judgeSegments - malformed batch triggers exactly one whole-batch retry
   })
 })
 
+// --- Minor: two individually-valid entries sharing one id are both dropped ---
+// (reviewer-flagged: correct behavior in reconcileScores, previously untested)
+
+describe('judgeSegments - two individually-valid entries sharing the same id in one response are both dropped', () => {
+  it('drops both same-id entries as ambiguous rather than guessing which is correct, then resolves via retry', async () => {
+    const { transport, chat } = fakeTransport()
+    const inputs = [input({ segmentId: 's1' }), input({ segmentId: 's2' })]
+    // s1 appears TWICE, each individually well-formed (passes
+    // SCORE_ENTRY_SCHEMA on its own) but with different values - ambiguous,
+    // so reconcileScores must drop BOTH, not guess at either. s2 has a
+    // single, unambiguous entry and should resolve immediately.
+    chat.mockResolvedValueOnce(
+      JSON.stringify({
+        scores: [
+          { id: 's1', accuracy: 5, fluency: 5, format: 5 },
+          { id: 's1', accuracy: 1, fluency: 1, format: 1 },
+          { id: 's2', accuracy: 3, fluency: 3, format: 3 }
+        ]
+      })
+    )
+    chat.mockResolvedValueOnce(
+      JSON.stringify({ scores: [{ id: 's1', accuracy: 4, fluency: 4, format: 4 }] })
+    )
+
+    const scores = await judgeSegments(inputs, 'judge-model', transport)
+
+    // s1 was NOT resolved by attempt 1 (both entries dropped) - proven by
+    // the retry actually happening, not just by the final score value.
+    expect(chat).toHaveBeenCalledTimes(2)
+    expect(byId(scores).get('s1')).toEqual({ segmentId: 's1', accuracy: 4, fluency: 4, format: 4 })
+    expect(byId(scores).get('s2')).toEqual({ segmentId: 's2', accuracy: 3, fluency: 3, format: 3 })
+  })
+})
+
 // --- contract point 4: per-segment fallback ---------------------------------
 
 describe('judgeSegments - per-segment fallback after a still-failing retry (contract point 4)', () => {
@@ -340,6 +375,22 @@ describe('createOllamaJudgeTransport (contract point 6)', () => {
       transport.chat({ model: 'm', system: 's', user: 'u', schema: {} })
     ).rejects.toThrow(/500/)
   })
+
+  it('throws when the response is missing message.content (Minor, previously untested)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      json: async () => ({ message: {} }) // no content field at all
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const transport = createOllamaJudgeTransport('http://127.0.0.1:11434')
+
+    await expect(
+      transport.chat({ model: 'm', system: 's', user: 'u', schema: {} })
+    ).rejects.toThrow('judge transport: response missing message.content')
+  })
 })
 
 // --- contract point 7: empty inputs -----------------------------------------
@@ -358,11 +409,13 @@ describe('judgeSegments - empty inputs (contract point 7)', () => {
 // --- transport-failure propagation (design decision - see judge.ts's module doc comment) ---
 //
 // JudgeTransport.chat() returns a bare Promise<string> with no error
-// channel, so a transport-level throw is let propagate straight out of
-// judgeSegments() uncaught rather than being absorbed into the retry/
-// fallback ladder - this is the only way the caller (bench-cli.ts's `judge`
-// subcommand, Task 9) can tell "the judge is down" (a rejected promise)
-// apart from "the judge scored badly" (a resolved but partial array).
+// channel, so a transport-level throw is let propagate out of
+// judgeSegments() - wrapped in JudgeBatchFailure (see that class's own doc
+// comment, and the dedicated describe block below) rather than being
+// absorbed into the retry/fallback ladder - this is the only way the
+// caller (bench-cli.ts's `judge` subcommand, Task 9) can tell "the judge is
+// down" (a rejected promise) apart from "the judge scored badly" (a
+// resolved but partial array).
 
 describe('judgeSegments - a transport-level failure propagates instead of being absorbed by the ladder', () => {
   it('rejects when the whole-batch call itself throws, without burning a retry/fallback on a down transport', async () => {
@@ -386,6 +439,56 @@ describe('judgeSegments - a transport-level failure propagates instead of being 
 
     await expect(judgeSegments(inputs, 'judge-model', transport)).rejects.toThrow('ECONNRESET')
     expect(chat).toHaveBeenCalledTimes(3)
+  })
+})
+
+// --- JudgeBatchFailure: partial results survive a later batch's failure (reviewer fix) ---
+//
+// judgeSegments has no per-batch checkpoint (unlike harness.ts's cells,
+// which are written to disk before an abort can even be detected - see the
+// module doc comment's full comparison). Without JudgeBatchFailure, a later
+// batch throwing would silently discard the already-correct scores an
+// earlier, fully-completed batch already produced. This needs MORE than
+// JUDGE_BATCH_SIZE inputs specifically: the two single-batch tests above
+// can never exercise cross-batch loss, since they only ever make one
+// judgeBatch call in the first place.
+
+describe("judgeSegments - a multi-batch failure carries the earlier batches' scores out via JudgeBatchFailure", () => {
+  it('a later batch throwing after an earlier batch resolved cleanly rejects with JudgeBatchFailure carrying exactly the earlier batchs scores', async () => {
+    const { transport, chat } = fakeTransport()
+    const inputs = Array.from({ length: JUDGE_BATCH_SIZE + 1 }, (_, i) =>
+      input({ segmentId: `s${i}` })
+    )
+    const firstBatchIds = inputs.slice(0, JUDGE_BATCH_SIZE).map((i) => i.segmentId)
+
+    // Batch 1 (s0..s7, JUDGE_BATCH_SIZE items): resolves cleanly on attempt 1.
+    chat.mockImplementationOnce(async (req) => perfectResponse(req))
+    // Batch 2 (s8 alone): the transport itself throws on the very first call.
+    chat.mockRejectedValueOnce(new Error('ECONNREFUSED'))
+
+    const err = await judgeSegments(inputs, 'judge-model', transport).catch((e: unknown) => e)
+
+    expect(err).toBeInstanceOf(JudgeBatchFailure)
+    const failure = err as JudgeBatchFailure
+    expect(failure.partialScores).toHaveLength(JUDGE_BATCH_SIZE)
+    expect(failure.partialScores.map((s) => s.segmentId).sort()).toEqual([...firstBatchIds].sort())
+    // Nothing fabricated or defaulted for the failed batch's own segment.
+    expect(failure.partialScores.some((s) => s.segmentId === 's8')).toBe(false)
+    expect(failure.cause).toBeInstanceOf(Error)
+    expect((failure.cause as Error).message).toBe('ECONNREFUSED')
+    // Batch 1: one happy-path call. Batch 2: one call, which throws.
+    expect(chat).toHaveBeenCalledTimes(2)
+  })
+
+  it('a failure on the very first batch carries an empty partialScores array, not undefined or a fabricated entry', async () => {
+    const { transport, chat } = fakeTransport()
+    const inputs = [input({ segmentId: 's1' })]
+    chat.mockRejectedValueOnce(new Error('ECONNREFUSED'))
+
+    const err = await judgeSegments(inputs, 'judge-model', transport).catch((e: unknown) => e)
+
+    expect(err).toBeInstanceOf(JudgeBatchFailure)
+    expect((err as JudgeBatchFailure).partialScores).toEqual([])
   })
 })
 

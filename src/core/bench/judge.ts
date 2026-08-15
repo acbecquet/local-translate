@@ -42,14 +42,35 @@
  * out of judgeSegments() uncaught, rather than absorbing it into the retry/
  * fallback ladder. This is the only way the caller (bench-cli.ts's `judge`
  * subcommand, Task 9) can tell "the judge is down" (a rejected promise -
- * abort the run, matching harness.ts's own transport-class-failure-aborts-
- * remaining-work philosophy) apart from "the judge scored badly" (a
- * resolved but shorter-than-`inputs` array - a normal, honest outcome of
- * the ladder). It also avoids a worse failure mode: a genuinely down judge
- * would otherwise fail every attempt identically, and burning the full
- * retry-plus-per-segment-fallback ladder on every batch of every remaining
- * cell against a server that can never answer would multiply one outage
- * into thousands of wasted calls during an unattended multi-hour judge pass.
+ * abort the run) apart from "the judge scored badly" (a resolved but
+ * shorter-than-`inputs` array - a normal, honest outcome of the ladder). It
+ * also avoids a worse failure mode: a genuinely down judge would otherwise
+ * fail every attempt identically, and burning the full retry-plus-per-
+ * segment-fallback ladder on every batch of every remaining cell against a
+ * server that can never answer would multiply one outage into thousands of
+ * wasted calls during an unattended multi-hour judge pass.
+ *
+ * IMPORTANT: this is NOT the same situation as harness.ts's own transport-
+ * class-failure-abort, and the two must not be conflated (an earlier
+ * version of this comment made exactly that flawed analogy). harness.ts
+ * only ever discards FUTURE, unattempted cells on an abort, because every
+ * cell it has already completed was checkpointed to disk
+ * (BenchStore.saveCell) before the abort could even be detected - nothing
+ * already-known is ever lost there. judgeSegments has no equivalent
+ * per-batch checkpoint: it is a single in-memory call across potentially
+ * many JUDGE_BATCH_SIZE-sized batches (the plan estimates 10-100 batches
+ * per cell), so a plain uncaught throw on batch k would silently discard
+ * the already-computed, already-correct scores from every batch before it -
+ * the caller would get back nothing at all, not even what genuinely
+ * succeeded. JudgeBatchFailure (below) exists specifically to prevent that:
+ * judgeSegments still throws on a transport failure rather than returning a
+ * value (the resolved path stays unambiguous - a successful return always
+ * means every batch reached a normal ladder outcome, never a mid-batch
+ * rejection), but the thrown error carries every score already resolved by
+ * the earlier, fully-completed batches as its `partialScores` property, so
+ * nothing already-known travels out lost even without a checkpoint. See
+ * JudgeBatchFailure's own doc comment for what a caller should (and should
+ * not) do with that partial data.
  */
 import { z } from 'zod'
 import type { JudgeScore } from './store'
@@ -289,15 +310,67 @@ async function judgeBatch(
 }
 
 /**
+ * Thrown by judgeSegments when a batch call fails partway through a
+ * multi-batch run. Carries every score already resolved by EARLIER,
+ * fully-completed batches as `partialScores`, plus the triggering failure
+ * as the standard Error `cause`.
+ *
+ * This class exists because judgeSegments has no equivalent of
+ * harness.ts's per-cell checkpoint (see the module doc comment for the full
+ * comparison): harness.ts's own transport-class-failure-abort only ever
+ * discards FUTURE, unattempted cells, since every cell it has already
+ * completed was written to disk via BenchStore.saveCell before the abort
+ * could even be detected - nothing already-known is lost there.
+ * judgeSegments is a single in-memory call across potentially many batches
+ * with no per-batch checkpoint of its own, so without this class a plain
+ * uncaught throw on batch k would silently discard the already-computed,
+ * already-correct scores from every batch before it, and the caller would
+ * get back nothing at all, not even what genuinely succeeded.
+ *
+ * judgeSegments still throws on a transport failure rather than returning a
+ * value - the resolved path stays unambiguous, so a successful return
+ * always means every requested batch reached a normal ladder outcome (full,
+ * partial, or an honest per-segment omission), never a mid-batch rejection.
+ * This class is what lets that throw carry useful information out instead
+ * of losing it.
+ *
+ * What a caller (bench-cli.ts's `judge` subcommand, Task 9) should do with
+ * `partialScores`: use it for reporting and diagnosis only - e.g. logging
+ * how far a judge pass got before the transport died. NEVER persist it via
+ * BenchStore.saveJudgement as if it were a complete, current judgement: a
+ * stored judgement whose cellConfigHash and promptVersion already match the
+ * current cell is skipped on resume, so saving a partial result would lock
+ * the gap in permanently, and a later `bench judge` re-run would never
+ * revisit the segments that never actually got scored.
+ */
+export class JudgeBatchFailure extends Error {
+  readonly partialScores: JudgeScore[]
+
+  constructor(partialScores: JudgeScore[], cause: unknown) {
+    const causeMessage = cause instanceof Error ? cause.message : String(cause)
+    super(
+      `judgeSegments: a batch call failed after ${partialScores.length} segment(s) were already ` +
+        `scored in earlier batches - ${causeMessage}`,
+      { cause }
+    )
+    this.name = 'JudgeBatchFailure'
+    this.partialScores = partialScores
+  }
+}
+
+/**
  * Scores `inputs` against the fixed accuracy/fluency/format rubric via
  * `transport`, chunked into JUDGE_BATCH_SIZE-sized batches (see judgeBatch
  * for the per-batch validation ladder). Batches run strictly sequentially -
  * matching this codebase's machine rule that nothing overcommits a
  * single-slot local model server (lifecycle.ts sets
- * OLLAMA_NUM_PARALLEL=1). A transport-level failure at any point propagates
- * out of this function uncaught (see the module doc comment); anything this
- * function DOES return completed without incident, even if shorter than
- * `inputs` - an honest gap, not a fabricated score (see judgeBatch).
+ * OLLAMA_NUM_PARALLEL=1). A transport-level failure at any point rejects
+ * this function's promise with a JudgeBatchFailure (see its own doc
+ * comment) carrying every score already resolved by the earlier,
+ * fully-completed batches - never silently absorbed, and never a bare loss
+ * of already-known results either. Anything this function DOES return
+ * completed without incident, even if shorter than `inputs` - an honest
+ * gap, not a fabricated score (see judgeBatch).
  */
 export async function judgeSegments(
   inputs: JudgeInput[],
@@ -308,7 +381,11 @@ export async function judgeSegments(
 
   const results: JudgeScore[] = []
   for (const batch of chunk(inputs, JUDGE_BATCH_SIZE)) {
-    results.push(...(await judgeBatch(batch, judgeModel, transport)))
+    try {
+      results.push(...(await judgeBatch(batch, judgeModel, transport)))
+    } catch (err) {
+      throw new JudgeBatchFailure([...results], err)
+    }
   }
   return results
 }
