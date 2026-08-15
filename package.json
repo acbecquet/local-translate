@@ -18,6 +18,7 @@
     "check": "npm run typecheck && npm run lint && npm run format && npm run test",
     "dist": "electron-vite build && electron-builder --win nsis",
     "translate": "tsx src/core/cli.ts",
+    "bench": "tsx src/core/bench/bench-cli.ts",
     "make-gate-decks": "tsx scripts/make-gate-decks.mjs",
     "make-bench-decks": "tsx scripts/make-bench-decks.mjs",
     "make-image-fixtures": "tsx scripts/make-image-fixtures.mjs",
