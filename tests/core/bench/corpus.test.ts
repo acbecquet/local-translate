@@ -154,6 +154,63 @@ describe('loadCorpus - id and language validation (contract point 2)', () => {
   })
 })
 
+describe('loadCorpus - collects problems across every category in one error', () => {
+  it('reports a duplicate id and a missing file together when a single manifest has both', async () => {
+    const root = await makeTempDir('bench-corpus-multi-category-')
+    await mkdir(path.join(root, 'fixtures'), { recursive: true })
+    await writeFile(path.join(root, 'fixtures', 'present.pptx'), 'exists')
+
+    const manifestPath = path.join(root, 'corpus.json')
+    await writeFile(
+      manifestPath,
+      JSON.stringify({
+        items: [
+          {
+            id: 'dupe-and-missing',
+            file: 'fixtures/present.pptx',
+            sourceLang: 'English',
+            targetLang: 'German',
+            kind: 'pptx'
+          },
+          {
+            id: 'dupe-and-missing',
+            file: 'fixtures/present.pptx',
+            sourceLang: 'English',
+            targetLang: 'German',
+            kind: 'pptx'
+          },
+          {
+            id: 'missing-generated',
+            file: 'fixtures/bench/decks/still-missing.pptx',
+            sourceLang: 'English',
+            targetLang: 'Chinese (Simplified)',
+            kind: 'pptx',
+            regenerate: 'npm run make-bench-decks'
+          }
+        ]
+      })
+    )
+
+    let thrown: Error | null = null
+    try {
+      loadCorpus(manifestPath, root)
+    } catch (err) {
+      thrown = err as Error
+    }
+
+    expect(thrown).not.toBeNull()
+    const message = thrown!.message
+    // Duplicate-id category:
+    expect(message).toContain('dupe-and-missing')
+    // Missing-file category, from a DIFFERENT item - only present in the
+    // same thrown error if loadCorpus collects across categories instead
+    // of throwing at the first one it finds.
+    expect(message).toContain('missing-generated')
+    expect(message).toContain('fixtures/bench/decks/still-missing.pptx')
+    expect(message).toContain('npm run make-bench-decks')
+  })
+})
+
 describe('loadRoster (contract point 3)', () => {
   it('rejects an empty models array', async () => {
     const root = await makeTempDir('bench-roster-empty-models-')
