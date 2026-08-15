@@ -210,7 +210,7 @@ export function loadRoster(rosterPath: string): Roster
 4. Generator: running `make-bench-decks.mjs` with a temp out dir produces the three decks, each of which the real `PptxAdapter` (regionEngine null) extracts more than zero segments from - proves the decks are structurally valid the same way gate decks are.
 5. The committed `corpus.json`/`roster.json` parse through their loaders in a test (guards manifest drift forever).
 
-- [ ] Steps: failing loader tests -> implement loaders -> generator (reusing build-pptx) -> generator test green -> run `npm run make-bench-decks` once locally to confirm output -> scoped check -> commit `feat: benchmark corpus and roster manifests with hard-case deck generator`.
+- [x] Steps: failing loader tests -> implement loaders -> generator (reusing build-pptx) -> generator test green -> run `npm run make-bench-decks` once locally to confirm output -> scoped check -> commit `feat: benchmark corpus and roster manifests with hard-case deck generator`.
 
 ---
 
