@@ -489,7 +489,7 @@ Validation ladder mirroring batching.ts's shape: whole-batch call -> on parse fa
 6. The transport is called with temperature-0/think-off structured requests (assert on the fake's captured request shape in `createOllamaJudgeTransport`'s own unit test, mocking fetch).
 7. An empty `inputs` array returns `[]` with zero transport calls.
 
-- [ ] Steps: failing tests -> implement (zod schema, ladder, chunking) -> green -> scoped check -> commit `feat: llm-judge rubric scoring with batch validation ladder`.
+- [x] Steps: failing tests -> implement (zod schema, ladder, chunking) -> green -> scoped check -> commit `feat: llm-judge rubric scoring with batch validation ladder`.
 
 ---
 
