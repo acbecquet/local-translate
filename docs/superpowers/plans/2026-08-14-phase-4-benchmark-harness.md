@@ -343,7 +343,7 @@ export function realHarnessDeps(): HarnessDeps // production wiring incl. PP-OCR
 6. Summary counts add up: completed + skipped + failed(+aborted, counted in failed) === models x items.
 7. Adapter resolution mirrors cli.ts (`buildAdapters` -> `adapterFor` by file extension); an image item resolves the image adapter, a pptx item the pptx adapter.
 
-- [ ] Steps: failing tests (fake backend translating deterministically, FakeAdapter-based corpus items in a temp repo root) -> implement -> green -> scoped check -> commit `feat: resumable corpus x roster benchmark matrix runner`.
+- [x] Steps: failing tests (fake backend translating deterministically, FakeAdapter-based corpus items in a temp repo root) -> implement -> green -> scoped check -> commit `feat: resumable corpus x roster benchmark matrix runner`.
 
 ---
 
