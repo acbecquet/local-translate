@@ -635,7 +635,7 @@ Subcommands (all take `--roster`, `--corpus`, `--store` with the fixture-path de
 6. `status` output lists every roster model x corpus item with its state (spot-check the grid string).
 7. `npm run bench -- status` works end to end against an empty store (integration smoke in the test via runBenchCli with real deps constructed but no network touched by `status`).
 
-- [ ] Steps: failing tests -> implement -> green -> scoped check + full `npm run check` -> commit `feat: bench cli - run, judge, report, crown, status`.
+- [x] Steps: failing tests -> implement -> green -> scoped check + full `npm run check` -> commit `feat: bench cli - run, judge, report, crown, status`.
 
 ---
 
