@@ -89,7 +89,7 @@ export interface RunReport {
 4. `report.segments.length === report.total` always (including the zero-segment document case: empty array).
 5. Existing printReport output is unchanged (the field is additive; no formatting change).
 
-- [ ] Steps: failing tests on the new field -> implement (collect during the existing translate/fit loops, no extra passes) -> green -> scoped check (`vitest run tests/core/pipeline.test.ts`) -> full `npm run check` -> commit `feat: per-segment detail array in RunReport for benchmark consumption`.
+- [x] Steps: failing tests on the new field -> implement (collect during the existing translate/fit loops, no extra passes) -> green -> scoped check (`vitest run tests/core/pipeline.test.ts`) -> full `npm run check` -> commit `feat: per-segment detail array in RunReport for benchmark consumption`.
 
 ---
 
