@@ -179,6 +179,25 @@ export interface ModelAggregate {
   judgedAll: boolean
   /** Segment-weighted across cells. */
   completenessPct: number
+  /** Judge coverage: how many segments actually carry a judge score, summed across cells. Surfaced in the report and the results doc, never only used as an internal weight - a model judged on 5 of 400 segments must not render identically to one judged on 400 of 400. */
+  judged: number
+  /** Judge coverage denominator: how many segments were eligible to be judged (i.e. were translated), summed across cells. */
+  ofSegments: number
+  /** keptOriginal segments whose reason is NOT an expected passthrough, summed across cells - content this model was asked to translate and did not deliver. The denominator half of deliveredPct. */
+  unresolvedFailures: number
+  /**
+   * `translated / (translated + unresolvedFailures) * 100`, pooled across
+   * cells - of the content this model was actually ASKED to translate, the
+   * share it delivered. 100 when nothing was eligible.
+   *
+   * Deliberately distinct from `completenessPct`, which divides by EVERY
+   * extracted segment and is therefore dominated by corpus-driven
+   * legitimate passthrough (untranslatable codes, and segments already in
+   * the target language). That makes completenessPct a fine comparative
+   * tie-break but useless as an absolute bar - see
+   * MIN_CHAMPION_DELIVERED_PCT, which gates on this number instead.
+   */
+  deliveredPct: number
   overflowed: number
   minFittedSizePt: number | null
   ladderHits: number
@@ -238,7 +257,6 @@ function aggregateOneModel(
   const modelCells = cells.filter((c) => c.cell.config.model === model)
   const itemIds = new Set(modelCells.map((c) => c.cell.config.itemId))
   const completedAll = corpus.items.every((item) => itemIds.has(item.id))
-  const judgedAll = completedAll && modelCells.every((c) => c.judgement !== null)
 
   const perCell: PerCellMetrics[] = modelCells.map((c) => ({
     itemId: c.cell.config.itemId,
@@ -247,13 +265,31 @@ function aggregateOneModel(
     quality: judgementQuality(c.judgement, c.cell.report.translated)
   }))
 
+  const judged = perCell.reduce((sum, c) => sum + c.quality.judged, 0)
+  const ofSegments = perCell.reduce((sum, c) => sum + c.quality.ofSegments, 0)
+
+  // A stored judgement per cell is necessary but NOT sufficient: judgements
+  // with zero scores in them are no quality evidence at all, so `judgedAll`
+  // requires actual coverage too. Without the `judged > 0` clause this was a
+  // pure presence check, and a model whose every judgement resolved empty
+  // would read as fully judged - and be crownable - on nothing.
+  const judgedAll = completedAll && modelCells.every((c) => c.judgement !== null) && judged > 0
+
+  const unresolvedFailures = perCell.reduce((sum, c) => sum + c.fidelity.unresolvedFailures, 0)
+  const translatedTotal = perCell.reduce((sum, c) => sum + c.report.translated, 0)
+  const deliveredPct = pooledRatio(
+    translatedTotal * 100,
+    translatedTotal + unresolvedFailures,
+    100 // nothing was eligible to translate: no content was lost either
+  )
+
   const completenessPct = pooledRatio(
-    perCell.reduce((sum, c) => sum + c.report.translated, 0) * 100,
+    translatedTotal * 100,
     perCell.reduce((sum, c) => sum + c.report.total, 0),
     100
   )
   const segmentsPerMin = pooledRatio(
-    perCell.reduce((sum, c) => sum + c.report.translated, 0),
+    translatedTotal,
     perCell.reduce((sum, c) => sum + c.report.durationMs, 0) / 60000,
     0
   )
@@ -295,6 +331,10 @@ function aggregateOneModel(
     completedAll,
     judgedAll,
     completenessPct,
+    judged,
+    ofSegments,
+    unresolvedFailures,
+    deliveredPct,
     overflowed,
     minFittedSizePt,
     ladderHits,
@@ -344,8 +384,70 @@ export function rankModels(aggregates: ModelAggregate[]): ModelAggregate[] {
   })
 }
 
-/** The top-ranked model with completedAll && judgedAll, else null - the crown recommendation. A model that scores higher but is missing cells or judgements is not a trustworthy champion, so it is skipped rather than crowned on partial evidence. */
-export function recommendChampion(ranked: ModelAggregate[]): string | null {
-  const champion = ranked.find((m) => m.completedAll && m.judgedAll)
-  return champion?.model ?? null
+/**
+ * The content-preservation floor for crowning: a model whose `deliveredPct`
+ * is below this can never be recommended as champion, no matter how well it
+ * scores on quality. The master plan's top-line constraint is that content
+ * preservation is absolute, and the crowned model becomes the app's shipped
+ * default - so a model that quietly leaves a large share of the content it
+ * was asked to translate in its source language must not win on the strength
+ * of its scores on the minority it did translate. Quality ranking alone
+ * rewards exactly that: a model that translates 40% of the eligible content
+ * beautifully outranks one that translates 99% of it well.
+ *
+ * Why 95, and why measured on `deliveredPct` rather than `completenessPct`:
+ * the ladder (whole-group call, group retry, per-segment fallback) already
+ * gives every eligible segment three chances, so a healthy model lands at or
+ * within a hair of 100 and only genuinely pathological segments fall
+ * through; 95 tolerates roughly one lost segment in twenty while catching
+ * every systematic-loss case decisively. It is deliberately NOT applied to
+ * `completenessPct` (translated over EVERY extracted segment): that number
+ * is dominated by corpus-driven legitimate passthrough, which no model
+ * controls. Measured on this repo's own phase-4 corpus, only 426 of 1164
+ * pptx segments (36.6%) are even eligible for translation - the real deck is
+ * mixed-language, so each direction language-gates most of it - which means
+ * any absolute floor on completenessPct is either vacuous (below ~36) or
+ * unreachable (above it) for every model alike.
+ *
+ * To override: change this constant (one place, and every consumer follows),
+ * or crown deliberately with `bench crown <model>`, which is a human
+ * accepting responsibility for a model the auto-recommendation refused and
+ * says so out loud in its output.
+ */
+export const MIN_CHAMPION_DELIVERED_PCT = 95
+
+/** A model that met every other champion bar but fell under MIN_CHAMPION_DELIVERED_PCT, carried out of recommendChampion so the report banner and the CLI can name it instead of silently skipping it. */
+export interface ChampionExclusion {
+  model: string
+  deliveredPct: number
+}
+
+export interface ChampionRecommendation {
+  /** The recommended champion, or null when nothing qualifies. */
+  model: string | null
+  /** Models ranked ABOVE `model` that met every other bar (completedAll && judgedAll) yet failed the completeness floor, in rank order - i.e. exactly the models this recommendation passed OVER, not every low-completeness model in the ranking (one that ranks below the recommendation lost on quality anyway and was never a candidate). Empty when the floor never bit. */
+  excludedForCompleteness: ChampionExclusion[]
+}
+
+/**
+ * The top-ranked model that is completedAll, judgedAll, AND at or above
+ * MIN_CHAMPION_DELIVERED_PCT - the crown recommendation. A model that scores
+ * higher but is missing cells or judgements is not a trustworthy champion,
+ * so it is skipped rather than crowned on partial evidence; a model that
+ * scores higher but preserved less content is skipped for a different and
+ * louder reason, and is reported in `excludedForCompleteness` rather than
+ * dropped silently - being passed over on the project's top-line constraint
+ * is exactly the kind of thing the person crowning needs to see.
+ */
+export function recommendChampion(ranked: ModelAggregate[]): ChampionRecommendation {
+  const excludedForCompleteness: ChampionExclusion[] = []
+  for (const m of ranked) {
+    if (!m.completedAll || !m.judgedAll) continue
+    if (m.deliveredPct < MIN_CHAMPION_DELIVERED_PCT) {
+      excludedForCompleteness.push({ model: m.model, deliveredPct: m.deliveredPct })
+      continue
+    }
+    return { model: m.model, excludedForCompleteness }
+  }
+  return { model: null, excludedForCompleteness }
 }

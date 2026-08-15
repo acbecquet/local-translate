@@ -8,7 +8,12 @@
 //
 // Subcommands:
 //   run     - loadRoster + loadCorpus, runMatrix, print the summary.
-//             Exit 0 when failed === 0, else 1.
+//             Exit 0 when failed === 0, else 1. When runMatrix reports
+//             summary.stoppedEarly (an unload it could not confirm, so no
+//             further model may be loaded without risking a VRAM
+//             overcommit), the partial summary still prints FIRST, the stop
+//             reason and how to resume follow on stderr, and the exit code
+//             is 1 - never a raw stack, and never a lost summary.
 //   judge   - for every stored cell lacking a CURRENT judgement (absent,
 //             hash-stale, or prompt-version-stale), build JudgeInputs from
 //             the cell's translated segments, judgeSegments, save. One
@@ -17,7 +22,11 @@
 //             cell): nothing is ever saved for the cell that failed, and
 //             every cell after it in processing order is never attempted -
 //             see the HARD constraint note on judgeOneCell below for why a
-//             partial judgement must never reach disk. Exit 0 when every
+//             partial judgement must never reach disk. A cell that HAD
+//             translated segments yet comes back with zero scores aborts
+//             the pass identically (a zero-of-N judgement is a failure that
+//             merely resolved), while a cell with nothing translated still
+//             saves its honestly-empty judgement. Exit 0 when every
 //             judged cell saved, or when every stored cell already has a
 //             current judgement (a benign steady state); exit 1 on any
 //             abort, or when the store has no cells at all (a setup
@@ -29,20 +38,28 @@
 //             max(meanOverall) - min(meanOverall) <= 0.25. PASS -> exit 0,
 //             FAIL -> exit 1 - the master plan's judge-prompt stability
 //             test.
-//   report  - buildReport, write <store>/report.json + <store>/report.html,
-//             print the resolved store path (see defaultStorePath below -
-//             it no longer lives under the repo tree, so this is the only
-//             way to find it without already knowing the convention) and
-//             the ranking table to stdout. Exit 0 on success.
+//   report  - buildReport, write <store>/report.json + <store>/report.html
+//             + <store>/results.md (renderResultsDoc's only production
+//             caller: the phase gate needs a results doc for
+//             docs/research/, and no other command produces one), print all
+//             three resolved paths and the resolved store path (see
+//             defaultStorePath below - it no longer lives under the repo
+//             tree, so this is the only way to find it without already
+//             knowing the convention) and the ranking table to stdout.
+//             Exit 0 on success.
 //   crown [model] - with no arg, recommendChampion (refuse with exit 1 and
-//             a stated reason when it returns null - no model is both
-//             completedAll and judgedAll yet); with an arg, that model must
-//             already have at least one stored cell (appear in the
-//             ranking), else refuse - kept deliberately weaker than the
-//             no-arg bar, but a stderr note fires when the crowned model is
-//             not itself completedAll/judgedAll, so a deliberate partial
-//             override is visibly different from a fully-vetted crown.
-//             Either way writeChampion into config/champion.json and print
+//             a stated reason when it returns null - no model is
+//             completedAll, judgedAll, AND at or above the
+//             MIN_CHAMPION_DELIVERED_PCT content-preservation floor yet);
+//             with an arg, that model must already have at least one stored
+//             cell (appear in the ranking), else refuse - kept deliberately
+//             weaker than the no-arg bar, but a stderr note fires when the
+//             crowned model is not itself completedAll/judgedAll or sits
+//             under that floor, so a deliberate partial override is visibly
+//             different from a fully-vetted crown. Either way, any model
+//             the recommendation passed OVER on the floor is named on
+//             stderr with its own number and the reason - never a silent
+//             skip - then writeChampion into config/champion.json and print
 //             "old -> new".
 //   status  - a model x item grid (roster models x corpus items) of
 //             missing/done, and each done cell's judgement state (current /
@@ -81,7 +98,14 @@ import { ensureOllama as realEnsureOllama } from '../translate/ollama/lifecycle'
 import { loadCorpus, loadRoster, type Corpus, type Roster } from './corpus'
 import { BenchStore, type StoredCell, type StoredJudgement } from './store'
 import { realHarnessDeps, runMatrix, type HarnessDeps, type HarnessEvent } from './harness'
-import { aggregate, judgementQuality, rankModels, recommendChampion } from './metrics'
+import {
+  aggregate,
+  judgementQuality,
+  MIN_CHAMPION_DELIVERED_PCT,
+  rankModels,
+  recommendChampion,
+  type ChampionExclusion
+} from './metrics'
 import {
   createOllamaJudgeTransport,
   judgeSegments,
@@ -90,7 +114,7 @@ import {
   type JudgeInput,
   type JudgeTransport
 } from './judge'
-import { buildReport, renderHtml, type BenchReport } from './report'
+import { buildReport, renderHtml, renderResultsDoc, type BenchReport } from './report'
 
 export interface BenchCliDeps {
   harnessDeps: HarnessDeps
@@ -337,6 +361,9 @@ function logHarnessEvent(e: HarnessEvent): void {
     case 'model-aborted':
       console.error(`[${e.type}] ${e.model}:${e.itemId} (${e.error})`)
       break
+    case 'matrix-stopped':
+      console.error(`[${e.type}] after ${e.model} (${e.error})`)
+      break
   }
 }
 
@@ -369,13 +396,70 @@ async function runRun(
     deps.harnessDeps
   )
 
+  // Printed FIRST, before any stop reason: a multi-hour run's partial
+  // progress is the most valuable thing on screen, and it must not be
+  // buried under (or, as before this was guarded, replaced entirely by) a
+  // stack trace from a failed unload.
   console.log(
     `run: completed ${summary.completed}, skipped ${summary.skipped}, failed ${summary.failed}`
   )
+
+  if (summary.stoppedEarly !== null) {
+    console.error(`run: STOPPED EARLY - ${summary.stoppedEarly}`)
+    console.error(
+      'run: models after that one never ran. Free the GPU (restart ollama if needed), then ' +
+        're-run "bench run" - every completed cell above is checkpointed and will be skipped.'
+    )
+    return 1
+  }
+
   return summary.failed === 0 ? 0 : 1
 }
 
 // --- judge ---------------------------------------------------------------
+
+/**
+ * Printed whenever the judge resolves ZERO usable scores for a set of
+ * segments it was actually given. judgeSegments never throws for this - a
+ * short (even empty) result is its documented "honest gap" outcome - so
+ * without naming the likely cause here, an unattended run's only evidence
+ * would be a bare count.
+ *
+ * The likely cause is specific and worth stating: createOllamaJudgeTransport
+ * (judge.ts) always sends `think: false` alongside the `format` JSON schema
+ * and, unlike OllamaBackend, carries no capability probe (see probeModelCaps
+ * in ../translate/ollama/ollama-backend.ts, which exists precisely because
+ * some local models cannot honor a JSON schema with thinking off). A judge
+ * model with that limitation fails every rung of the ladder identically -
+ * whole batch, retry, and every per-segment fallback - and produces exactly
+ * this all-zero shape, so it is by far the most likely explanation for a
+ * judge that answers every call yet scores nothing.
+ */
+const ZERO_SCORES_LIKELY_CAUSE =
+  'the judge model returned no usable scores at all - it may not support structured output ' +
+  '(a JSON response schema) with thinking disabled, which is how the judge transport always ' +
+  'calls it; try a different judge model in roster.json'
+
+/**
+ * ensureOllama, with its failure turned into a printed message and a null
+ * instead of a rejection. Starting the model server is exactly the step most
+ * likely to fail on an unattended run (a stale process holding the port, a
+ * server that never becomes ready), and an unguarded await here threw
+ * straight out of runBenchCli, breaking its documented "resolves to an exit
+ * code and never calls process.exit" contract and printing a raw stack in
+ * place of an actionable message - the same defect harness.ts's unload had.
+ */
+async function connectOrNull(
+  deps: BenchCliDeps,
+  label: string
+): Promise<Awaited<ReturnType<CliDeps['ensureOllama']>> | null> {
+  try {
+    return await deps.ensureOllama({ appDataDir: resolveAppDataDir() })
+  } catch (err) {
+    console.error(`${label}: could not start or reach ollama - ${errorMessage(err)}`)
+    return null
+  }
+}
 
 async function judgeOneCell(
   cell: StoredCell,
@@ -386,6 +470,29 @@ async function judgeOneCell(
   const inputs = buildJudgeInputs(cell)
   try {
     const scores = await judgeSegments(inputs, judgeModel, transport)
+
+    // HARD constraint, the same one the catch block below enforces for a
+    // thrown failure: a zero-of-N judgement is NOT a result, it is a total
+    // failure that merely resolved. Saving it would write a
+    // `scores: []` StoredJudgement whose cellConfigHash and promptVersion
+    // both match the current cell, which isJudgementCurrent then reports as
+    // CURRENT forever - a later `bench judge` would say "nothing to do" and
+    // exit 0, and metrics' judgedAll would read true, all on zero quality
+    // evidence. So this aborts the pass exactly the way a transport failure
+    // does. `inputs.length === 0` deliberately does NOT abort: a cell where
+    // nothing was translated has nothing to score, and an empty judgement is
+    // the honest, complete record of that.
+    if (inputs.length > 0 && scores.length === 0) {
+      console.error(
+        `judge: aborting the pass - ${cell.config.model} / ${cell.config.itemId}: ` +
+          `0 of ${inputs.length} segment(s) scored; ${ZERO_SCORES_LIKELY_CAUSE}`
+      )
+      console.error(
+        'judge: nothing was saved for this cell; cells already saved earlier in this pass remain saved.'
+      )
+      return { ok: false }
+    }
+
     store.saveJudgement(cell.config.model, cell.config.itemId, {
       judgeModel,
       promptVersion: JUDGE_PROMPT_VERSION,
@@ -457,7 +564,9 @@ async function runJudgeMain(
     return 0
   }
 
-  const connection = await deps.ensureOllama({ appDataDir: resolveAppDataDir() })
+  const connection = await connectOrNull(deps, 'judge')
+  if (connection === null) return 1
+
   try {
     const transport = deps.createJudgeTransport(connection.baseUrl)
 
@@ -499,7 +608,9 @@ async function runJudgeStability(
     `judge --stability: scoring ${cell.config.model} / ${cell.config.itemId} ${STABILITY_PASSES} times fresh (nothing will be saved).`
   )
 
-  const connection = await deps.ensureOllama({ appDataDir: resolveAppDataDir() })
+  const connection = await connectOrNull(deps, 'judge --stability')
+  if (connection === null) return 1
+
   try {
     const transport = deps.createJudgeTransport(connection.baseUrl)
     const meanOveralls: number[] = []
@@ -533,7 +644,8 @@ async function runJudgeStability(
 
       if (meanOverall === null) {
         console.error(
-          `judge --stability: pass ${pass} scored 0 of ${inputs.length} segment(s) - cannot compute a mean.`
+          `judge --stability: pass ${pass} scored 0 of ${inputs.length} segment(s) - cannot ` +
+            `compute a mean; ${ZERO_SCORES_LIKELY_CAUSE}`
         )
         return 1
       }
@@ -587,7 +699,9 @@ function printRankingTable(report: BenchReport): void {
   for (const m of report.ranking) {
     const overall = m.meanOverall === null ? '-' : m.meanOverall.toFixed(2)
     console.log(
-      `  ${m.model.padEnd(20)} quality ${overall.padStart(5)}  completeness ${m.completenessPct.toFixed(1)}%  seg/min ${m.segmentsPerMin.toFixed(2)}`
+      `  ${m.model.padEnd(20)} quality ${overall.padStart(5)}  judged ${m.judged}/${m.ofSegments}` +
+        `  completeness ${m.completenessPct.toFixed(1)}%  delivered ${m.deliveredPct.toFixed(1)}%` +
+        `  seg/min ${m.segmentsPerMin.toFixed(2)}`
     )
   }
   console.log('')
@@ -596,6 +710,7 @@ function printRankingTable(report: BenchReport): void {
       ? `Recommended champion: ${report.recommended}`
       : 'No champion recommended yet.'
   )
+  printCompletenessExclusions(report.excludedForCompleteness, 'report')
 }
 
 async function runReport(command: Extract<BenchCommand, { cmd: 'report' }>): Promise<number> {
@@ -612,12 +727,21 @@ async function runReport(command: Extract<BenchCommand, { cmd: 'report' }>): Pro
   const store = new BenchStore(command.store)
   const report = buildReport(store, corpus, roster.judge)
   const html = renderHtml(report, store)
+  // The third renderer report.ts provides. Without this, renderResultsDoc
+  // had no production caller at all, yet the phase gate requires a
+  // docs/research/<date>-phase-4-benchmark-results.md produced from it -
+  // so the doc is written here alongside the other two artifacts and its
+  // path printed, and copying it into docs/research/ is the only manual
+  // step left.
+  const resultsDoc = renderResultsDoc(report)
 
   const reportJsonPath = path.join(store.dir, 'report.json')
   const reportHtmlPath = path.join(store.dir, 'report.html')
+  const resultsDocPath = path.join(store.dir, 'results.md')
   try {
     writeFileSync(reportJsonPath, JSON.stringify(report, null, 2))
     writeFileSync(reportHtmlPath, html)
+    writeFileSync(resultsDocPath, resultsDoc)
   } catch (err) {
     printError(err)
     return 1
@@ -630,6 +754,7 @@ async function runReport(command: Extract<BenchCommand, { cmd: 'report' }>): Pro
   console.log(`Store: ${path.resolve(store.dir)}`)
   console.log(`Wrote ${path.resolve(reportJsonPath)}`)
   console.log(`Wrote ${path.resolve(reportHtmlPath)}`)
+  console.log(`Wrote ${path.resolve(resultsDocPath)}`)
   printRankingTable(report)
   return 0
 }
@@ -648,6 +773,25 @@ async function runReport(command: Extract<BenchCommand, { cmd: 'report' }>): Pro
  * via this module's own repoRoot override alone. Malformed/missing file -> null,
  * same as champion.ts's own leniency; this is a display nicety, not a gate.
  */
+/**
+ * Names every model the completeness floor passed over, one line each, on
+ * stderr. Being outranked on quality yet skipped on the project's top-line
+ * content-preservation constraint is the single most surprising thing the
+ * recommendation can do, so it is never a silent skip - the report banner
+ * says the same thing (report.ts's completenessExclusionSentence) for the
+ * same reason.
+ */
+function printCompletenessExclusions(exclusions: ChampionExclusion[], label: string): void {
+  for (const excluded of exclusions) {
+    console.error(
+      `${label}: "${excluded.model}" ranked higher on quality but was passed over for insufficient ` +
+        `completeness - it delivered ${excluded.deliveredPct.toFixed(1)}% of the content it was ` +
+        `asked to translate, under the ${MIN_CHAMPION_DELIVERED_PCT}% floor (content preservation ` +
+        'is absolute).'
+    )
+  }
+}
+
 function readChampionModelAt(repoRoot: string): string | null {
   try {
     const raw = readFileSync(path.join(repoRoot, 'config', 'champion.json'), 'utf8')
@@ -696,24 +840,31 @@ async function runCrown(command: Extract<BenchCommand, { cmd: 'crown' }>): Promi
       )
       return 1
     }
-    if (!found.completedAll || !found.judgedAll) {
+    if (
+      !found.completedAll ||
+      !found.judgedAll ||
+      found.deliveredPct < MIN_CHAMPION_DELIVERED_PCT
+    ) {
       console.error(
         `crown: note - "${command.model}" is a deliberate override, not a fully-vetted recommendation ` +
-          `(completedAll: ${found.completedAll}, judgedAll: ${found.judgedAll}).`
+          `(completedAll: ${found.completedAll}, judgedAll: ${found.judgedAll}, delivered ` +
+          `${found.deliveredPct.toFixed(1)}% of eligible content against a ${MIN_CHAMPION_DELIVERED_PCT}% floor).`
       )
     }
     chosen = command.model
   } else {
-    const recommended = recommendChampion(ranking)
-    if (recommended === null) {
+    const recommendation = recommendChampion(ranking)
+    printCompletenessExclusions(recommendation.excludedForCompleteness, 'crown')
+    if (recommendation.model === null) {
       console.error(
         'crown: no model qualifies yet - recommendChampion requires a model with every corpus item ' +
-          'completed AND judged, and no model meets that bar yet. Run "bench run" then "bench judge" ' +
-          'first, or crown an explicit model with "bench crown <model>".'
+          `completed AND judged AND at least ${MIN_CHAMPION_DELIVERED_PCT}% of the content it was ` +
+          'asked to translate actually delivered, and no model meets that bar yet. Run "bench run" ' +
+          'then "bench judge" first, or crown an explicit model with "bench crown <model>".'
       )
       return 1
     }
-    chosen = recommended
+    chosen = recommendation.model
   }
 
   const previous = readChampionModelAt(repoRoot) ?? '(none)'

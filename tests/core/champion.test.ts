@@ -187,13 +187,21 @@ describe('writeChampion (contract point 3)', () => {
 })
 
 describe('readChampion / resolveDefaultModel: public API', () => {
-  it('the real committed config/champion.json resolves and matches DEFAULT_MODEL in its pre-crowning placeholder state (read-only - proves the real findAppRoot-based resolution path)', () => {
-    expect(readChampion()).toEqual({
-      model: DEFAULT_MODEL,
-      crownedAt: '2026-08-14T00:00:00.000Z',
-      note: 'pre-benchmark placeholder, equals DEFAULT_MODEL until the phase-4 cohort crowns'
-    })
-    expect(resolveDefaultModel()).toBe(DEFAULT_MODEL)
+  it('the real committed config/champion.json resolves to a well-formed state whose model IS resolveDefaultModel() (read-only - proves the real findAppRoot-based resolution path)', () => {
+    // Deliberately asserts the INVARIANT, never the current placeholder
+    // values: `bench crown` (the whole point of this branch) rewrites
+    // model, crownedAt, and note on every crowning, so pinning any of the
+    // three would make the next `npm run check` after a crowning fail on
+    // the harness being used exactly as designed. What must always hold is
+    // that the committed file parses, names some model, carries a real
+    // timestamp, and is what resolveDefaultModel() actually returns.
+    const champion = readChampion()
+
+    expect(champion).not.toBeNull()
+    expect(typeof champion!.model).toBe('string')
+    expect(champion!.model.trim().length).toBeGreaterThan(0)
+    expect(Number.isNaN(Date.parse(champion!.crownedAt))).toBe(false)
+    expect(resolveDefaultModel()).toBe(champion!.model)
   })
 
   it('a valid champion file with a model different from DEFAULT_MODEL wins over it (contract point 1)', () => {

@@ -396,6 +396,58 @@ describe('run - exit codes (contract point 2)', () => {
     expect(store.loadCell('model-a', 'item-1')).toBeNull()
   })
 
+  it('exits 1, prints the partial summary AND the stop reason, and never rejects when an unload fails mid-matrix', async () => {
+    const repoRoot = await makeTempDir('bench-cli-run-unloadfail-')
+    _internals.setRepoRootForTesting(repoRoot)
+    const storeDir = await makeTempDir('bench-cli-run-unloadfail-store-')
+
+    const itemFile = await writeFakeItemFile(repoRoot, 'item-1', [seg({ id: 's1', text: 'Hello' })])
+    const corpusPath = await writeCorpus(repoRoot, [
+      { id: 'item-1', file: itemFile, sourceLang: 'English', targetLang: 'German', kind: 'pptx' }
+    ])
+    const rosterPath = await writeRoster(repoRoot, {
+      models: ['model-a', 'model-b'],
+      judge: 'judge-x'
+    })
+
+    const translateBatch = vi.fn().mockImplementation(async (req: BatchRequest) => ({
+      translations: req.segments.map((s) => ({ id: s.id, translation: `[DE] ${s.text}` }))
+    }))
+    const deps = fakeDeps({
+      harnessDeps: fakeHarnessDeps({
+        createBackend: vi.fn().mockReturnValue(fakeBackend({ translateBatch })),
+        unloadModel: vi.fn().mockRejectedValue(new Error('responded 404 Not Found'))
+      })
+    })
+
+    const logs: string[] = []
+    const errs: string[] = []
+    vi.spyOn(console, 'log').mockImplementation((msg?: unknown) => {
+      logs.push(String(msg ?? ''))
+    })
+    vi.spyOn(console, 'error').mockImplementation((msg?: unknown) => {
+      errs.push(String(msg ?? ''))
+    })
+
+    const code = await runBenchCli(
+      ['run', '--roster', rosterPath, '--corpus', corpusPath, '--store', storeDir],
+      deps
+    )
+
+    // Non-zero, but a returned exit code - not a raw stack out of
+    // runBenchCli, which is the contract this path used to break.
+    expect(code).toBe(1)
+    // The partial summary still prints: model-a's cell DID complete.
+    expect(logs.join('\n')).toContain('run: completed 1')
+    const errText = errs.join('\n')
+    expect(errText).toContain('overcommit')
+    expect(errText).toContain('model-a')
+
+    const store = new BenchStore(storeDir)
+    expect(store.loadCell('model-a', 'item-1')).not.toBeNull()
+    expect(store.loadCell('model-b', 'item-1')).toBeNull()
+  })
+
   it('exits 1 and never touches the harness when the corpus manifest is invalid', async () => {
     const repoRoot = await makeTempDir('bench-cli-run-badcorpus-')
     _internals.setRepoRootForTesting(repoRoot)
@@ -485,6 +537,48 @@ describe('report - buildReport, writes report.json/report.html, prints the ranki
     expect(output).toContain(`Store: ${path.resolve(storeDir)}`)
     expect(output).toContain(`Wrote ${path.resolve(path.join(storeDir, 'report.json'))}`)
     expect(output).toContain(`Wrote ${path.resolve(path.join(storeDir, 'report.html'))}`)
+  })
+
+  it('also writes results.md from renderResultsDoc and prints its path - the phase gate needs a results doc, and no other command produces one', async () => {
+    const repoRoot = await makeTempDir('bench-cli-report-doc-')
+    _internals.setRepoRootForTesting(repoRoot)
+    const storeDir = await makeTempDir('bench-cli-report-doc-store-')
+    const store = new BenchStore(storeDir)
+    const rosterPath = await writeRoster(repoRoot, { models: ['model-a'], judge: 'judge-x' })
+    const itemFile = await writeFakeItemFile(repoRoot, 'item-1', [seg({ id: 's1', text: 'Hi' })])
+    const corpusPath = await writeCorpus(repoRoot, [
+      { id: 'item-1', file: itemFile, sourceLang: 'English', targetLang: 'German', kind: 'pptx' }
+    ])
+
+    const cell = makeCell({ config: makeConfig({ model: 'model-a', itemId: 'item-1' }) })
+    store.saveCell(cell)
+    store.saveJudgement(
+      'model-a',
+      'item-1',
+      makeJudgement({ judgeModel: 'judge-x', cellConfigHash: cell.configHash })
+    )
+
+    const logs: string[] = []
+    vi.spyOn(console, 'log').mockImplementation((msg?: unknown) => {
+      logs.push(String(msg ?? ''))
+    })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const code = await runBenchCli(
+      ['report', '--roster', rosterPath, '--corpus', corpusPath, '--store', storeDir],
+      fakeDeps()
+    )
+
+    expect(code).toBe(0)
+    const docPath = path.join(storeDir, 'results.md')
+    expect(existsSync(docPath)).toBe(true)
+
+    const doc = readFileSync(docPath, 'utf8')
+    expect(doc).toContain('# Benchmark Results')
+    expect(doc).toContain('model-a')
+    expect(doc).toContain('| Rank | Model |')
+
+    expect(logs.join('\n')).toContain(`Wrote ${path.resolve(docPath)}`)
   })
 
   it('exits 1 and writes nothing when the corpus manifest is invalid', async () => {
@@ -637,6 +731,31 @@ describe('judge - skips current judgements, re-judges stale ones, exact transpor
     expect(logText).not.toContain('already has a current judgement')
   })
 
+  it('exits 1 with a printed reason (never a raw rejection) when ensureOllama itself fails', async () => {
+    const repoRoot = await makeTempDir('bench-cli-judge-noconnect-')
+    _internals.setRepoRootForTesting(repoRoot)
+    const storeDir = await makeTempDir('bench-cli-judge-noconnect-store-')
+    const store = new BenchStore(storeDir)
+    const rosterPath = await writeRoster(repoRoot, { models: ['model-a'], judge: 'judge-x' })
+    store.saveCell(makeCell({ config: makeConfig({ model: 'model-a', itemId: 'item-1' }) }))
+
+    const createJudgeTransport = vi.fn()
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    const code = await runBenchCli(
+      ['judge', '--roster', rosterPath, '--store', storeDir],
+      fakeDeps({
+        ensureOllama: vi.fn().mockRejectedValue(new Error('ollama did not become ready')),
+        createJudgeTransport
+      })
+    )
+
+    expect(code).toBe(1)
+    expect(createJudgeTransport).not.toHaveBeenCalled()
+    expect(errSpy).toHaveBeenCalled()
+  })
+
   it('exits 1 and never connects when the roster manifest is invalid', async () => {
     const repoRoot = await makeTempDir('bench-cli-judge-badroster-')
     _internals.setRepoRootForTesting(repoRoot)
@@ -704,6 +823,110 @@ describe('judge - a JudgeBatchFailure aborts the whole pass without ever persist
   })
 })
 
+// --- HARD constraint: a zero-of-N judgement is never persisted as complete ---
+
+describe('judge - a cell that scored 0 of N segments aborts the pass and saves nothing (HARD constraint)', () => {
+  it('saves NOTHING and exits 1 when the judge resolves zero usable scores for a cell that HAD translated segments, naming the likely cause', async () => {
+    const repoRoot = await makeTempDir('bench-cli-judge-zero-')
+    _internals.setRepoRootForTesting(repoRoot)
+    const storeDir = await makeTempDir('bench-cli-judge-zero-store-')
+    const store = new BenchStore(storeDir)
+    const rosterPath = await writeRoster(repoRoot, { models: ['model-a'], judge: 'judge-x' })
+
+    const cell = makeCell({ config: makeConfig({ model: 'model-a', itemId: 'item-1' }) })
+    store.saveCell(cell)
+
+    // Every rung of the ladder answers with unusable content (the shape a
+    // judge model that cannot honor a JSON schema with thinking off
+    // produces): judgeSegments RESOLVES with [] rather than throwing.
+    const chat = vi.fn().mockResolvedValue('I am thinking about it, not JSON at all')
+    const deps = fakeDeps({ createJudgeTransport: vi.fn().mockReturnValue({ chat }) })
+
+    const errs: string[] = []
+    vi.spyOn(console, 'error').mockImplementation((msg?: unknown) => {
+      errs.push(String(msg ?? ''))
+    })
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    const code = await runBenchCli(['judge', '--roster', rosterPath, '--store', storeDir], deps)
+
+    expect(code).toBe(1)
+    // The poison-the-store failure mode: a scores:[] judgement whose hash and
+    // prompt version match would be "current" forever, so a later judge pass
+    // would say "nothing to do" on a cell that has zero quality evidence.
+    expect(store.loadJudgement('judge-x', 'model-a', 'item-1')).toBeNull()
+
+    const errText = errs.join('\n')
+    expect(errText).toContain('0 of 1 segment(s)')
+    expect(errText).toContain('structured output')
+    expect(errText).toContain('thinking disabled')
+  })
+
+  it('never attempts the cell after the zero-score one (the pass aborts, exactly like a transport failure)', async () => {
+    const repoRoot = await makeTempDir('bench-cli-judge-zero-abort-')
+    _internals.setRepoRootForTesting(repoRoot)
+    const storeDir = await makeTempDir('bench-cli-judge-zero-abort-store-')
+    const store = new BenchStore(storeDir)
+    const rosterPath = await writeRoster(repoRoot, { models: ['model-a'], judge: 'judge-x' })
+
+    store.saveCell(makeCell({ config: makeConfig({ model: 'model-a', itemId: 'a-first' }) }))
+    store.saveCell(makeCell({ config: makeConfig({ model: 'model-a', itemId: 'b-second' }) }))
+
+    const chat = vi.fn().mockResolvedValue('not json')
+    const stop = vi.fn().mockResolvedValue(undefined)
+    const deps = fakeDeps({
+      ensureOllama: vi.fn().mockResolvedValue(fakeConnection(stop)),
+      createJudgeTransport: vi.fn().mockReturnValue({ chat })
+    })
+
+    silenceConsole()
+
+    const code = await runBenchCli(['judge', '--roster', rosterPath, '--store', storeDir], deps)
+
+    expect(code).toBe(1)
+    // a-first burns its whole ladder (batch + retry + one per-segment
+    // fallback = 3 calls) and then aborts; b-second is never attempted.
+    expect(chat).toHaveBeenCalledTimes(3)
+    expect(store.loadJudgement('judge-x', 'model-a', 'a-first')).toBeNull()
+    expect(store.loadJudgement('judge-x', 'model-a', 'b-second')).toBeNull()
+    expect(stop).toHaveBeenCalledTimes(1)
+  })
+
+  it('STILL saves an empty judgement for a cell with nothing translated - an empty judgement is the honest record there, not a shortfall', async () => {
+    const repoRoot = await makeTempDir('bench-cli-judge-nothing-translated-')
+    _internals.setRepoRootForTesting(repoRoot)
+    const storeDir = await makeTempDir('bench-cli-judge-nothing-translated-store-')
+    const store = new BenchStore(storeDir)
+    const rosterPath = await writeRoster(repoRoot, { models: ['model-a'], judge: 'judge-x' })
+
+    const cell = makeCell({
+      config: makeConfig({ model: 'model-a', itemId: 'item-1' }),
+      report: {
+        ...makeCell().report,
+        total: 1,
+        translated: 0,
+        keptOriginal: [{ id: 's1', reason: 'skipped-untranslatable' }],
+        segments: [{ id: 's1', sourceText: '12345', translation: null }]
+      }
+    })
+    store.saveCell(cell)
+
+    const chat = vi.fn()
+    const deps = fakeDeps({ createJudgeTransport: vi.fn().mockReturnValue({ chat }) })
+
+    silenceConsole()
+
+    const code = await runBenchCli(['judge', '--roster', rosterPath, '--store', storeDir], deps)
+
+    expect(code).toBe(0)
+    expect(chat).not.toHaveBeenCalled()
+    const saved = store.loadJudgement('judge-x', 'model-a', 'item-1')
+    expect(saved).not.toBeNull()
+    expect(saved!.scores).toEqual([])
+    expect(saved!.cellConfigHash).toBe(cell.configHash)
+  })
+})
+
 // --- contract point 4: judge --stability ------------------------------------
 
 describe('judge --stability - 3 independent passes with the 0.25 spread gate (contract point 4)', () => {
@@ -721,6 +944,7 @@ describe('judge --stability - 3 independent passes with the 0.25 spread gate (co
       .fn()
       .mockImplementation(async (req: { user: string }) => uniformScoreResponse(req, 5))
     const saveJudgementSpy = vi.spyOn(BenchStore.prototype, 'saveJudgement')
+    const stop = vi.fn().mockResolvedValue(undefined)
 
     const logs: string[] = []
     vi.spyOn(console, 'log').mockImplementation((msg?: unknown) => {
@@ -730,12 +954,18 @@ describe('judge --stability - 3 independent passes with the 0.25 spread gate (co
 
     const code = await runBenchCli(
       ['judge', '--stability', '--roster', rosterPath, '--store', storeDir],
-      fakeDeps({ createJudgeTransport: vi.fn().mockReturnValue({ chat }) })
+      fakeDeps({
+        ensureOllama: vi.fn().mockResolvedValue(fakeConnection(stop)),
+        createJudgeTransport: vi.fn().mockReturnValue({ chat })
+      })
     )
 
     expect(code).toBe(0)
     expect(chat).toHaveBeenCalledTimes(3)
     expect(saveJudgementSpy).not.toHaveBeenCalled()
+    // The connection is closed exactly once, in the finally block - the same
+    // assertion the main judge path already carries.
+    expect(stop).toHaveBeenCalledTimes(1)
 
     const output = logs.join('\n')
     expect(output).toMatch(/pass 1.*5\.000/)
@@ -779,6 +1009,38 @@ describe('judge --stability - 3 independent passes with the 0.25 spread gate (co
     expect(logs.join('\n')).toContain('FAIL')
   })
 
+  it('FAILs legibly when a pass scores 0 segments, naming the likely cause rather than leaving an unattended run to guess', async () => {
+    const repoRoot = await makeTempDir('bench-cli-stability-zero-')
+    _internals.setRepoRootForTesting(repoRoot)
+    const storeDir = await makeTempDir('bench-cli-stability-zero-store-')
+    const store = new BenchStore(storeDir)
+    const rosterPath = await writeRoster(repoRoot, { models: ['model-a'], judge: 'judge-x' })
+
+    store.saveCell(makeCell({ config: makeConfig({ model: 'model-a', itemId: 'item-1' }) }))
+
+    // The judge model answers, but never with anything the schema can use -
+    // exactly what a model that cannot honor structured output with thinking
+    // off produces. judgeSegments RESOLVES with [], so nothing throws.
+    const chat = vi.fn().mockResolvedValue('<think>hmm</think> sure thing!')
+
+    const errs: string[] = []
+    vi.spyOn(console, 'error').mockImplementation((msg?: unknown) => {
+      errs.push(String(msg ?? ''))
+    })
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    const code = await runBenchCli(
+      ['judge', '--stability', '--roster', rosterPath, '--store', storeDir],
+      fakeDeps({ createJudgeTransport: vi.fn().mockReturnValue({ chat }) })
+    )
+
+    expect(code).toBe(1)
+    const errText = errs.join('\n')
+    expect(errText).toContain('0 of 1 segment(s)')
+    expect(errText).toContain('structured output')
+    expect(errText).toContain('thinking disabled')
+  })
+
   it('refuses with exit 1 when the store has no cells at all', async () => {
     const repoRoot = await makeTempDir('bench-cli-stability-empty-')
     _internals.setRepoRootForTesting(repoRoot)
@@ -795,6 +1057,31 @@ describe('judge --stability - 3 independent passes with the 0.25 spread gate (co
 
     expect(code).toBe(1)
     expect(ensureOllama).not.toHaveBeenCalled()
+  })
+
+  it('exits 1 with a printed reason (never a raw rejection) when ensureOllama itself fails', async () => {
+    const repoRoot = await makeTempDir('bench-cli-stability-noconnect-')
+    _internals.setRepoRootForTesting(repoRoot)
+    const storeDir = await makeTempDir('bench-cli-stability-noconnect-store-')
+    const store = new BenchStore(storeDir)
+    const rosterPath = await writeRoster(repoRoot, { models: ['model-a'], judge: 'judge-x' })
+    store.saveCell(makeCell({ config: makeConfig({ model: 'model-a', itemId: 'item-1' }) }))
+
+    const createJudgeTransport = vi.fn()
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    const code = await runBenchCli(
+      ['judge', '--stability', '--roster', rosterPath, '--store', storeDir],
+      fakeDeps({
+        ensureOllama: vi.fn().mockRejectedValue(new Error('ollama did not become ready')),
+        createJudgeTransport
+      })
+    )
+
+    expect(code).toBe(1)
+    expect(createJudgeTransport).not.toHaveBeenCalled()
+    expect(errSpy).toHaveBeenCalled()
   })
 
   it('refuses with exit 1 and never connects when the first stored cell has no translated segments', async () => {
@@ -922,6 +1209,121 @@ describe('crown - refuses with no stored cells, writes+round-trips otherwise (co
 
     const written = JSON.parse(readFileSync(path.join(repoRoot, 'config', 'champion.json'), 'utf8'))
     expect(written.model).toBe('model-a')
+  })
+
+  it('crowns an EXPLICIT model that is completedAll and judgedAll WITHOUT the override note (the fourth crown combination: explicit + fully vetted)', async () => {
+    const repoRoot = await makeTempDir('bench-cli-crown-explicit-vetted-')
+    _internals.setRepoRootForTesting(repoRoot)
+    const storeDir = await makeTempDir('bench-cli-crown-explicit-vetted-store-')
+    const store = new BenchStore(storeDir)
+    const rosterPath = await writeRoster(repoRoot, { models: ['model-a'], judge: 'judge-x' })
+    const itemFile = await writeFakeItemFile(repoRoot, 'item-1', [seg({ id: 's1', text: 'Hi' })])
+    const corpusPath = await writeCorpus(repoRoot, [
+      { id: 'item-1', file: itemFile, sourceLang: 'English', targetLang: 'German', kind: 'pptx' }
+    ])
+
+    const cell = makeCell({ config: makeConfig({ model: 'model-a', itemId: 'item-1' }) })
+    store.saveCell(cell)
+    store.saveJudgement(
+      'model-a',
+      'item-1',
+      makeJudgement({ judgeModel: 'judge-x', cellConfigHash: cell.configHash })
+    )
+
+    const logs: string[] = []
+    const errs: string[] = []
+    vi.spyOn(console, 'log').mockImplementation((msg?: unknown) => {
+      logs.push(String(msg ?? ''))
+    })
+    vi.spyOn(console, 'error').mockImplementation((msg?: unknown) => {
+      errs.push(String(msg ?? ''))
+    })
+
+    const code = await runBenchCli(
+      ['crown', 'model-a', '--roster', rosterPath, '--corpus', corpusPath, '--store', storeDir],
+      fakeDeps()
+    )
+
+    expect(code).toBe(0)
+    expect(logs.join('\n')).toContain('-> model-a')
+    const written = JSON.parse(readFileSync(path.join(repoRoot, 'config', 'champion.json'), 'utf8'))
+    expect(written.model).toBe('model-a')
+
+    // The negative assertion this suite was missing: a fully-vetted model
+    // crowned EXPLICITLY must read exactly like a fully-vetted no-arg crown,
+    // so the override note only ever marks a genuinely partial override.
+    expect(errs.join('\n')).not.toContain('deliberate override')
+  })
+
+  it('crowns the faithful runner-up and SAYS on stderr that the top-ranked model was passed over for insufficient completeness', async () => {
+    const repoRoot = await makeTempDir('bench-cli-crown-floor-')
+    _internals.setRepoRootForTesting(repoRoot)
+    const storeDir = await makeTempDir('bench-cli-crown-floor-store-')
+    const store = new BenchStore(storeDir)
+    const rosterPath = await writeRoster(repoRoot, {
+      models: ['model-lossy', 'model-faithful'],
+      judge: 'judge-x'
+    })
+    const itemFile = await writeFakeItemFile(repoRoot, 'item-1', [seg({ id: 's1', text: 'Hi' })])
+    const corpusPath = await writeCorpus(repoRoot, [
+      { id: 'item-1', file: itemFile, sourceLang: 'English', targetLang: 'German', kind: 'pptx' }
+    ])
+
+    // model-lossy: 2 of 10 eligible segments translated, scored 5s on those.
+    const lossy = makeCell({
+      config: makeConfig({ model: 'model-lossy', itemId: 'item-1' }),
+      report: {
+        ...makeCell().report,
+        total: 10,
+        translated: 2,
+        keptOriginal: Array.from({ length: 8 }, (_, i) => ({ id: `f${i}`, reason: 'empty' }))
+      }
+    })
+    // model-faithful: everything translated, scored 4s.
+    const faithful = makeCell({
+      config: makeConfig({ model: 'model-faithful', itemId: 'item-1' }),
+      report: { ...makeCell().report, total: 10, translated: 10, keptOriginal: [] }
+    })
+    store.saveCell(lossy)
+    store.saveCell(faithful)
+    store.saveJudgement(
+      'model-lossy',
+      'item-1',
+      makeJudgement({ judgeModel: 'judge-x', cellConfigHash: lossy.configHash })
+    )
+    store.saveJudgement(
+      'model-faithful',
+      'item-1',
+      makeJudgement({
+        judgeModel: 'judge-x',
+        cellConfigHash: faithful.configHash,
+        scores: [{ segmentId: 's1', accuracy: 4, fluency: 4, format: 4 }]
+      })
+    )
+
+    const logs: string[] = []
+    const errs: string[] = []
+    vi.spyOn(console, 'log').mockImplementation((msg?: unknown) => {
+      logs.push(String(msg ?? ''))
+    })
+    vi.spyOn(console, 'error').mockImplementation((msg?: unknown) => {
+      errs.push(String(msg ?? ''))
+    })
+
+    const code = await runBenchCli(
+      ['crown', '--roster', rosterPath, '--corpus', corpusPath, '--store', storeDir],
+      fakeDeps()
+    )
+
+    expect(code).toBe(0)
+    const written = JSON.parse(readFileSync(path.join(repoRoot, 'config', 'champion.json'), 'utf8'))
+    expect(written.model).toBe('model-faithful')
+    expect(logs.join('\n')).toContain('-> model-faithful')
+
+    const errText = errs.join('\n')
+    expect(errText).toContain('model-lossy')
+    expect(errText).toContain('passed over')
+    expect(errText).toContain('20.0%')
   })
 
   it('refuses an explicit model argument that has no stored cells', async () => {

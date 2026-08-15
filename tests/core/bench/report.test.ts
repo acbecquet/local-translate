@@ -106,6 +106,22 @@ function makeJudgement(overrides: Partial<StoredJudgement> = {}): StoredJudgemen
   }
 }
 
+/**
+ * This repo's markdown convention: one full sentence per physical line,
+ * outside of headings and table rows, which are structural, not prose.
+ * Shared by every renderResultsDoc test so a newly-added prose line (the
+ * completeness-exclusion note was exactly that) is held to it too, rather
+ * than only the prose that happened to exist when the check was written.
+ */
+function expectOneSentencePerLine(doc: string): void {
+  for (const line of doc.split('\n')) {
+    const trimmed = line.trim()
+    if (trimmed === '' || trimmed.startsWith('|') || trimmed.startsWith('#')) continue
+    const withoutTrailingTerminator = trimmed.replace(/[.!?]$/, '')
+    expect(withoutTrailingTerminator).not.toMatch(/[.!?]\s+[A-Z(]/)
+  }
+}
+
 // --- contract point 1 -------------------------------------------------------
 
 describe('buildReport - wires aggregate/rankModels/recommendChampion, carries every A/B row (contract point 1)', () => {
@@ -462,6 +478,173 @@ describe('renderHtml - image artifact embedding (contract point 4)', () => {
     expect(dataUriCount).toBe(1) // only the small original embeds
     expect(html).toContain(artifactRelPath)
   })
+
+  it('an oversized ORIGINAL falls back to its basename, never the full local filesystem path (this report ships in EVIDENCE/)', async () => {
+    const storeDir = await makeTempDir('bench-report-image-origlarge-store-')
+    const sourceDir = await makeTempDir('bench-report-image-origlarge-source-')
+    const store = new BenchStore(storeDir)
+    const corpus: Corpus = {
+      items: [makeCorpusItem({ id: 'item-img', kind: 'image', file: 'fixtures/whatever.png' })]
+    }
+
+    const originalPath = path.join(sourceDir, 'original.png')
+    await writeFile(originalPath, Buffer.alloc(2 * 1024 * 1024 + 1024, 3))
+
+    const artifactRelPath = store.artifactPathFor('model-a', 'item-img', 'whatever.png')
+    const artifactAbsPath = path.join(store.dir, artifactRelPath)
+    await mkdir(path.dirname(artifactAbsPath), { recursive: true })
+    await writeFile(artifactAbsPath, Buffer.from('tiny-fake-translated-bytes'))
+
+    store.saveCell(
+      makeCell({
+        config: makeConfig({ model: 'model-a', itemId: 'item-img' }),
+        report: makeReport({ file: originalPath }),
+        artifactPath: artifactRelPath
+      })
+    )
+
+    const report = buildReport(store, corpus, 'judge-x')
+    const html = renderHtml(report, store)
+
+    expect(html).toContain('original.png')
+    // report.html is committed under EVIDENCE/phase-4/ and shared - the
+    // machine-local directory it happened to be generated from must not
+    // travel with it.
+    expect(html).not.toContain(sourceDir)
+  })
+
+  it('a MISSING original falls back to its basename too, never the full local filesystem path', async () => {
+    const storeDir = await makeTempDir('bench-report-image-origmissing-store-')
+    const sourceDir = await makeTempDir('bench-report-image-origmissing-source-')
+    const store = new BenchStore(storeDir)
+    const corpus: Corpus = {
+      items: [makeCorpusItem({ id: 'item-img', kind: 'image', file: 'fixtures/whatever.png' })]
+    }
+
+    // Never written to disk - statSync throws and the missing-artifact
+    // fallback fires with the same label.
+    const originalPath = path.join(sourceDir, 'gone.png')
+
+    const artifactRelPath = store.artifactPathFor('model-a', 'item-img', 'whatever.png')
+    const artifactAbsPath = path.join(store.dir, artifactRelPath)
+    await mkdir(path.dirname(artifactAbsPath), { recursive: true })
+    await writeFile(artifactAbsPath, Buffer.from('tiny'))
+
+    store.saveCell(
+      makeCell({
+        config: makeConfig({ model: 'model-a', itemId: 'item-img' }),
+        report: makeReport({ file: originalPath }),
+        artifactPath: artifactRelPath
+      })
+    )
+
+    const html = renderHtml(buildReport(store, corpus, 'judge-x'), store)
+
+    expect(html).toContain('gone.png')
+    expect(html).not.toContain(sourceDir)
+  })
+})
+
+// --- judge coverage reaches the reader (IMPORTANT 3) -----------------------
+
+describe('judge coverage is visible in the report, not just used as an internal weight', () => {
+  it('carries judged/ofSegments onto the ranking and renders them in both the HTML table and the results doc', async () => {
+    const storeDir = await makeTempDir('bench-report-coverage-')
+    const store = new BenchStore(storeDir)
+    const corpus: Corpus = { items: [makeCorpusItem({ id: 'item-a' })] }
+
+    // 8 translated segments, only 3 of them actually scored.
+    const cell = makeCell({
+      config: makeConfig({ model: 'model-a', itemId: 'item-a' }),
+      report: makeReport({ total: 8, translated: 8 })
+    })
+    store.saveCell(cell)
+    store.saveJudgement(
+      'model-a',
+      'item-a',
+      makeJudgement({
+        scores: [1, 2, 3].map((n) => ({
+          segmentId: `s${n}`,
+          accuracy: 4,
+          fluency: 4,
+          format: 4
+        }))
+      })
+    )
+
+    const report = buildReport(store, corpus, 'judge-x')
+
+    expect(report.ranking[0].judged).toBe(3)
+    expect(report.ranking[0].ofSegments).toBe(8)
+
+    // A 3-of-8 model must not render identically to an 8-of-8 one.
+    expect(renderHtml(report, store)).toContain('3 / 8')
+    expect(renderResultsDoc(report)).toContain('3 / 8')
+  })
+})
+
+// --- the completeness floor is visible, never a silent skip (IMPORTANT 4) ---
+
+describe('a model passed over for insufficient completeness is named, not silently skipped', () => {
+  it('carries excludedForCompleteness and says so in the HTML banner and the results doc', async () => {
+    const storeDir = await makeTempDir('bench-report-floor-')
+    const store = new BenchStore(storeDir)
+    const corpus: Corpus = { items: [makeCorpusItem({ id: 'item-a' })] }
+
+    // model-lossy scores perfectly on the 2 segments it translated, but
+    // dropped 8 more it was asked to translate - 20% delivered.
+    const lossy = makeCell({
+      config: makeConfig({ model: 'model-lossy', itemId: 'item-a' }),
+      configHash: 'hash-lossy',
+      report: makeReport({
+        total: 10,
+        translated: 2,
+        keptOriginal: Array.from({ length: 8 }, (_, i) => ({ id: `f${i}`, reason: 'empty' }))
+      })
+    })
+    // model-faithful delivered everything, at a lower score.
+    const faithful = makeCell({
+      config: makeConfig({ model: 'model-faithful', itemId: 'item-a' }),
+      configHash: 'hash-faithful',
+      report: makeReport({ total: 10, translated: 10, keptOriginal: [] })
+    })
+    store.saveCell(lossy)
+    store.saveCell(faithful)
+    store.saveJudgement(
+      'model-lossy',
+      'item-a',
+      makeJudgement({
+        cellConfigHash: 'hash-lossy',
+        scores: [{ segmentId: 's1', accuracy: 5, fluency: 5, format: 5 }]
+      })
+    )
+    store.saveJudgement(
+      'model-faithful',
+      'item-a',
+      makeJudgement({
+        cellConfigHash: 'hash-faithful',
+        scores: [{ segmentId: 's1', accuracy: 4, fluency: 4, format: 4 }]
+      })
+    )
+
+    const report = buildReport(store, corpus, 'judge-x')
+
+    expect(report.ranking[0].model).toBe('model-lossy') // still ranks first on quality
+    expect(report.recommended).toBe('model-faithful') // but never gets crowned
+    expect(report.excludedForCompleteness).toEqual([{ model: 'model-lossy', deliveredPct: 20 }])
+
+    const html = renderHtml(report, store)
+    expect(html).toContain('model-lossy')
+    expect(html).toContain('passed over')
+    expect(html).toContain('completeness')
+
+    const doc = renderResultsDoc(report)
+    expect(doc).toContain('passed over')
+    expect(doc).toContain('model-lossy')
+    // The exclusion note is prose in a doc bound for docs/research/, so it
+    // obeys the same one-sentence-per-line convention as the rest.
+    expectOneSentencePerLine(doc)
+  })
 })
 
 // --- contract point 5 -------------------------------------------------------
@@ -524,12 +707,37 @@ describe('renderResultsDoc - ranking order, recommended champion, tier table, on
     // One full sentence per physical line (repo markdown convention): no
     // non-table, non-heading, non-blank line has a mid-line sentence
     // terminator followed by the start of another sentence.
-    for (const line of doc.split('\n')) {
-      const trimmed = line.trim()
-      if (trimmed === '' || trimmed.startsWith('|') || trimmed.startsWith('#')) continue
-      const withoutTrailingTerminator = trimmed.replace(/[.!?]$/, '')
-      expect(withoutTrailingTerminator).not.toMatch(/[.!?]\s+[A-Z(]/)
-    }
+    expectOneSentencePerLine(doc)
+  })
+
+  it('escapes a literal pipe in a model name so one model can never break the markdown tables', async () => {
+    const storeDir = await makeTempDir('bench-report-doc-pipe-')
+    const store = new BenchStore(storeDir)
+    const corpus: Corpus = { items: [makeCorpusItem({ id: 'item-a' })] }
+    store.saveCell(makeCell({ config: makeConfig({ model: 'model-a', itemId: 'item-a' }) }))
+
+    // Injected onto the built report rather than seeded through the store:
+    // model names are arbitrary ollama tags read from roster.json, but
+    // store.modelSlug only rewrites ':' and '/', so a pipe would fail the
+    // filesystem write on Windows long before it reached a table cell.
+    // renderResultsDoc takes a plain BenchReport, so this exercises exactly
+    // the escaping seam under test, on a doc headed for docs/research/.
+    const report = buildReport(store, corpus, 'judge-x')
+    report.ranking[0].model = 'weird|model:7b'
+    const doc = renderResultsDoc(report)
+
+    expect(doc).toContain('weird\\|model:7b')
+    expect(doc).not.toContain('| weird|model:7b |')
+
+    // Structural check: the ranking row still has the same CELL count as its
+    // own header row once escaped pipes are discounted, which is exactly
+    // what a raw pipe would break. Splitting on unescaped pipes only.
+    const unescapedPipe = /(?<!\\)\|/
+    const cellCount = (line: string): number => line.split(unescapedPipe).length
+    const lines = doc.split('\n')
+    const header = lines.find((l) => l.startsWith('| Rank |'))!
+    const modelRow = lines.find((l) => l.includes('weird\\|model'))!
+    expect(cellCount(modelRow)).toBe(cellCount(header))
   })
 
   it('never uses an em dash', async () => {

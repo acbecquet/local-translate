@@ -179,7 +179,7 @@ describe('runMatrix - model-major order and unloadModel timing (contract point 1
       deps
     )
 
-    expect(summary).toEqual({ completed: 4, skipped: 0, failed: 0 })
+    expect(summary).toEqual({ completed: 4, skipped: 0, failed: 0, stoppedEarly: null })
     expect(timeline).toEqual([
       'model-start:model-a',
       'cell-start:model-a:item-1',
@@ -273,7 +273,7 @@ describe('runMatrix - resume via configHash (contract point 2)', () => {
       deps
     )
 
-    expect(summary).toEqual({ completed: 1, skipped: 1, failed: 0 })
+    expect(summary).toEqual({ completed: 1, skipped: 1, failed: 0, stoppedEarly: null })
     expect(events.some((e) => e.type === 'cell-skipped' && e.itemId === 'fresh')).toBe(true)
     expect(events.some((e) => e.type === 'cell-done' && e.itemId === 'stale')).toBe(true)
 
@@ -319,7 +319,7 @@ describe('runMatrix - saves the full RunReport and copies the artifact into the 
       deps
     )
 
-    expect(summary).toEqual({ completed: 1, skipped: 0, failed: 0 })
+    expect(summary).toEqual({ completed: 1, skipped: 0, failed: 0, stoppedEarly: null })
 
     const cell = store.loadCell('model-a', 'item-1')
     expect(cell).not.toBeNull()
@@ -374,7 +374,7 @@ describe('runMatrix - an ordinary cell failure is recorded and the model continu
       deps
     )
 
-    expect(summary).toEqual({ completed: 1, skipped: 0, failed: 1 })
+    expect(summary).toEqual({ completed: 1, skipped: 0, failed: 1, stoppedEarly: null })
 
     const failedEvent = events.find(
       (e): e is { type: 'cell-failed'; model: string; itemId: string; error: string } =>
@@ -439,7 +439,7 @@ describe('runMatrix - a transport-class failure aborts the model and moves to th
 
     // model-a: item-1 triggers the transport error, item-2/3/4 cascade-abort.
     // model-b: all 4 items complete normally.
-    expect(summary).toEqual({ completed: 4, skipped: 0, failed: 4 })
+    expect(summary).toEqual({ completed: 4, skipped: 0, failed: 4, stoppedEarly: null })
 
     const modelAEvents = events.filter((e) => e.model === 'model-a')
     expect(modelAEvents.filter((e) => e.type === 'model-aborted')).toHaveLength(4)
@@ -513,7 +513,7 @@ describe('runMatrix - a resolved BatchResponse reporting only transport-class ba
       deps
     )
 
-    expect(summary).toEqual({ completed: 0, skipped: 0, failed: 3 })
+    expect(summary).toEqual({ completed: 0, skipped: 0, failed: 3, stoppedEarly: null })
 
     const modelAEvents = events.filter((e) => e.model === 'model-a')
     expect(modelAEvents.filter((e) => e.type === 'model-aborted')).toHaveLength(3)
@@ -563,7 +563,7 @@ describe('runMatrix - a resolved BatchResponse reporting only transport-class ba
       deps
     )
 
-    expect(summary).toEqual({ completed: 1, skipped: 0, failed: 0 })
+    expect(summary).toEqual({ completed: 1, skipped: 0, failed: 0, stoppedEarly: null })
     expect(events.some((e) => e.type === 'model-aborted')).toBe(false)
     expect(events.some((e) => e.type === 'cell-done' && e.itemId === 'item-1')).toBe(true)
 
@@ -575,6 +575,74 @@ describe('runMatrix - a resolved BatchResponse reporting only transport-class ba
 
   it('_internals.BACKEND_TRANSPORT_FAILURE_REASON matches the literal reason string OllamaBackend actually reports', () => {
     expect(_internals.BACKEND_TRANSPORT_FAILURE_REASON).toBe('error')
+  })
+})
+
+// --- an unload failure stops the matrix GRACEFULLY (never an unhandled rejection) ---
+
+describe('runMatrix - a failing unloadModel stops the whole matrix without rejecting', () => {
+  it('stops after the failing model, never starts the next one, resolves with a stoppedEarly reason, and still closes the connection exactly once', async () => {
+    const repoRoot = await makeTempDir('bench-harness-unloadfail-')
+    const store = new BenchStore(await makeTempDir('bench-harness-unloadfail-store-'))
+    const appDataDir = await makeTempDir('bench-harness-unloadfail-appdata-')
+
+    const file1 = await writeFakeItem(repoRoot, 'item-1', [seg({ id: 's1', text: 'Hello' })])
+    const corpus: Corpus = { items: [corpusItem({ id: 'item-1', file: file1 })] }
+
+    const events: HarnessEvent[] = []
+    const stop = vi.fn().mockResolvedValue(undefined)
+    // Exactly the real 404 shape: ollama has no such model (a mistyped or
+    // unpulled roster entry), which is also the state right after a
+    // BackendTransportFailure abort.
+    const unloadModel = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          'unloadModel: POST http://127.0.0.1:1/api/generate responded 404 Not Found for model "model-a"'
+        )
+      )
+    const deps: HarnessDeps = {
+      ensureOllama: vi.fn().mockResolvedValue(fakeConnection(stop)),
+      createBackend: vi.fn().mockReturnValue(fakeTranslatingBackend()),
+      unloadModel,
+      buildAdapters: vi.fn().mockReturnValue([new FakeAdapter()])
+    }
+
+    const summary = await runMatrix(
+      {
+        models: ['model-a', 'model-b'],
+        corpus,
+        store,
+        repoRoot,
+        appDataDir,
+        onEvent: (e) => events.push(e)
+      },
+      deps
+    )
+
+    // Resolves - the contract is that runBenchCli returns an exit code and
+    // never lets a rejection escape, which an unguarded await here broke.
+    expect(summary.completed).toBe(1)
+    expect(summary.stoppedEarly).not.toBeNull()
+    expect(summary.stoppedEarly).toContain('model-a')
+    expect(summary.stoppedEarly).toContain('overcommit')
+
+    // STOPPING is the right call (proceeding on an unconfirmed unload risks
+    // overcommitting VRAM) - model-b must never be attempted, and unload is
+    // never retried.
+    expect(unloadModel).toHaveBeenCalledTimes(1)
+    expect(events.some((e) => e.type === 'model-start' && e.model === 'model-b')).toBe(false)
+    expect(events.some((e) => e.type === 'model-done')).toBe(false)
+
+    const stopEvent = events.find((e) => e.type === 'matrix-stopped')
+    expect(stopEvent).toBeDefined()
+    expect(stopEvent!.model).toBe('model-a')
+
+    // The finally block still runs on the way out.
+    expect(stop).toHaveBeenCalledTimes(1)
+
+    // Everything completed before the stop stays checkpointed.
+    expect(store.loadCell('model-a', 'item-1')).not.toBeNull()
   })
 })
 
@@ -623,7 +691,7 @@ describe('runMatrix - summary counts add up to models x items (contract point 6)
       deps
     )
 
-    expect(summary).toEqual({ completed: 1, skipped: 1, failed: 1 })
+    expect(summary).toEqual({ completed: 1, skipped: 1, failed: 1, stoppedEarly: null })
     expect(summary.completed + summary.skipped + summary.failed).toBe(1 * corpus.items.length)
   })
 })
@@ -669,7 +737,7 @@ describe('runMatrix - adapter resolution mirrors cli.ts: buildAdapters -> adapte
       deps
     )
 
-    expect(summary).toEqual({ completed: 2, skipped: 0, failed: 0 })
+    expect(summary).toEqual({ completed: 2, skipped: 0, failed: 0, stoppedEarly: null })
     expect(pptxLikeAdapter.extract).toHaveBeenCalledTimes(1)
     expect(pptxLikeAdapter.extract).toHaveBeenCalledWith(
       path.resolve(repoRoot, 'docs/a.fake-pptx.json')

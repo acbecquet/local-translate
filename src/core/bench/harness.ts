@@ -67,6 +67,8 @@ export type HarnessEvent =
   | { type: 'model-start' | 'model-done'; model: string }
   | { type: 'cell-start' | 'cell-done' | 'cell-skipped'; model: string; itemId: string }
   | { type: 'cell-failed' | 'model-aborted'; model: string; itemId: string; error: string }
+  /** The whole matrix stopped after `model`: its unload could not be confirmed, so no further model may be loaded (see runMatrix). Terminal - no event follows it. */
+  | { type: 'matrix-stopped'; model: string; error: string }
 
 export interface HarnessOpts {
   models: string[]
@@ -81,6 +83,14 @@ export interface HarnessSummary {
   completed: number
   skipped: number
   failed: number
+  /**
+   * Null on a normal run. Otherwise the human-readable reason the matrix
+   * stopped before every model had its turn - today the one such reason is
+   * an unconfirmed unload (see runMatrix). Models after the named one never
+   * ran at all, so their absence from the store is not a failure to
+   * investigate, it is this. Callers surface it and exit non-zero.
+   */
+  stoppedEarly: string | null
 }
 
 function errorMessage(err: unknown): string {
@@ -261,7 +271,7 @@ async function runCell(
 }
 
 export async function runMatrix(opts: HarnessOpts, deps: HarnessDeps): Promise<HarnessSummary> {
-  const summary: HarnessSummary = { completed: 0, skipped: 0, failed: 0 }
+  const summary: HarnessSummary = { completed: 0, skipped: 0, failed: 0, stoppedEarly: null }
 
   // Once for the whole matrix, not once per model/cell - mirrors cli.ts's
   // single ensureOllama call, just amortized across every cell instead of
@@ -317,7 +327,32 @@ export async function runMatrix(opts: HarnessOpts, deps: HarnessDeps): Promise<H
 
       // Runs even for an aborted model - freeing VRAM is the whole point,
       // and matters MORE, not less, after a broken load.
-      await deps.unloadModel(connection.baseUrl, model)
+      //
+      // An unload that fails (unloadModel throws on any non-ok status - a
+      // roster entry ollama does not have answers 404, which is exactly the
+      // state after a BackendTransportFailure abort on a mistyped or
+      // unpulled model) means this model's VRAM was never confirmed freed.
+      // STOPPING is the right call: loading the next model on top of an
+      // unconfirmed one is precisely the overcommit the machine rules
+      // forbid. But it must stop GRACEFULLY - an unguarded await here threw
+      // straight out of runMatrix, out of the caller's own un-try/catch'd
+      // call, and out of runBenchCli entirely, breaking its documented
+      // "resolves to an exit code, never throws" contract and losing the
+      // partial summary of a multi-hour run along with it. So the stop is
+      // recorded, announced, and returned like any other outcome. Never
+      // retried: a crash-retry on a model operation is the VRAM-leak pattern
+      // this module exists to avoid.
+      try {
+        await deps.unloadModel(connection.baseUrl, model)
+      } catch (err) {
+        const message = errorMessage(err)
+        summary.stoppedEarly =
+          `could not confirm model "${model}" was unloaded, so the matrix stopped rather than ` +
+          `load another model on top of it and overcommit the GPU: ${message}`
+        opts.onEvent?.({ type: 'matrix-stopped', model, error: message })
+        break
+      }
+
       opts.onEvent?.({ type: 'model-done', model })
     }
   } finally {

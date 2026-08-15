@@ -315,6 +315,8 @@ export type HarnessEvent =
   | { type: 'model-start' | 'model-done'; model: string }
   | { type: 'cell-start' | 'cell-done' | 'cell-skipped'; model: string; itemId: string }
   | { type: 'cell-failed' | 'model-aborted'; model: string; itemId: string; error: string }
+  /** Terminal: the matrix stopped after `model` because its unload could not be confirmed. */
+  | { type: 'matrix-stopped'; model: string; error: string }
 export interface HarnessOpts {
   models: string[]
   corpus: Corpus
@@ -327,6 +329,8 @@ export interface HarnessSummary {
   completed: number
   skipped: number
   failed: number
+  /** Non-null when the matrix stopped before every model ran: the reason. Models after that one never ran. */
+  stoppedEarly: string | null
 }
 export async function runMatrix(opts: HarnessOpts, deps: HarnessDeps): Promise<HarnessSummary>
 export function realHarnessDeps(): HarnessDeps // production wiring incl. PP-OCR region engine
@@ -342,6 +346,9 @@ export function realHarnessDeps(): HarnessDeps // production wiring incl. PP-OCR
 5. `ensureOllama` is called once for the whole matrix, `connection.stop()` runs exactly once in a finally block even when a model aborts.
 6. Summary counts add up: completed + skipped + failed(+aborted, counted in failed) === models x items.
 7. Adapter resolution mirrors cli.ts (`buildAdapters` -> `adapterFor` by file extension); an image item resolves the image adapter, a pptx item the pptx adapter.
+8. A `unloadModel` that THROWS (it rejects on any non-ok status, and a roster entry ollama does not have answers 404) stops the whole matrix rather than loading the next model on top of an unconfirmed one, which would overcommit the GPU.
+   The stop is graceful, never a rejection out of `runMatrix`: a `matrix-stopped` event fires, `summary.stoppedEarly` carries the reason, `connection.stop()` still runs in the finally block, and every cell completed before the stop stays checkpointed.
+   Amended 2026-08-15 (final-review finding): the original unguarded `await deps.unloadModel(...)` propagated out of `runMatrix`, out of `runRun`, and out of `runBenchCli` entirely, which broke that function's "resolves to an exit code, never throws" contract and discarded the partial summary of a multi-hour run.
 
 - [x] Steps: failing tests (fake backend translating deterministically, FakeAdapter-based corpus items in a temp repo root) -> implement -> green -> scoped check -> commit `feat: resumable corpus x roster benchmark matrix runner`.
 
@@ -402,8 +409,12 @@ export interface ModelAggregate {
   model: string
   cells: number
   completedAll: boolean // every corpus item has a stored cell
-  judgedAll: boolean
+  judgedAll: boolean // completedAll, every cell judged, AND judged > 0
   completenessPct: number // segment-weighted across cells
+  judged: number // judge coverage numerator, summed across cells
+  ofSegments: number // judge coverage denominator (translated segments), summed across cells
+  unresolvedFailures: number // kept-original segments outside the expected passthrough set
+  deliveredPct: number // translated / (translated + unresolvedFailures) * 100, pooled
   overflowed: number
   minFittedSizePt: number | null
   ladderHits: number
@@ -418,9 +429,28 @@ export function aggregate(
 ): ModelAggregate[]
 /** Ranking: meanOverall desc (null sorts last), then completenessPct desc, then segmentsPerMin desc. */
 export function rankModels(aggregates: ModelAggregate[]): ModelAggregate[]
-/** The top-ranked model with completedAll && judgedAll, else null - the crown recommendation. */
-export function recommendChampion(ranked: ModelAggregate[]): string | null
+/** Content-preservation floor: no model below this deliveredPct may be crowned, whatever it scores. */
+export const MIN_CHAMPION_DELIVERED_PCT = 95
+export interface ChampionExclusion {
+  model: string
+  deliveredPct: number
+}
+export interface ChampionRecommendation {
+  model: string | null
+  /** Models ranked above `model` that met every other bar but failed the floor. */
+  excludedForCompleteness: ChampionExclusion[]
+}
+/** The top-ranked model with completedAll && judgedAll && deliveredPct >= the floor, else null. */
+export function recommendChampion(ranked: ModelAggregate[]): ChampionRecommendation
 ```
+
+`judged`/`ofSegments` are carried on the aggregate, not merely used as internal weights, so Task 6's justification for omitting unresolvable segments ("the quality metric's `judged` vs `ofSegments` makes the shortfall visible") is actually delivered by a field the report can render.
+Amended 2026-08-15 (final-review finding): before this, both numbers stopped at the per-cell QualityMetric, so a model judged on 5 of 400 segments rendered identically to one judged on 400 of 400, and `judgedAll` was a presence check that a store full of empty judgements could satisfy.
+
+`deliveredPct` and `MIN_CHAMPION_DELIVERED_PCT` exist because ranking on quality alone contradicts the master plan's absolute content-preservation constraint: a model that translates 40% of the eligible content beautifully outranks one that translates 99% of it well, and the winner becomes the app's shipped default.
+The floor deliberately gates on `deliveredPct` (translated over the content the model was ASKED to translate) rather than `completenessPct` (translated over EVERY extracted segment), because the latter is dominated by corpus-driven legitimate passthrough that no model controls: measured on this phase's own corpus, only 426 of 1164 pptx segments (36.6%) are even eligible, since the real deck is mixed-language and each direction language-gates most of it.
+Any absolute floor on `completenessPct` would therefore be either vacuous or unreachable for every model alike.
+A floor-excluded model is reported in `excludedForCompleteness`, never silently skipped, and both the report banner and the `crown` output name it with its number and the reason.
 
 **Behavior contract (each point a test on hand-built RunReports):**
 
@@ -430,6 +460,8 @@ export function recommendChampion(ranked: ModelAggregate[]): string | null
 4. `tierFor` boundary cases: 4.5 -> A, 3.5 -> B, 2.5 -> C, 2.49 -> D.
 5. `aggregate` weights completeness by segment counts (not per-cell mean of pcts), fills `tiersByPair` per corpus pair, and sets `completedAll` false when any corpus item lacks a cell.
 6. `rankModels` orders by the documented tri-key and `recommendChampion` skips a higher-scored model that is missing cells or judgements.
+7. `aggregate` sums `judged`/`ofSegments`/`unresolvedFailures` across cells and pools `deliveredPct` (never a mean of per-cell rates); `judgedAll` is false when every cell carries a judgement but not one segment was actually scored.
+8. `recommendChampion` refuses a top-ranked model below `MIN_CHAMPION_DELIVERED_PCT`, crowns the next qualifying model, and returns the refused one in `excludedForCompleteness`; a model exactly ON the floor is crownable.
 
 - [x] Steps: failing tests -> implement (pure functions only, no I/O) -> green -> scoped check -> commit `feat: benchmark metric families, per-pair tiers, and champion ranking`.
 
@@ -513,6 +545,8 @@ export interface BenchReport {
   promptVersion: string
   ranking: ModelAggregate[] // rankModels output
   recommended: string | null
+  /** Models passed over by the completeness floor (metrics.ts), named in the banner. */
+  excludedForCompleteness: ChampionExclusion[]
   corpusItems: { id: string; pair: string; kind: string; segments: number }[]
   /** Per item: rows of segment-level A/B - source + each model's translation with its overall judge score. */
   abByItem: Record<
@@ -531,11 +565,13 @@ export function renderResultsDoc(report: BenchReport): string // markdown, one s
 
 **HTML content (single template-literal document, no framework):**
 
-1. Header: generated timestamp, judge model, prompt version, recommendation banner.
-2. Ranking table: model, quality meanOverall, completeness pct, overflow count, min fitted pt, ladder hits, seg/min, tok/s - one row per model, ranked.
+1. Header: generated timestamp, judge model, prompt version, recommendation banner, plus a second banner naming any model the completeness floor passed over (with its deliveredPct and the floor) whenever `excludedForCompleteness` is non-empty.
+2. Ranking table: model, quality meanOverall, judge coverage (`judged / ofSegments`), completeness pct, delivered pct, overflow count, min fitted pt, ladder hits, seg/min, tok/s - one row per model, ranked.
+   Amended 2026-08-15 (final-review finding): the coverage and delivered columns were missing, so a model judged on 5 of 400 segments, or one that preserved far less content, rendered indistinguishably from a fully-judged, fully-delivering one.
+   `renderResultsDoc` carries the same two columns and the same passed-over sentence, and escapes literal `|` in every interpolated table cell so a model name can never break a table in a doc headed for docs/research/.
 3. Per-pair tier table (knowledge-base item 9): rows = models, columns = corpus pairs, cell = tier letter (A-D) color-coded, `-` when unjudged.
 4. A/B section per corpus item: a table of source | one column per model showing the translation and its overall score; keptOriginal shows `(kept original)`.
-5. Image items additionally show the original and each model's translated artifact inline as data URIs (read via the store's artifact paths; an artifact over 2 MB falls back to its store-relative path as text instead of embedding).
+5. Image items additionally show the original and each model's translated artifact inline as data URIs (read via the store's artifact paths; an artifact over 2 MB falls back to its store-relative path as text instead of embedding, and the ORIGINAL falls back to its basename only, never the absolute local path it was generated from - this page is committed under EVIDENCE/phase-4/ and shared).
 6. Every interpolated string passes through one `escapeHtml` helper - model outputs are untrusted text.
 
 **Behavior contract (each point a test on a store seeded with hand-built cells/judgements in a temp dir):**
@@ -619,10 +655,17 @@ export async function runBenchCli(argv: string[], deps?: BenchCliDeps): Promise<
 Subcommands (all take `--roster`, `--corpus`, `--store` with the fixture-path defaults):
 
 - `run`: load roster + corpus, `runMatrix`, print the summary; exit 0 when failed === 0, else 1.
+  When `summary.stoppedEarly` is set (an unconfirmed unload, see Task 4), the partial summary still prints FIRST, the stop reason and the resume instruction follow on stderr, and the exit code is 1.
 - `judge`: for every stored cell lacking a current judgement (absent, stale hash, or old prompt version), build `JudgeInput`s from `report.segments` (translated ones only), `judgeSegments`, save; one ensureOllama connection for the whole pass; exit 0 when every judged cell saved.
+  A cell with translated segments that comes back with ZERO scores is a cell FAILURE, not a result: nothing is saved for it and the pass aborts exactly as it does on a transport failure, since a `scores: []` judgement carrying a matching hash and prompt version would read as current forever and permanently lock in the gap.
+  A cell with nothing translated stays savable, because an empty judgement is the honest record there.
+  The zero-score message names the likely cause (the judge model may not support structured output with thinking disabled, which `createOllamaJudgeTransport` always requests and, unlike OllamaBackend, does not probe for), so an unattended run is not left guessing.
 - `judge --stability`: score the first stored cell 3 times fresh (no saving), print each pass's meanOverall and the max-min spread; PASS at spread <= 0.25, exit 1 on FAIL - the master plan's judge-prompt stability test.
-- `report`: buildReport -> write `<store>/report.json` + `<store>/report.html` + print the ranking table to stdout.
+- `report`: buildReport -> write `<store>/report.json` + `<store>/report.html` + `<store>/results.md` (from `renderResultsDoc`) + print all three resolved paths and the ranking table to stdout.
+  Amended 2026-08-15 (final-review finding): the original spec named only the first two, which left `renderResultsDoc` with no production caller at all even though Task 10's gate requires a results doc produced from it; copying `results.md` into `docs/research/<date>-phase-4-benchmark-results.md` is now the only manual step.
 - `crown [model]`: with no arg, `recommendChampion` (refuse with exit 1 and a reason when null); with an arg, that model (must exist in the ranking); `writeChampion` into `config/champion.json`, print old -> new.
+  Whenever the recommendation passed a higher-ranked model over on the completeness floor, `crown` names that model, its deliveredPct, and the floor on stderr before crowning or refusing, so a floor exclusion is never invisible.
+  An explicit crown stays a human override and still succeeds, but its "deliberate override" note now also fires (and reports deliveredPct) when the named model is under the floor.
 - `status`: cells completed/missing per model x item grid, judgements current/stale counts.
 
 **Behavior contract (each point a test with injected fakes, temp store dirs):**

@@ -11,6 +11,7 @@ import {
   aggregate,
   cellMetrics,
   judgementQuality,
+  MIN_CHAMPION_DELIVERED_PCT,
   pairKey,
   rankModels,
   recommendChampion,
@@ -105,6 +106,10 @@ function makeAggregate(overrides: Partial<ModelAggregate> & { model: string }): 
     completedAll: true,
     judgedAll: true,
     completenessPct: 100,
+    judged: 1,
+    ofSegments: 1,
+    unresolvedFailures: 0,
+    deliveredPct: 100,
     overflowed: 0,
     minFittedSizePt: null,
     ladderHits: 0,
@@ -564,6 +569,151 @@ describe('aggregate - completedAll / judgedAll (contract point 5)', () => {
   })
 })
 
+// --- aggregate: judge coverage reaches the aggregate -----------------------
+
+describe('aggregate - judge coverage (judged / ofSegments) is carried, not just used as a weight', () => {
+  it('sums judged and ofSegments across a model cells', () => {
+    const corpus: Corpus = {
+      items: [makeCorpusItem({ id: 'item-a' }), makeCorpusItem({ id: 'item-b' })]
+    }
+    // 10 translated segments, 4 of them scored.
+    const cellA = makeCell({
+      config: makeConfig({ model: 'model-a', itemId: 'item-a' }),
+      report: makeReport({ total: 10, translated: 10 })
+    })
+    // 6 translated segments, 1 of them scored.
+    const cellB = makeCell({
+      config: makeConfig({ model: 'model-a', itemId: 'item-b' }),
+      report: makeReport({ total: 6, translated: 6 })
+    })
+
+    const [result] = aggregate(
+      [
+        {
+          cell: cellA,
+          judgement: makeJudgement({
+            scores: [1, 2, 3, 4].map((n) => ({
+              segmentId: `s${n}`,
+              accuracy: 4,
+              fluency: 4,
+              format: 4
+            }))
+          })
+        },
+        {
+          cell: cellB,
+          judgement: makeJudgement({
+            scores: [{ segmentId: 's1', accuracy: 4, fluency: 4, format: 4 }]
+          })
+        }
+      ],
+      corpus
+    )
+
+    expect(result.judged).toBe(5)
+    expect(result.ofSegments).toBe(16)
+  })
+
+  it('judgedAll is FALSE when every cell has a judgement but not one segment was actually scored (a presence check with no coverage is no quality evidence)', () => {
+    const corpus: Corpus = { items: [makeCorpusItem({ id: 'item-a' })] }
+    const cell = makeCell({
+      config: makeConfig({ model: 'model-a', itemId: 'item-a' }),
+      report: makeReport({ total: 4, translated: 4 })
+    })
+
+    const [result] = aggregate([{ cell, judgement: makeJudgement({ scores: [] }) }], corpus)
+
+    expect(result.completedAll).toBe(true)
+    expect(result.judged).toBe(0)
+    expect(result.judgedAll).toBe(false)
+  })
+})
+
+// --- aggregate: delivered content (the champion completeness floor input) ---
+
+describe('aggregate - deliveredPct: of the content the model was ASKED to translate, what it delivered', () => {
+  it('sums unresolvedFailures and divides translated by (translated + unresolvedFailures), ignoring legitimate passthrough', () => {
+    const corpus: Corpus = { items: [makeCorpusItem({ id: 'item-a' })] }
+    // 10 segments: 6 translated, 2 legitimate passthrough (untranslatable /
+    // not-source-language - NOT the model's fault, and the dominant kept
+    // reason on a real mixed-language deck), 2 the model was asked to
+    // translate and simply did not deliver.
+    const cell = makeCell({
+      config: makeConfig({ model: 'model-a', itemId: 'item-a' }),
+      report: makeReport({
+        total: 10,
+        translated: 6,
+        keptOriginal: [
+          { id: 's7', reason: UNTRANSLATABLE_REASON },
+          { id: 's8', reason: NOT_SOURCE_LANGUAGE_REASON },
+          { id: 's9', reason: 'empty' },
+          { id: 's10', reason: 'error' }
+        ]
+      })
+    })
+
+    const [result] = aggregate([{ cell, judgement: null }], corpus)
+
+    expect(result.unresolvedFailures).toBe(2)
+    // Raw completeness is 60% here, dragged down by legitimate passthrough;
+    // delivered content is 6 / (6 + 2) = 75%.
+    expect(result.completenessPct).toBeCloseTo(60, 5)
+    expect(result.deliveredPct).toBeCloseTo(75, 5)
+  })
+
+  it('is 100 when nothing was eligible to translate at all (never NaN)', () => {
+    const corpus: Corpus = { items: [makeCorpusItem({ id: 'item-a' })] }
+    const cell = makeCell({
+      config: makeConfig({ model: 'model-a', itemId: 'item-a' }),
+      report: makeReport({
+        total: 2,
+        translated: 0,
+        segments: [],
+        keptOriginal: [
+          { id: 's1', reason: UNTRANSLATABLE_REASON },
+          { id: 's2', reason: NOT_SOURCE_LANGUAGE_REASON }
+        ]
+      })
+    })
+
+    const [result] = aggregate([{ cell, judgement: null }], corpus)
+
+    expect(result.deliveredPct).toBe(100)
+    expect(Number.isNaN(result.deliveredPct)).toBe(false)
+  })
+
+  it('pools across cells rather than averaging per-cell percentages', () => {
+    const corpus: Corpus = {
+      items: [makeCorpusItem({ id: 'item-a' }), makeCorpusItem({ id: 'item-b' })]
+    }
+    // Cell A: 90 delivered of 90 eligible. Cell B: 1 delivered of 11 eligible.
+    const cellA = makeCell({
+      config: makeConfig({ model: 'model-a', itemId: 'item-a' }),
+      report: makeReport({ total: 90, translated: 90, keptOriginal: [] })
+    })
+    const cellB = makeCell({
+      config: makeConfig({ model: 'model-a', itemId: 'item-b' }),
+      report: makeReport({
+        total: 11,
+        translated: 1,
+        keptOriginal: Array.from({ length: 10 }, (_, i) => ({ id: `f${i}`, reason: 'empty' }))
+      })
+    })
+
+    const [result] = aggregate(
+      [
+        { cell: cellA, judgement: null },
+        { cell: cellB, judgement: null }
+      ],
+      corpus
+    )
+
+    // Pooled: 91 / 101 = 90.09%. A mean of per-cell rates would be
+    // (100 + 9.09) / 2 = 54.5% - a different, wrong number.
+    expect(result.deliveredPct).toBeCloseTo(90.099, 2)
+  })
+})
+
 // --- aggregate: tiersByPair (contract point 5) ----------------------------
 
 describe('aggregate - tiersByPair (contract point 5)', () => {
@@ -757,7 +907,7 @@ describe('recommendChampion (contract point 6)', () => {
 
     const ranked = rankModels([topButIncomplete, runnerUp])
 
-    expect(recommendChampion(ranked)).toBe('runner-up')
+    expect(recommendChampion(ranked).model).toBe('runner-up')
   })
 
   it('skips a higher-scored model missing judgedAll even when completedAll is true', () => {
@@ -776,20 +926,103 @@ describe('recommendChampion (contract point 6)', () => {
 
     const ranked = rankModels([topButUnjudged, runnerUp])
 
-    expect(recommendChampion(ranked)).toBe('runner-up')
+    expect(recommendChampion(ranked).model).toBe('runner-up')
   })
 
   it('returns null when nothing qualifies', () => {
     const onlyIncomplete = makeAggregate({ model: 'only', judgedAll: false })
 
-    expect(recommendChampion(rankModels([onlyIncomplete]))).toBeNull()
+    expect(recommendChampion(rankModels([onlyIncomplete])).model).toBeNull()
   })
 
   it('returns the top-ranked model when it fully qualifies', () => {
     const winner = makeAggregate({ model: 'winner', meanOverall: 5 })
     const loser = makeAggregate({ model: 'loser', meanOverall: 2 })
 
-    expect(recommendChampion(rankModels([winner, loser]))).toBe('winner')
+    expect(recommendChampion(rankModels([winner, loser])).model).toBe('winner')
+  })
+
+  it('reports no exclusions when the floor never bites', () => {
+    const ranked = rankModels([makeAggregate({ model: 'winner', meanOverall: 5 })])
+
+    expect(recommendChampion(ranked).excludedForCompleteness).toEqual([])
+  })
+})
+
+// --- recommendChampion: the content-preservation floor ---------------------
+
+describe('recommendChampion - MIN_CHAMPION_DELIVERED_PCT floor (content preservation is absolute)', () => {
+  it('refuses to crown a higher-scored model that delivered less content, and crowns the runner-up instead', () => {
+    // The exact trap: 4.6 quality on the minority it bothered to translate,
+    // beating a 4.4 model that translated essentially everything.
+    const lossy = makeAggregate({
+      model: 'lossy',
+      meanOverall: 4.6,
+      deliveredPct: 40,
+      completedAll: true,
+      judgedAll: true
+    })
+    const faithful = makeAggregate({
+      model: 'faithful',
+      meanOverall: 4.4,
+      deliveredPct: 99,
+      completedAll: true,
+      judgedAll: true
+    })
+
+    const result = recommendChampion(rankModels([lossy, faithful]))
+
+    expect(result.model).toBe('faithful')
+    expect(result.excludedForCompleteness).toEqual([{ model: 'lossy', deliveredPct: 40 }])
+  })
+
+  it('returns a null model but still names the excluded model when the floor disqualifies everyone', () => {
+    const lossy = makeAggregate({
+      model: 'lossy',
+      meanOverall: 4.9,
+      deliveredPct: 12.5,
+      completedAll: true,
+      judgedAll: true
+    })
+
+    const result = recommendChampion(rankModels([lossy]))
+
+    expect(result.model).toBeNull()
+    expect(result.excludedForCompleteness).toEqual([{ model: 'lossy', deliveredPct: 12.5 }])
+  })
+
+  it('crowns a model sitting exactly ON the floor (the bar is >=, never a hair under)', () => {
+    const onTheLine = makeAggregate({
+      model: 'on-the-line',
+      meanOverall: 4.0,
+      deliveredPct: MIN_CHAMPION_DELIVERED_PCT
+    })
+
+    const result = recommendChampion(rankModels([onTheLine]))
+
+    expect(result.model).toBe('on-the-line')
+    expect(result.excludedForCompleteness).toEqual([])
+  })
+
+  it('never lists a model excluded for some OTHER reason as a completeness exclusion', () => {
+    const unjudged = makeAggregate({
+      model: 'unjudged',
+      meanOverall: 4.9,
+      judgedAll: false,
+      deliveredPct: 100
+    })
+    const winner = makeAggregate({ model: 'winner', meanOverall: 4.0, deliveredPct: 100 })
+
+    const result = recommendChampion(rankModels([unjudged, winner]))
+
+    expect(result.model).toBe('winner')
+    expect(result.excludedForCompleteness).toEqual([])
+  })
+
+  it('the floor is a documented constant in the 0..100 range, not a buried magic number', () => {
+    expect(typeof MIN_CHAMPION_DELIVERED_PCT).toBe('number')
+    expect(MIN_CHAMPION_DELIVERED_PCT).toBeGreaterThan(0)
+    expect(MIN_CHAMPION_DELIVERED_PCT).toBeLessThanOrEqual(100)
   })
 })
 

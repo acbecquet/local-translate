@@ -34,9 +34,11 @@ import type { Corpus } from './corpus'
 import { JUDGE_PROMPT_VERSION } from './judge'
 import {
   aggregate,
+  MIN_CHAMPION_DELIVERED_PCT,
   pairKey,
   rankModels,
   recommendChampion,
+  type ChampionExclusion,
   type ModelAggregate,
   type Tier
 } from './metrics'
@@ -48,6 +50,8 @@ export interface BenchReport {
   promptVersion: string
   ranking: ModelAggregate[] // rankModels output
   recommended: string | null
+  /** Models that outranked `recommended` on quality but were passed over for delivering too little content (metrics.ts's MIN_CHAMPION_DELIVERED_PCT). Empty when the floor never bit. Carried so the banner can name them: being passed over on the project's top-line content-preservation constraint must never be a silent skip. */
+  excludedForCompleteness: ChampionExclusion[]
   corpusItems: { id: string; pair: string; kind: string; segments: number }[]
   /** Per item: rows of segment-level A/B - source + each model's translation with its overall judge score. */
   abByItem: Record<
@@ -145,7 +149,7 @@ export function buildReport(store: BenchStore, corpus: Corpus, judgeModel: strin
   })
 
   const ranking = rankModels(aggregate(cellsWithJudgement, corpus))
-  const recommended = recommendChampion(ranking)
+  const recommendation = recommendChampion(ranking)
   const anyCurrentJudgement = cellsWithJudgement.some((c) => c.judgement !== null)
 
   const firstCellByItemId = new Map(cells.map((c) => [c.config.itemId, c]))
@@ -161,7 +165,8 @@ export function buildReport(store: BenchStore, corpus: Corpus, judgeModel: strin
     judgeModel: anyCurrentJudgement ? judgeModel : null,
     promptVersion: JUDGE_PROMPT_VERSION,
     ranking,
-    recommended,
+    recommended: recommendation.model,
+    excludedForCompleteness: recommendation.excludedForCompleteness,
     corpusItems,
     abByItem: buildAbByItem(corpus, cellsWithJudgement)
   }
@@ -253,10 +258,42 @@ dl.meta { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1r
 dl.meta dt { font-weight: 600; }
 `
 
+/**
+ * The sentences naming every model the completeness floor passed over, or an
+ * empty array when the floor never bit. Shared wording between the HTML
+ * banner and the results doc so the two artifacts can never disagree about
+ * why a higher-scoring model was not crowned - a silent skip on the
+ * project's top-line content-preservation constraint is exactly what this
+ * exists to prevent.
+ *
+ * Returned as one string PER SENTENCE rather than one joined paragraph
+ * because the markdown caller writes each on its own physical line (this
+ * repo's docs convention, which renderResultsDoc's own doc comment states);
+ * the HTML caller joins them back into one banner.
+ */
+function completenessExclusionSentences(exclusions: ChampionExclusion[]): string[] {
+  if (exclusions.length === 0) return []
+  const named = exclusions
+    .map((e) => `${e.model} (delivered ${e.deliveredPct.toFixed(1)}%)`)
+    .join(', ')
+  const subject = exclusions.length === 1 ? 'model was' : 'models were'
+  return [
+    `Higher-ranked ${subject} passed over for insufficient completeness: ${named}.`,
+    `A champion must deliver at least ${MIN_CHAMPION_DELIVERED_PCT}% of the content it was asked ` +
+      'to translate, however well it scores on what it did translate.'
+  ]
+}
+
 function renderHeader(report: BenchReport): string {
   const bannerText = report.recommended
     ? `Recommended champion: ${escapeHtml(report.recommended)}`
     : 'No champion recommended yet - a model needs every corpus item completed and judged.'
+
+  const exclusionSentences = completenessExclusionSentences(report.excludedForCompleteness)
+  const exclusionBanner =
+    exclusionSentences.length === 0
+      ? ''
+      : `\n  <div class="banner banner-pending">${escapeHtml(exclusionSentences.join(' '))}</div>`
 
   return `
 <header>
@@ -266,7 +303,7 @@ function renderHeader(report: BenchReport): string {
     <dt>Judge model</dt><dd>${escapeHtml(report.judgeModel ?? 'not judged yet')}</dd>
     <dt>Prompt version</dt><dd>${escapeHtml(report.promptVersion)}</dd>
   </dl>
-  <div class="banner ${report.recommended ? 'banner-ok' : 'banner-pending'}">${bannerText}</div>
+  <div class="banner ${report.recommended ? 'banner-ok' : 'banner-pending'}">${bannerText}</div>${exclusionBanner}
 </header>`
 }
 
@@ -277,7 +314,9 @@ function renderRankingTable(ranking: ModelAggregate[]): string {
       <tr>
         <td>${escapeHtml(m.model)}</td>
         <td>${formatNullableNumber(m.meanOverall, 2)}</td>
+        <td>${m.judged} / ${m.ofSegments}</td>
         <td>${formatNumber(m.completenessPct, 1)}%</td>
+        <td>${formatNumber(m.deliveredPct, 1)}%</td>
         <td>${m.overflowed}</td>
         <td>${formatNullableNumber(m.minFittedSizePt, 1)}</td>
         <td>${m.ladderHits}</td>
@@ -291,7 +330,8 @@ function renderRankingTable(ranking: ModelAggregate[]): string {
 <table class="ranking">
   <thead>
     <tr>
-      <th>Model</th><th>Quality (mean overall)</th><th>Completeness</th><th>Overflow</th>
+      <th>Model</th><th>Quality (mean overall)</th><th>Judged (of translated)</th>
+      <th>Completeness</th><th>Delivered</th><th>Overflow</th>
       <th>Min fitted pt</th><th>Ladder hits</th><th>Seg/min</th><th>Tok/s</th>
     </tr>
   </thead>
@@ -330,8 +370,17 @@ function renderImageArtifacts(
   cellByKey: Map<string, StoredCell>
 ): string {
   const anyCell = models.map((m) => cellByKey.get(`${m}::${itemId}`)).find((c) => c !== undefined)
+  // basename, never the full report.file path: unlike the per-model
+  // artifacts below (whose labels are store-RELATIVE and therefore portable),
+  // report.file is an absolute path on whichever machine ran the benchmark,
+  // and this page is destined for EVIDENCE/phase-4/, which is committed and
+  // shared. The filename is all a reader needs to identify the original.
   const originalHtml = anyCell
-    ? renderArtifactImage(anyCell.report.file, anyCell.report.file, `${itemId} original`)
+    ? renderArtifactImage(
+        anyCell.report.file,
+        path.basename(anyCell.report.file),
+        `${itemId} original`
+      )
     : '<p class="artifact-missing">(no runs recorded, nothing to show)</p>'
 
   const perModelHtml = models
@@ -432,6 +481,20 @@ ${renderHeader(report)}
 // --- renderResultsDoc ----------------------------------------------------
 
 /**
+ * Escapes the one character that can structurally break a markdown table
+ * cell: a literal `|`, which would otherwise read as a column separator and
+ * silently split one cell into two for the rest of that row. Model names are
+ * arbitrary ollama tags read from roster.json, and corpus ids and language
+ * pair labels are equally free-form, so every interpolated cell value goes
+ * through this - the table-cell counterpart to renderHtml's escapeHtml choke
+ * point, applied for the same reason (this doc is committed under
+ * docs/research/).
+ */
+function escapeCell(value: string): string {
+  return value.replace(/\|/g, '\\|')
+}
+
+/**
  * Markdown for docs/research/: one full sentence per physical line (this
  * repo's markdown convention) outside of headings and table rows, which are
  * structural, not prose.
@@ -452,18 +515,20 @@ export function renderResultsDoc(report: BenchReport): string {
       ? `The recommended champion is ${report.recommended}.`
       : 'No model qualifies as champion yet - every corpus item must be completed and judged.'
   )
+  lines.push(...completenessExclusionSentences(report.excludedForCompleteness))
   lines.push('')
 
   lines.push('## Ranking')
   lines.push('')
   lines.push(
-    '| Rank | Model | Quality | Completeness | Overflow | Min fitted pt | Ladder hits | Seg/min | Tok/s |'
+    '| Rank | Model | Quality | Judged | Completeness | Delivered | Overflow | Min fitted pt | Ladder hits | Seg/min | Tok/s |'
   )
-  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- |')
+  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |')
   report.ranking.forEach((m, i) => {
     lines.push(
-      `| ${i + 1} | ${m.model} | ${formatNullableNumber(m.meanOverall, 2)} | ` +
-        `${formatNumber(m.completenessPct, 1)}% | ${m.overflowed} | ` +
+      `| ${i + 1} | ${escapeCell(m.model)} | ${formatNullableNumber(m.meanOverall, 2)} | ` +
+        `${m.judged} / ${m.ofSegments} | ${formatNumber(m.completenessPct, 1)}% | ` +
+        `${formatNumber(m.deliveredPct, 1)}% | ${m.overflowed} | ` +
         `${formatNullableNumber(m.minFittedSizePt, 1)} | ${m.ladderHits} | ` +
         `${formatNumber(m.segmentsPerMin, 2)} | ${formatNumber(m.tokensPerSec, 2)} |`
     )
@@ -473,11 +538,11 @@ export function renderResultsDoc(report: BenchReport): string {
   lines.push('## Per-pair quality tiers')
   lines.push('')
   const pairs = [...new Set(report.corpusItems.map((i) => i.pair))]
-  lines.push(`| Model | ${pairs.join(' | ')} |`)
+  lines.push(`| Model | ${pairs.map(escapeCell).join(' | ')} |`)
   lines.push(`| --- | ${pairs.map(() => '---').join(' | ')} |`)
   for (const m of report.ranking) {
     const cells = pairs.map((pair) => m.tiersByPair[pair] ?? '-')
-    lines.push(`| ${m.model} | ${cells.join(' | ')} |`)
+    lines.push(`| ${escapeCell(m.model)} | ${cells.join(' | ')} |`)
   }
   lines.push('')
 
