@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import os, { tmpdir } from 'node:os'
 import path from 'node:path'
+import { _internals as championInternals } from '../../src/core/champion'
 import { _internals, runCli, type CliDeps } from '../../src/core/cli'
 import type { TextSegment } from '../../src/core/segments'
 import type { BatchRequest, TranslationBackend } from '../../src/core/translate/backend'
@@ -26,6 +27,10 @@ const tmpDirs: string[] = []
 afterEach(() => {
   for (const dir of tmpDirs) rmSync(dir, { recursive: true, force: true })
   tmpDirs.length = 0
+  // Defensive reset even on tests that never set it - see champion.ts's
+  // _internals for why the override exists (avoiding cross-test-file races
+  // on the repo's real committed config/champion.json).
+  championInternals.setConfigDirForTesting(null)
   vi.restoreAllMocks()
 })
 
@@ -102,6 +107,39 @@ describe('_internals.parseArgs', () => {
     const result = parseArgs(['doc.fake.json', 'English', 'French', '--bogus'])
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.error).toContain('--bogus')
+  })
+})
+
+describe('_internals.parseArgs: default model resolution (champion.json wiring, contract point 4)', () => {
+  /** Fabricates a champion.json under a fresh temp config dir and points champion.ts's readChampion()/resolveDefaultModel() at it via the test-only override - never touches the repo's real committed config/champion.json. */
+  function fabricateChampion(model: string): void {
+    const dir = mkdtempSync(path.join(tmpdir(), 'lt-cli-champion-'))
+    tmpDirs.push(dir)
+    const configDir = path.join(dir, 'config')
+    mkdirSync(configDir, { recursive: true })
+    writeFileSync(
+      path.join(configDir, 'champion.json'),
+      JSON.stringify({ model, crownedAt: '2026-08-15T00:00:00.000Z' })
+    )
+    championInternals.setConfigDirForTesting(configDir)
+  }
+
+  it('applies resolveDefaultModel() - a fabricated champion file changes the default', () => {
+    fabricateChampion('qwen3.5:4b')
+
+    const result = parseArgs(['doc.fake.json', 'English', 'French'])
+
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.args.model).toBe('qwen3.5:4b')
+  })
+
+  it('an explicit --model still overrides a fabricated champion default', () => {
+    fabricateChampion('qwen3.5:4b')
+
+    const result = parseArgs(['doc.fake.json', 'English', 'French', '--model', 'llama3.1'])
+
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.args.model).toBe('llama3.1')
   })
 })
 

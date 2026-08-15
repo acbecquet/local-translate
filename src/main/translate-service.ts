@@ -16,6 +16,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { adapterFor, type FormatAdapter } from '../core/adapters/adapter'
 import { buildAdapters } from '../core/adapters/registry'
+import { resolveDefaultModel } from '../core/champion'
 import { DEFAULT_MODEL } from '../core/defaults'
 import { createPPOcrEngine } from '../core/images/engines/ppocr'
 import { withCellSplit } from '../core/images/cellsplit'
@@ -38,6 +39,10 @@ import type {
 // and other main-process callers import DEFAULT_MODEL from this module, not
 // from src/core/defaults directly - see defaults.ts for the single source of
 // truth this and src/core/cli.ts both now import instead of duplicating.
+// Note: the LIVE default used below (defaultDeps()'s `model` field) is
+// champion.ts's resolveDefaultModel(), not this constant directly - see
+// defaults.ts's own doc comment. DEFAULT_MODEL stays exported here as the
+// ultimate fallback tests and callers can still reference by name.
 export { DEFAULT_MODEL }
 
 /**
@@ -91,7 +96,7 @@ function defaultDeps(): TranslateServiceDeps {
     createBackend: (opts) => new OllamaBackend(opts),
     runPipeline: realRunPipeline,
     appDataDir: resolveAppDataDir(),
-    model: DEFAULT_MODEL,
+    model: resolveDefaultModel(),
     onProgress: () => {},
     onState: () => {}
   }

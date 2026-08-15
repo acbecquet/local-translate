@@ -26,6 +26,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { adapterFor } from './adapters/adapter'
 import { buildAdapters } from './adapters/registry'
+import { resolveDefaultModel } from './champion'
 import { DEFAULT_MODEL } from './defaults'
 import { createPPOcrEngine } from './images/engines/ppocr'
 import { withCellSplit } from './images/cellsplit'
@@ -76,7 +77,9 @@ const USAGE =
 
 function parseArgs(argv: string[]): ParseResult {
   const positional: string[] = []
-  let model = DEFAULT_MODEL
+  // The champion crowned by the phase-4 benchmark harness (config/champion.json)
+  // when present and well-formed, else DEFAULT_MODEL - see champion.ts.
+  let model = resolveDefaultModel()
   let out: string | undefined
 
   for (let i = 0; i < argv.length; i++) {

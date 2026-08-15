@@ -11,9 +11,16 @@ files:
 # first, which is where extraResources land (a sibling of app.asar, not a
 # child of it), falling back to the dev/CLI findAppRoot()-based path when
 # packaged resources aren't present (see that function's own doc comment).
+# config/champion.json (src/core/champion.ts's resolveDefaultModel): shipped
+# the same way and for the same reason - the packaged app must be able to
+# read the crowned champion model without it being sealed inside app.asar.
+# champion.ts's resolveConfigDir() mirrors resolveFontsDir()'s exact
+# resourcesPath-first, then findAppRoot()-fallback precedence.
 extraResources:
   - from: fonts
     to: fonts
+  - from: config
+    to: config
 win:
   target: nsis
 nsis:
