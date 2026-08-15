@@ -1,0 +1,56 @@
+{
+  "items": [
+    {
+      "id": "real-deck-en-zh",
+      "file": "fixtures/real/CCELL 3.0 AIO Lab Test Updates Mandarin.pptx",
+      "sourceLang": "English",
+      "targetLang": "Chinese (Simplified)",
+      "kind": "pptx"
+    },
+    {
+      "id": "real-deck-zh-en",
+      "file": "fixtures/real/CCELL 3.0 AIO Lab Test Updates Mandarin.pptx",
+      "sourceLang": "Chinese (Simplified)",
+      "targetLang": "English",
+      "kind": "pptx"
+    },
+    {
+      "id": "german-compounds-en-de",
+      "file": "fixtures/bench/decks/german-compounds.pptx",
+      "sourceLang": "English",
+      "targetLang": "German",
+      "kind": "pptx",
+      "regenerate": "npm run make-bench-decks"
+    },
+    {
+      "id": "cjk-table-en-zh",
+      "file": "fixtures/bench/decks/cjk-table.pptx",
+      "sourceLang": "English",
+      "targetLang": "Chinese (Simplified)",
+      "kind": "pptx",
+      "regenerate": "npm run make-bench-decks"
+    },
+    {
+      "id": "tiny-boxes-en-zh",
+      "file": "fixtures/bench/decks/tiny-boxes.pptx",
+      "sourceLang": "English",
+      "targetLang": "Chinese (Simplified)",
+      "kind": "pptx",
+      "regenerate": "npm run make-bench-decks"
+    },
+    {
+      "id": "chart-image-en-zh",
+      "file": "fixtures/image-regions/real/real-chart-en.png",
+      "sourceLang": "English",
+      "targetLang": "Chinese (Simplified)",
+      "kind": "image"
+    },
+    {
+      "id": "photo-image-en-zh",
+      "file": "fixtures/image-regions/real/real-photo-1.jpg",
+      "sourceLang": "English",
+      "targetLang": "Chinese (Simplified)",
+      "kind": "image"
+    }
+  ]
+}

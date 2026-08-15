@@ -19,6 +19,7 @@
     "dist": "electron-vite build && electron-builder --win nsis",
     "translate": "tsx src/core/cli.ts",
     "make-gate-decks": "tsx scripts/make-gate-decks.mjs",
+    "make-bench-decks": "tsx scripts/make-bench-decks.mjs",
     "make-image-fixtures": "tsx scripts/make-image-fixtures.mjs",
     "spike-image-regions": "node scripts/spike-image-regions.mjs"
   },

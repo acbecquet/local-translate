@@ -1,0 +1,4 @@
+{
+  "models": ["gemma4:e2b", "gemma4:e4b", "gemma4:12b", "qwen3.5:4b", "qwen3.5:9b", "qwen3:30b"],
+  "judge": "qwen3.6:35b"
+}
