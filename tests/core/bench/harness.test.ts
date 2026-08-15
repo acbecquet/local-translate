@@ -33,6 +33,7 @@ async function makeTempDir(prefix: string): Promise<string> {
 
 afterEach(async () => {
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
   await Promise.all(tempDirs.splice(0).map((d) => rm(d, { recursive: true, force: true })))
 })
 
@@ -467,6 +468,116 @@ describe('runMatrix - a transport-class failure aborts the model and moves to th
   })
 })
 
+// --- regression: a RESOLVED transport-class backend failure must also abort --
+//
+// OllamaBackend.translateBatch() never rejects for a transport-level failure
+// (server down, connection reset, model still loading): callChat's own
+// try/catch swallows it and reports it per-segment as keptOriginal reason
+// 'error' (ollama-backend.ts's callChat/attemptGroup). The abort tests above
+// only exercise a backend that REJECTS - they never proved runMatrix reacts
+// to this, the shape a real broken-model-load run actually takes.
+
+describe('runMatrix - a resolved BatchResponse reporting only transport-class backend failures also aborts the model (regression)', () => {
+  it('never retries: a translateBatch that RESOLVES with reason "error" for every segment still aborts the model, and nothing is saved', async () => {
+    const repoRoot = await makeTempDir('bench-harness-backend-transport-')
+    const store = new BenchStore(await makeTempDir('bench-harness-backend-transport-store-'))
+    const appDataDir = await makeTempDir('bench-harness-backend-transport-appdata-')
+
+    const ids = ['item-1', 'item-2', 'item-3']
+    const files = await Promise.all(
+      ids.map((id) => writeFakeItem(repoRoot, id, [seg({ id: 's1', text: 'Hello' })]))
+    )
+    const corpus: Corpus = { items: ids.map((id, i) => corpusItem({ id, file: files[i] })) }
+
+    // Exactly what OllamaBackend produces for a real transport failure: it
+    // RESOLVES (never rejects), translations empty, every segment's failure
+    // reason is the literal 'error' string callChat's catch block reports.
+    const translateBatch = vi.fn().mockResolvedValue({
+      translations: [],
+      failures: [{ id: 's1', reason: 'error' }]
+    })
+
+    const stop = vi.fn().mockResolvedValue(undefined)
+    const ensureOllama = vi.fn().mockResolvedValue(fakeConnection(stop))
+    const unloadModel = vi.fn().mockResolvedValue(undefined)
+    const deps: HarnessDeps = {
+      ensureOllama,
+      createBackend: vi.fn().mockReturnValue(fakeTranslatingBackend(translateBatch)),
+      unloadModel,
+      buildAdapters: vi.fn().mockReturnValue([new FakeAdapter()])
+    }
+
+    const events: HarnessEvent[] = []
+    const summary = await runMatrix(
+      { models: ['model-a'], corpus, store, repoRoot, appDataDir, onEvent: (e) => events.push(e) },
+      deps
+    )
+
+    expect(summary).toEqual({ completed: 0, skipped: 0, failed: 3 })
+
+    const modelAEvents = events.filter((e) => e.model === 'model-a')
+    expect(modelAEvents.filter((e) => e.type === 'model-aborted')).toHaveLength(3)
+    expect(modelAEvents.some((e) => e.type === 'cell-done')).toBe(false)
+    expect(modelAEvents.some((e) => e.type === 'cell-failed')).toBe(false)
+
+    // Never a retry loop: translateBatch is called exactly once, for
+    // item-1 - item-2/item-3 never reach the backend at all, and item-1
+    // itself is never re-attempted.
+    expect(translateBatch).toHaveBeenCalledTimes(1)
+
+    // NOTHING saved - not even a completed-but-empty cell that a later
+    // resume would then skip forever.
+    for (const id of ids) {
+      expect(store.loadCell('model-a', id)).toBeNull()
+    }
+
+    expect(unloadModel).toHaveBeenCalledTimes(1)
+    expect(ensureOllama).toHaveBeenCalledTimes(1)
+    expect(stop).toHaveBeenCalledTimes(1)
+  })
+
+  it('does NOT abort on model-quality failures (parse/id-mismatch/empty/echo) - these are legitimate benchmark data and must still be saved as a completed cell', async () => {
+    const repoRoot = await makeTempDir('bench-harness-quality-fail-')
+    const store = new BenchStore(await makeTempDir('bench-harness-quality-fail-store-'))
+    const appDataDir = await makeTempDir('bench-harness-quality-fail-appdata-')
+
+    const file = await writeFakeItem(repoRoot, 'item-1', [seg({ id: 's1', text: 'Hello' })])
+    const corpus: Corpus = { items: [corpusItem({ id: 'item-1', file })] }
+
+    // The model responded but its output didn't validate - a genuine
+    // quality result, not a transport problem. Must be saved, not aborted.
+    const translateBatch = vi.fn().mockResolvedValue({
+      translations: [],
+      failures: [{ id: 's1', reason: 'echo' }]
+    })
+    const deps: HarnessDeps = {
+      ensureOllama: vi.fn().mockResolvedValue(fakeConnection()),
+      createBackend: vi.fn().mockReturnValue(fakeTranslatingBackend(translateBatch)),
+      unloadModel: vi.fn().mockResolvedValue(undefined),
+      buildAdapters: vi.fn().mockReturnValue([new FakeAdapter()])
+    }
+
+    const events: HarnessEvent[] = []
+    const summary = await runMatrix(
+      { models: ['model-a'], corpus, store, repoRoot, appDataDir, onEvent: (e) => events.push(e) },
+      deps
+    )
+
+    expect(summary).toEqual({ completed: 1, skipped: 0, failed: 0 })
+    expect(events.some((e) => e.type === 'model-aborted')).toBe(false)
+    expect(events.some((e) => e.type === 'cell-done' && e.itemId === 'item-1')).toBe(true)
+
+    const cell = store.loadCell('model-a', 'item-1')
+    expect(cell).not.toBeNull()
+    expect(cell!.report.translated).toBe(0)
+    expect(cell!.report.keptOriginal).toEqual([{ id: 's1', reason: 'echo' }])
+  })
+
+  it('_internals.BACKEND_TRANSPORT_FAILURE_REASON matches the literal reason string OllamaBackend actually reports', () => {
+    expect(_internals.BACKEND_TRANSPORT_FAILURE_REASON).toBe('error')
+  })
+})
+
 // --- contract point 6: summary counts add up ---------------------------------
 
 describe('runMatrix - summary counts add up to models x items (contract point 6)', () => {
@@ -625,5 +736,41 @@ describe('realHarnessDeps (production wiring)', () => {
     // adapter show up here despite the null.
     const adapters = deps.buildAdapters({ regionEngine: null, sourceLang: 'English' })
     expect(adapters.map((a) => a.name).sort()).toEqual(['fake', 'image', 'pptx'])
+  })
+})
+
+// --- realHarnessDeps.unloadModel: checks response status (important fix) ----
+//
+// fetch() only rejects on a network-level failure - a 4xx/5xx HTTP response
+// from ollama resolves normally with ok:false, so without an explicit check
+// a failed unload reads as a successful one and the next model loads with no
+// confirmation VRAM was actually freed. Mirrors probeVersion's res.ok check
+// (lifecycle.ts). Stubs global fetch - no real network touched.
+
+describe('realHarnessDeps - unloadModel checks the response status (important fix)', () => {
+  it('throws with the status when ollama responds with a non-ok status', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue({ ok: false, status: 500, statusText: 'Internal Server Error' })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const deps = realHarnessDeps()
+
+    await expect(deps.unloadModel('http://127.0.0.1:11434', 'some-model')).rejects.toThrow(/500/)
+  })
+
+  it('resolves cleanly and posts the expected body when ollama responds ok', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: 'OK' })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const deps = realHarnessDeps()
+
+    await expect(deps.unloadModel('http://127.0.0.1:11434', 'some-model')).resolves.toBeUndefined()
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [url, init] = fetchMock.mock.calls[0] as [URL, RequestInit]
+    expect(url.toString()).toBe('http://127.0.0.1:11434/api/generate')
+    expect(init.method).toBe('POST')
+    expect(init.body).toBe(JSON.stringify({ model: 'some-model', keep_alive: 0 }))
   })
 })

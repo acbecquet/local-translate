@@ -23,6 +23,21 @@
  * cells instead of burning through them one at a time - see
  * isTransportError below. Retrying a broken model load is exactly the
  * crash-retry pattern that leaks VRAM on this machine.
+ *
+ * A transport-class failure reaches isTransportError two ways: a real throw
+ * (e.g. deps.ensureOllama/createBackend construction), or - the common real
+ * case - a completed RunReport whose keptOriginal reasons show the backend
+ * never actually responded (BACKEND_TRANSPORT_FAILURE_REASON, below).
+ * OllamaBackend.translateBatch() never rejects for a transport failure
+ * (server down, connection reset, model still loading): it catches the
+ * failure internally and reports it per-segment instead, so runCell must
+ * inspect a SUCCESSFULLY RESOLVED report for that shape and synthesize a
+ * throw (BackendTransportFailure) to engage the same abort machinery -
+ * otherwise the harness would grind through every remaining item against a
+ * model that can never produce a real translation, repeating the full
+ * initial+retry+per-segment-fallback ladder each time: the exact
+ * repeated-load-attempt pattern the machine rule above prohibits, just
+ * spread across ladder calls instead of harness-level retries.
  */
 import { copyFileSync, mkdirSync } from 'node:fs'
 import path from 'node:path'
@@ -32,7 +47,7 @@ import type { CliDeps } from '../cli'
 import { withCellSplit } from '../images/cellsplit'
 import { createPPOcrEngine } from '../images/engines/ppocr'
 import { withRotationPasses } from '../images/rotation'
-import { runPipeline } from '../pipeline'
+import { runPipeline, type RunReport } from '../pipeline'
 import type { TranslationBackend } from '../translate/backend'
 import { OllamaBackend } from '../translate/ollama/ollama-backend'
 import { ensureOllama as realEnsureOllama } from '../translate/ollama/lifecycle'
@@ -73,6 +88,61 @@ function errorMessage(err: unknown): string {
 }
 
 /**
+ * The reason string OllamaBackend (../translate/ollama/ollama-backend.ts's
+ * callChat/attemptGroup) reports for a segment when the underlying
+ * ollama.chat() call itself threw - a transport-level failure (server down,
+ * connection reset, model still loading) as opposed to a model-quality
+ * problem (parse/id-mismatch/empty/echo - see batching.ts's
+ * ValidationFailure). OllamaBackend never rejects for this: callChat's own
+ * try/catch swallows the throw and every ladder rung reports it per-segment
+ * instead, so it flows unchanged from BatchResponse.failures[].reason into
+ * RunReport.keptOriginal[].reason. Documented, but not exported as a named
+ * constant, on backend.ts's own BatchResponse.failures field doc ("one of
+ * 'parse' | 'id-mismatch' | 'empty' | 'echo' | 'error' - kept as plain
+ * `string` there so backend.ts stays dependency-free of batching.ts") -
+ * redefined here, pointing at that origin, rather than importing a constant
+ * that doesn't exist.
+ */
+const BACKEND_TRANSPORT_FAILURE_REASON = 'error'
+
+/**
+ * Thrown by runCell when a successfully RESOLVED RunReport is itself
+ * evidence of a transport-class failure (see isBackendTransportFailure) -
+ * OllamaBackend never rejects for this, so runCell has to notice it after
+ * the fact and synthesize a throw to engage the same abort machinery a real
+ * throw would. Recognized by isTransportError via `.name`, not message
+ * content: unlike the fetch/ECONNREFUSED cases (third-party errors this
+ * module has to sniff), this one originates entirely inside this module, so
+ * it can just say what it is.
+ */
+class BackendTransportFailure extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'BackendTransportFailure'
+  }
+}
+
+/**
+ * True when a completed RunReport is actually evidence of a broken model or
+ * connection rather than a translation result: nothing translated AND at
+ * least one kept-original segment was kept specifically because the backend
+ * never responded (BACKEND_TRANSPORT_FAILURE_REASON) - as opposed to a
+ * report where the model responded but produced unusable output
+ * (parse/id-mismatch/empty/echo), which is legitimate benchmark data (0%
+ * completeness, ladder hits) and must still be saved as a completed cell,
+ * never aborted. Gated on `translated === 0` (not "any segment has this
+ * reason") so one transient blip inside an otherwise-working cell doesn't
+ * abort the whole model over a fluke - only a cell where NOTHING got
+ * through counts as evidence the model/connection itself is broken.
+ */
+function isBackendTransportFailure(report: RunReport): boolean {
+  return (
+    report.translated === 0 &&
+    report.keptOriginal.some((k) => k.reason === BACKEND_TRANSPORT_FAILURE_REASON)
+  )
+}
+
+/**
  * Detects a transport-class failure - the model server itself is
  * unreachable, or the model failed to load - as opposed to an ordinary
  * per-cell failure (a bad extract, a validation-ladder exhaustion, a fit
@@ -82,20 +152,22 @@ function errorMessage(err: unknown): string {
  * them one at a time; never a retry loop (machine rule: a crash-retry loop
  * on a failed model load leaks VRAM on this machine).
  *
- * Detected by error code/message, since fetch/undici and ollama's client
- * don't expose a stable error class across Node versions - the documented
- * list this predicate matches:
+ * The documented list this predicate matches:
+ *  - `err.name === 'BackendTransportFailure'` - runCell's own synthetic
+ *    throw for a RESOLVED report that shows the backend never responded
+ *    (the common real case: OllamaBackend never rejects, see above)
  *  - a message containing "fetch failed" (undici's own wrapper message for
  *    a failed global fetch() call)
  *  - ECONNREFUSED / ECONNRESET, either directly on `err.code` or nested
  *    under `err.cause.code` (how a wrapped fetch failure carries the
  *    underlying socket error)
  *  - a message mentioning both "model" and "load" (covers both word orders,
- *    e.g. "failed to load model" and "model load failed") - ollama's own
- *    reported failure to load a model into memory (e.g. out of VRAM)
+ *    e.g. "failed to load model" and "model load failed") - a raw thrown
+ *    model-load failure, if some future caller ever throws one directly
  */
 function isTransportError(err: unknown): boolean {
   if (!(err instanceof Error)) return false
+  if (err.name === 'BackendTransportFailure') return true
 
   const code = (err as NodeJS.ErrnoException).code
   const causeCode = (err.cause as NodeJS.ErrnoException | undefined)?.code
@@ -155,6 +227,20 @@ async function runCell(
     adapter,
     backend
   })
+
+  // OllamaBackend never rejects for a transport-level failure - it catches
+  // ollama.chat()'s throw internally and reports it per-segment instead
+  // (see BACKEND_TRANSPORT_FAILURE_REASON's doc comment above). A report
+  // shaped like that is not a translation result to save - it's the model
+  // or connection being broken, so this is thrown to engage the same abort
+  // machinery a real throw would, BEFORE anything gets copied or saved.
+  if (isBackendTransportFailure(report)) {
+    throw new BackendTransportFailure(
+      `backend reported a transport-level failure (reason "${BACKEND_TRANSPORT_FAILURE_REASON}") ` +
+        `for every segment of item "${item.id}" on model "${model}" - the model likely failed to ` +
+        'load, or the connection to it was lost'
+    )
+  }
 
   const artifactRelPath = opts.store.artifactPathFor(model, item.id, report.outPath)
   const artifactAbsPath = path.join(opts.store.dir, artifactRelPath)
@@ -241,13 +327,27 @@ export async function runMatrix(opts: HarnessOpts, deps: HarnessDeps): Promise<H
   return summary
 }
 
-/** Plain HTTP POST to <baseUrl>/api/generate with { model, keep_alive: 0 } - how ollama frees a loaded model's VRAM without waiting out its normal keep-alive window. */
+/**
+ * Plain HTTP POST to <baseUrl>/api/generate with { model, keep_alive: 0 } -
+ * how ollama frees a loaded model's VRAM without waiting out its normal
+ * keep-alive window. Checks `res.ok` and throws with the status when it
+ * isn't (mirrors probeVersion, ../translate/ollama/lifecycle.ts): fetch()
+ * only rejects on a network-level failure, so a 4xx/5xx HTTP response would
+ * otherwise resolve normally and read as a successful unload with no
+ * confirmation VRAM was actually freed - defeating the fail-loud point of
+ * checking at all before the next model loads.
+ */
 async function unloadModel(baseUrl: string, model: string): Promise<void> {
-  await fetch(new URL('/api/generate', baseUrl), {
+  const res = await fetch(new URL('/api/generate', baseUrl), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ model, keep_alive: 0 })
   })
+  if (!res.ok) {
+    throw new Error(
+      `unloadModel: POST ${baseUrl}/api/generate responded ${res.status} ${res.statusText} for model "${model}"`
+    )
+  }
 }
 
 /**
@@ -271,4 +371,4 @@ export function realHarnessDeps(): HarnessDeps {
   }
 }
 
-export const _internals = { isTransportError }
+export const _internals = { isTransportError, BACKEND_TRANSPORT_FAILURE_REASON }
