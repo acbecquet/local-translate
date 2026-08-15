@@ -546,7 +546,7 @@ export function renderResultsDoc(report: BenchReport): string // markdown, one s
 4. Small png artifact embeds as a `data:image/png;base64,` URI; an oversized artifact (seed a >2 MB file) renders its path instead.
 5. `renderResultsDoc` contains the ranking order, the recommended champion, and the tier table in markdown, with each sentence on its own line.
 
-- [ ] Steps: failing tests -> implement -> green -> scoped check -> commit `feat: benchmark json report, self-contained html, and results doc renderer`.
+- [x] Steps: failing tests -> implement -> green -> scoped check -> commit `feat: benchmark json report, self-contained html, and results doc renderer`.
 
 ---
 
