@@ -2,36 +2,20 @@ import { Canvas, FontLibrary, type CanvasRenderingContext2D } from 'skia-canvas'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { findAppRoot } from '../app-root'
 
-/**
- * Locates the app root - the nearest ancestor directory of `startDir` that
- * contains a package.json - by walking up rather than hardcoding a fixed
- * number of `..` hops. A fixed hop count breaks under bundling: this
- * module's *source* location (src/core/fit/fonts.ts) sits 3 directories
- * below the repo root, but electron-vite's production build inlines it
- * into a single out/main/index.js, only 2 directories below - a fixed
- * `../../../` walks one directory too far and never finds fonts/ (a real
- * bug caught by tests/e2e/runner.spec.ts driving the built app: it
- * resolved to `N:\fonts` instead of `N:\local_translate\fonts`). Walking up
- * to the package.json marker instead works identically whether this module
- * runs from its original source path (tsx, vitest) or bundled to any other
- * depth, since it never assumes a specific starting depth.
- */
-export function findAppRoot(startDir: string): string {
-  let dir = startDir
-  for (;;) {
-    if (existsSync(path.join(dir, 'package.json'))) return dir
-    const parent = path.dirname(dir)
-    if (parent === dir) {
-      // Reached the filesystem root without finding package.json - fall
-      // back to the starting directory rather than looping forever;
-      // registerBundledFonts() will simply fail to find the font files, the
-      // same observable failure the old fixed-hop-count code would have had.
-      return startDir
-    }
-    dir = parent
-  }
-}
+// findAppRoot itself now lives in ../app-root.ts (shared with champion.ts,
+// which needs the identical repo-root walk without pulling this file's
+// skia-canvas import into its own module graph) - re-exported here so
+// existing callers/tests importing it from this module (tests/core/fit/fonts.test.ts)
+// keep working unchanged. See app-root.ts's own doc comment for the full
+// walk-vs-fixed-hops rationale, including the concrete bug it fixed: this
+// module's source location sits 3 directories below the repo root, but
+// electron-vite's production build inlines it into a single out/main/index.js
+// only 2 directories below - a fixed `../../../` walked one directory too
+// far and never found fonts/, caught by tests/e2e/runner.spec.ts driving the
+// built app.
+export { findAppRoot }
 
 /**
  * Resolves the directory holding the bundled font files, preferring the

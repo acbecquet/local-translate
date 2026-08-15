@@ -71,9 +71,21 @@ interface CliArgs {
 
 type ParseResult = { ok: true; args: CliArgs } | { ok: false; error: string }
 
-const USAGE =
-  `Usage: translate <file> <sourceLang> <targetLang> [--model <name>] [--out <path>]\n` +
-  `  --model defaults to "${DEFAULT_MODEL}" if omitted`
+/**
+ * Built fresh on every call (not a module-level constant) specifically so
+ * the printed default always names the model the CLI will ACTUALLY use:
+ * `resolveDefaultModel()` reads config/champion.json live, and once the
+ * phase-4 benchmark harness crowns a champion other than DEFAULT_MODEL, a
+ * cached string would keep advertising the stale pre-benchmark placeholder
+ * while `parseArgs` below silently used the real crowned model - a user
+ * omitting a required arg would see one model named and another one run.
+ */
+function usage(): string {
+  return (
+    `Usage: translate <file> <sourceLang> <targetLang> [--model <name>] [--out <path>]\n` +
+    `  --model defaults to "${resolveDefaultModel()}" if omitted`
+  )
+}
 
 function parseArgs(argv: string[]): ParseResult {
   const positional: string[] = []
@@ -93,7 +105,7 @@ function parseArgs(argv: string[]): ParseResult {
       if (value === undefined) return { ok: false, error: 'Missing value for --out' }
       out = value
     } else if (arg.startsWith('--')) {
-      return { ok: false, error: `Unknown flag: ${arg}\n${USAGE}` }
+      return { ok: false, error: `Unknown flag: ${arg}\n${usage()}` }
     } else {
       positional.push(arg)
     }
@@ -101,7 +113,7 @@ function parseArgs(argv: string[]): ParseResult {
 
   const [file, sourceLang, targetLang] = positional
   if (!file || !sourceLang || !targetLang) {
-    return { ok: false, error: USAGE }
+    return { ok: false, error: usage() }
   }
   return { ok: true, args: { file, sourceLang, targetLang, model, out } }
 }
@@ -342,7 +354,7 @@ export async function runCli(argv: string[], deps: CliDeps = defaultDeps): Promi
   }
 }
 
-export const _internals = { parseArgs, DEFAULT_MODEL, USAGE, resolveAppDataDir }
+export const _internals = { parseArgs, DEFAULT_MODEL, usage, resolveAppDataDir }
 
 function isMainModule(): boolean {
   const entry = process.argv[1]

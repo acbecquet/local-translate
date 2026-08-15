@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type { FormatAdapter } from '../../src/core/adapters/adapter'
+import { _internals as championInternals, resolveDefaultModel } from '../../src/core/champion'
 import type { PipelineOpts, RunReport } from '../../src/core/pipeline'
 import type { TranslationBackend } from '../../src/core/translate/backend'
 import {
@@ -308,8 +310,23 @@ describe('TranslateService.stop', () => {
   })
 })
 
-describe('DEFAULT_MODEL', () => {
-  it('is used when no model override is supplied', async () => {
+describe('default model resolution (champion.json wiring)', () => {
+  const championTmpDirs: string[] = []
+  afterEach(() => {
+    for (const dir of championTmpDirs) rmSync(dir, { recursive: true, force: true })
+    championTmpDirs.length = 0
+    championInternals.setConfigDirForTesting(null)
+  })
+
+  it('defaultDeps() uses resolveDefaultModel() when no model override is supplied', async () => {
+    // Asserted against the LIVE resolveDefaultModel(), not the static
+    // DEFAULT_MODEL constant: the two only coincide before a real champion
+    // is crowned (config/champion.json's committed placeholder currently
+    // equals DEFAULT_MODEL) - comparing against DEFAULT_MODEL directly would
+    // pass today for the wrong reason and silently break the instant a real
+    // champion is crowned to something else. See the next test for the
+    // stronger, fabricated-value proof that defaultDeps() is genuinely
+    // champion-aware rather than just coincidentally consistent.
     const runPipeline = vi.fn().mockResolvedValue(FAKE_REPORT)
     const service = new TranslateService({
       adapters: () => [FAKE_ADAPTER],
@@ -321,7 +338,33 @@ describe('DEFAULT_MODEL', () => {
     await service.run({ filePath: 'doc.fake.json', sourceLang: 'English', targetLang: 'French' })
 
     const opts = runPipeline.mock.calls[0][0] as PipelineOpts
-    expect(opts.model).toBe(DEFAULT_MODEL)
+    expect(opts.model).toBe(resolveDefaultModel())
+  })
+
+  it('uses the crowned champion model, not DEFAULT_MODEL, once a champion is crowned', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'lt-service-champion-'))
+    championTmpDirs.push(dir)
+    const configDir = path.join(dir, 'config')
+    mkdirSync(configDir, { recursive: true })
+    writeFileSync(
+      path.join(configDir, 'champion.json'),
+      JSON.stringify({ model: 'qwen3.5:9b', crownedAt: '2026-08-15T00:00:00.000Z' })
+    )
+    championInternals.setConfigDirForTesting(configDir)
+
+    const runPipeline = vi.fn().mockResolvedValue(FAKE_REPORT)
+    const service = new TranslateService({
+      adapters: () => [FAKE_ADAPTER],
+      ensureOllama: vi.fn().mockResolvedValue(fakeConnection()),
+      createBackend: vi.fn().mockReturnValue(fakeBackend()),
+      runPipeline
+    })
+
+    await service.run({ filePath: 'doc.fake.json', sourceLang: 'English', targetLang: 'French' })
+
+    const opts = runPipeline.mock.calls[0][0] as PipelineOpts
+    expect(opts.model).toBe('qwen3.5:9b')
+    expect(opts.model).not.toBe(DEFAULT_MODEL)
   })
 })
 

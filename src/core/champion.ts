@@ -10,6 +10,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { findAppRoot } from './app-root'
 import { DEFAULT_MODEL } from './defaults'
 
 export interface ChampionState {
@@ -19,29 +20,6 @@ export interface ChampionState {
 }
 
 const CHAMPION_FILENAME = 'champion.json'
-
-/**
- * Locates the app root - the nearest ancestor directory of `startDir` that
- * contains a package.json - by walking up rather than hardcoding a fixed
- * number of `..` hops. Deliberately duplicated from fonts.ts's identical
- * findAppRoot (see that copy's own doc comment for the full walk-vs-fixed-
- * hops rationale, which applies here unchanged) instead of imported:
- * fonts.ts pulls in skia-canvas at module scope, and champion.ts resolves
- * the app's default model on essentially every CLI/app startup path - it
- * must not force-load a rendering library's native addon just to find the
- * repo root. Mirrors the resolveAppDataDir duplication already established
- * between cli.ts and translate-service.ts for the same
- * don't-couple-unrelated-modules reason.
- */
-function findAppRoot(startDir: string): string {
-  let dir = startDir
-  for (;;) {
-    if (existsSync(path.join(dir, 'package.json'))) return dir
-    const parent = path.dirname(dir)
-    if (parent === dir) return startDir
-    dir = parent
-  }
-}
 
 /**
  * Resolves the directory holding config/champion.json, preferring the

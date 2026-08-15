@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import os, { tmpdir } from 'node:os'
 import path from 'node:path'
-import { _internals as championInternals } from '../../src/core/champion'
+import { _internals as championInternals, resolveDefaultModel } from '../../src/core/champion'
 import { _internals, runCli, type CliDeps } from '../../src/core/cli'
 import type { TextSegment } from '../../src/core/segments'
 import type { BatchRequest, TranslationBackend } from '../../src/core/translate/backend'
@@ -63,6 +63,14 @@ function fakeConnection(stop = vi.fn().mockResolvedValue(undefined)): OllamaConn
 
 describe('_internals.parseArgs', () => {
   it('applies the default model when --model is omitted', () => {
+    // Asserted against resolveDefaultModel(), not the static DEFAULT_MODEL
+    // constant: the two only coincide before a real champion is crowned
+    // (config/champion.json's committed placeholder currently equals
+    // DEFAULT_MODEL) - comparing against DEFAULT_MODEL directly would pass
+    // today for the wrong reason and silently break the instant a real
+    // champion is crowned to something else. See the dedicated
+    // "default model resolution" describe block below for the test that
+    // proves champion-awareness with a fabricated, non-coincidental value.
     const result = parseArgs(['doc.fake.json', 'English', 'French'])
     expect(result).toEqual({
       ok: true,
@@ -70,7 +78,7 @@ describe('_internals.parseArgs', () => {
         file: 'doc.fake.json',
         sourceLang: 'English',
         targetLang: 'French',
-        model: DEFAULT_MODEL,
+        model: resolveDefaultModel(),
         out: undefined
       }
     })
@@ -140,6 +148,35 @@ describe('_internals.parseArgs: default model resolution (champion.json wiring, 
 
     expect(result.ok).toBe(true)
     if (result.ok) expect(result.args.model).toBe('llama3.1')
+  })
+
+  // The USAGE text is built from resolveDefaultModel(), not the static
+  // DEFAULT_MODEL constant - the two only agree before a champion is
+  // crowned. Once config/champion.json names a different model, a user
+  // omitting a required arg must see THAT model in the help text, not the
+  // stale pre-benchmark placeholder.
+  it('the missing-positionals usage error names the crowned champion model, not the static DEFAULT_MODEL fallback', () => {
+    fabricateChampion('qwen3.5:4b')
+
+    const result = parseArgs(['doc.fake.json']) // missing sourceLang/targetLang
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.error).toContain('qwen3.5:4b')
+      expect(result.error).not.toContain(DEFAULT_MODEL)
+    }
+  })
+
+  it('the unknown-flag error also names the crowned champion model, not the static DEFAULT_MODEL fallback', () => {
+    fabricateChampion('qwen3.5:4b')
+
+    const result = parseArgs(['doc.fake.json', 'English', 'French', '--bogus'])
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.error).toContain('qwen3.5:4b')
+      expect(result.error).not.toContain(DEFAULT_MODEL)
+    }
   })
 })
 
@@ -222,7 +259,10 @@ describe('runCli: exit codes and dependency injection', () => {
 
     expect(code).toBe(0)
     const req = translateBatch.mock.calls[0][0] as BatchRequest
-    expect(req.model).toBe(DEFAULT_MODEL)
+    // See the comment on "applies the default model when --model is
+    // omitted" above: resolveDefaultModel(), not the static DEFAULT_MODEL
+    // constant, is the actual contract once a champion can be crowned.
+    expect(req.model).toBe(resolveDefaultModel())
   })
 
   it('returns 1 when nothing gets translated, and still calls stop exactly once', async () => {
